@@ -1,0 +1,149 @@
+## Codebase Patterns
+- TiKV workspace has 80+ crates organized under cmd/, components/, src/, tests/, fuzz/
+- Key dependency layers: foundational (codec, keys) → utils (tikv_util) → engine abstraction (engine_traits) → consensus (raftstore, batch-system) → txn (storage/txn) → server
+- Thread pools: gRPC (grpcio), read pool (YATP), raft batch system (custom FSM), scheduler worker pool, background workers (MPSC-based)
+- Request flow: gRPC → Storage → TxnScheduler (latches) → RaftKv → Raft replication → Apply → RocksDB
+- PD client uses bidirectional gRPC streams for heartbeats and TSO
+- Configuration hierarchy mirrors component structure; online_config crate supports runtime changes
+- Raftstore uses two FSM types: StoreFsm (one per store) and PeerFsm (one per region), driven by batch-system Router
+- Raftstore-v2 reorganizes code into operation/ modules (command/admin/split.rs, ready/snapshot.rs, life.rs)
+- Transaction actions (prewrite, commit, rollback, check_txn_status, gc) are in src/storage/txn/actions/ as standalone functions
+- MvccTxn (txn.rs) accumulates writes; MvccReader (reader/) handles reads — write and read paths are separate abstractions
+- ConcurrencyManager in components/concurrency_manager/ tracks max_ts and in-memory locks for async commit correctness
+- Latch system in src/storage/txn/latch.rs uses sorted key hashes for deadlock-free serialization
+- GC has two modes: GcManager-driven per-region GC and RocksDB compaction filter GC (compaction_filter.rs)
+- Resolved TS computed per-region in components/resolved_ts/src/resolver.rs using BTreeMap-based lock tracking
+- Coprocessor batch execution uses 6 tidb_query_* crates; expressions are RPN (flat postfix, not trees) evaluated with stack-based batch evaluator
+- Coprocessor V2 plugins are cdylibs loaded via libloading with hot-reload filesystem watcher; interact through RawStorage trait only
+- gRPC dispatch uses 3 macros: handle_request! (reads), txn_command_future! (txn writes), handle_cmd! (batch_commands sub-dispatch)
+- Flow control is multi-layered: read pool busy threshold (EWMA), scheduler memory quota (256MB), write flow controller (discard ratio + rate limiter), Raft message rejection on memory pressure
+- Status server is a separate Hyper HTTP server on status_addr (default :10080), not part of the gRPC server
+- RaftClient uses lock-free ArrayQueue per connection with seahash(region_id) for connection selection; batch_raft is default with raft as fallback
+- PD client has V1 (distributed reconnection) and V2 (centralized reconnection loop) implementations; TSO uses bidirectional streaming with batched requests
+- CDC, backup-stream, and resolved_ts all register as observers on the same CoprocessorHost; ObserveLevel (LockRelated vs All) determines what data is captured
+- Resolved TS Resolver uses dual tracking: BTreeMap for normal locks, separate HashMap+TxnStatusCache for large transactions
+- Backup-stream TwoPhaseResolver wraps resolved_ts Resolver with phase 1 (initial scan) buffering incremental locks in future_locks vec
+- Full backup uses direct engine snapshots (NOT raftstore observer pattern); backup-stream uses observer pattern for incremental capture
+- ExternalStorage trait (components/external_storage/) provides unified S3/GCS/Azure/local/HDFS abstraction shared by backup and backup-stream
+- Resource control uses virtual-time priority scheduling in YATP read pool; token bucket only for background tasks
+- Encryption: two-tier key hierarchy (master key → key dictionary → data keys), file_dict is plaintext, key_dict encrypted
+- OnlineConfig derive macro with skip/hidden/submodule attributes controls runtime changeability of config fields
+- ConfigController dispatches changes per-module via ConfigManager trait; validates before dispatch, persists after
+- Log routing by slog tag: "slow_log*"/"rocksdb_log*"/"raftdb_log*" routed to separate drains via LogDispatcher
+---
+
+## 2026-03-17 - US-001
+- What was implemented: Created impl_docs/architecture_overview.md covering system overview, crate dependency graph, thread/async-task model, request lifecycle (read & write), cluster topology (PD-based discovery, region assignment, leader balancing), and design philosophy/trade-offs
+- Files changed: impl_docs/architecture_overview.md (new), progress.txt (new)
+- **Learnings for future iterations:**
+  - The main server bootstrap is in components/server/src/server.rs, not cmd/tikv-server (which just calls run_tikv())
+  - gRPC services are defined in src/server/service/kv.rs with handle_request! macro pattern
+  - Storage layer entry point is src/storage/mod.rs (Storage struct)
+  - TxnScheduler in src/storage/txn/scheduler.rs uses latch-based serialization for write commands
+  - Raft batch system created via fsm::create_raft_batch_system() in raftstore
+  - PD worker is a single LazyWorker processing PdTask enum variants
+  - Read pool uses thread-local engine instances (TLS pattern)
+---
+
+## 2026-03-17 - US-002
+- What was implemented: Created impl_docs/key_encoding_and_data_formats.md covering key space organization (LOCAL_PREFIX/DATA_PREFIX), memcomparable byte encoding algorithm, number encoding (fixed-width BE, VarInt, descending u64), MVCC key format with timestamp, all four column family layouts (CF_DEFAULT, CF_LOCK, CF_WRITE, CF_RAFT), Lock record serialization with prefix-tagged fields, Write record serialization with short value optimization, RocksDB engine usage patterns, SST file format, and kvproto definitions
+- Files changed: impl_docs/key_encoding_and_data_formats.md (new)
+- **Learnings for future iterations:**
+  - Lock and Write records use a custom compact binary format with single-byte prefix tags (NOT protobuf) for space efficiency
+  - Short values (≤255 bytes) are inlined in Write records under prefix 'v' (0x76), avoiding CF_DEFAULT lookup
+  - CF_LOCK keys have NO timestamp suffix (one lock per user key); CF_WRITE uses commit_ts; CF_DEFAULT uses start_ts
+  - The codec crate at components/codec/src/ has the canonical memcomparable encoding (byte.rs) and number encoding (number.rs)
+  - txn_types Lock/Write serialization is in components/txn_types/src/lock.rs and write.rs respectively
+  - kvproto types (kvrpcpb, metapb) are used at the RPC boundary; internal types convert from them
+---
+
+## 2026-03-17 - US-003
+- What was implemented: Created impl_docs/raft_and_replication.md covering Raft protocol implementation (raft-rs integration, RawNode lifecycle, Storage trait), region abstraction (epoch semantics, metadata storage), region lifecycle (bootstrap, split, merge, destruction), batch-system architecture (Router, FSM scheduling, PeerMsg/StoreMsg/SignificantMsg/CasualMessage dispatch), snapshot generation/application/transfer, raftstore-v2 differences (tablet-based storage, operation-based code), safety invariants (consistency, durability, leader lease, epoch linearization), background workers, and hibernation
+- Files changed: impl_docs/raft_and_replication.md (new)
+- **Learnings for future iterations:**
+  - TiKV uses external raft-rs v0.7.0 (forked at tikv/raft-rs) — does NOT reimplement Raft algorithm
+  - PeerStorage (peer_storage.rs) implements raft::Storage trait, wrapping EntryStorage for log access
+  - Batch system uses DashMap-based Router with BasicMailbox per peer FSM for lock-free message routing
+  - Apply FSM is separate from Peer FSM — runs on its own thread pool to avoid blocking Raft ticks
+  - Region merge is a complex 3-phase protocol: PrepareMerge → CommitMerge → cleanup (with RollbackMerge fallback)
+  - Raftstore-v2 uses per-region RocksDB tablets instead of shared DB — enables O(1) snapshot via RocksDB Checkpoint
+  - CmdEpochChecker limits at most 2 concurrent epoch-changing admin commands to prevent conflicts
+  - Leader lease (max 9s < election timeout) enables local reads without Raft round-trips
+---
+
+## 2026-03-17 - US-004
+- What was implemented: Created impl_docs/transaction_and_mvcc.md covering the full Percolator protocol (prewrite/commit/rollback/check_txn_status as algorithmic pseudocode), lock types and state machine (Put/Delete/Lock/Pessimistic with transitions), write record types (Put/Delete/Lock/Rollback with GC fence and LastChange), MvccTxn write accumulator and MvccReader/SnapshotReader/PointGetter/Scanner read abstractions, conflict detection (write conflicts, lock conflicts, data constraints), concurrency control (TxnScheduler, Latches, ConcurrencyManager), async commit and 1PC optimizations, pessimistic transactions, GC (safe point, per-key GC state machine, compaction filter, lock TTL), resolved timestamp (per-region Resolver, AdvanceTsWorker, lock tracking), and isolation levels (SI/RC/RcCheckTs)
+- Files changed: impl_docs/transaction_and_mvcc.md (new)
+- **Learnings for future iterations:**
+  - Prewrite actions are standalone functions, not methods on a struct — take (txn, reader, props, mutation) as args
+  - CommitKind enum {TwoPc, OnePc(max_commit_ts), Async(max_commit_ts)} drives the prewrite path
+  - 1PC caches locks in txn.locks_for_1pc instead of writing to CF_LOCK; converts to CF_WRITE at end
+  - Pessimistic locks use LockType::Pessimistic and are upgraded to Put/Delete/Lock during prewrite
+  - GC uses a 3-state machine: Rewind → RemoveIdempotent → RemoveAll
+  - Compaction filter runs the same state machine during RocksDB compaction of CF_WRITE
+  - Resolved TS resolver uses BTreeMap<TimeStamp, TxnLocks> for O(1) min-lock lookup
+  - Scanner's SEEK_BOUND=32 optimization: try next() 32 times before falling back to seek()
+  - check_txn_status has two entry points: lock_exists and missing_lock, handling the two cases separately
+---
+
+## 2026-03-17 - US-005
+- What was implemented: Created impl_docs/coprocessor.md covering the full coprocessor request model (DAG/Analyze/Checksum dispatch), DAG executor pipeline (11 executor types: TableScan, IndexScan, Selection, Projection, Limit, TopN, PartitionTopN, SimpleAggr, FastHashAggr, SlowHashAggr, StreamAggr), batch execution model (BatchExecutor trait, LazyBatchColumnVec, logical rows optimization), RPN expression evaluation framework (1500+ functions, #[rpn_fn] macro, stack-based batch evaluation), aggregation function system (two-trait pattern, AggrFunction/AggrFunctionState), statistics collection (Analyze), Coprocessor V2 plugin system (PluginRegistry, hot-reloading, RawStorage API, sandboxing), memory/time/concurrency quota enforcement, query result caching, and interface patterns for adding new executors/functions/plugins
+- Files changed: impl_docs/coprocessor.md (new)
+- **Learnings for future iterations:**
+  - Batch execution framework lives in 6 crates: tidb_query_executors, tidb_query_expr, tidb_query_common, tidb_query_datatype, tidb_query_aggr, tidb_query_codegen
+  - Expression system uses RPN (Reverse Polish Notation) flat vectors, NOT tree-based evaluation — stack-based batch eval
+  - #[rpn_fn] procedural macro in tidb_query_codegen generates RpnFnMeta, validator, and batch dispatch wrapper
+  - map_expr_node_to_rpn_func() in tidb_query_expr/src/lib.rs is the giant dispatcher for 1500+ scalar function variants
+  - Aggregation uses two-trait pattern: AggrFunctionState (type-erased) + ConcreteAggrFunctionState (type-safe), bridged by #[derive(AggrFunction)]
+  - Coprocessor V2 plugins are cdylib loaded via libloading with hot-reload via filesystem watcher
+  - "Light task" optimization: requests < 5ms bypass concurrency semaphore
+  - LazyBatchColumnVec provides lazy decoding — raw bytes decoded only when accessed
+---
+
+## 2026-03-17 - US-006
+- What was implemented: Created impl_docs/grpc_api_and_server.md covering all 3 gRPC services (~70 TikvService RPCs, DebugService, DiagnosticsService), request routing architecture (read/write/coprocessor paths with dispatch macros), multi-layered flow control (read pool busy threshold, write flow controller with discard ratio and rate limiter, scheduler memory quota, Raft message rejection, gRPC resource limits, quota limiter), connection and session management (server lifecycle, TLS, thread load tracking, request proxying), HTTP status server (30+ endpoints for metrics, profiling, config, diagnostics), inter-node Raft message transport (RaftClient connection pool, message batching, adaptive flush, snapshot transfer, health checking), PD client protocol (region/store heartbeats, TSO, scheduling tasks, reconnection), and safety invariants
+- Files changed: impl_docs/grpc_api_and_server.md (new)
+- **Learnings for future iterations:**
+  - Three dispatch macros (handle_request!, txn_command_future!, handle_cmd!) are the core routing patterns — all RPCs flow through one of these
+  - batch_commands is the primary TiDB→TiKV transport; individual RPCs are mainly for debugging/admin
+  - Flow control has 6+ independent mechanisms operating at different layers (gRPC → read pool → scheduler → flow controller → Raft)
+  - Status server (src/server/status_server/mod.rs, 2205 lines) is Hyper-based HTTP, completely separate from gRPC
+  - RaftClient (src/server/raft_client.rs, 1854 lines) manages connection pool with lock-free ArrayQueue per (store_id, conn_id)
+  - Snapshot transfer uses dedicated gRPC stream with 1MB chunks, NOT the batch_raft stream
+  - PD client TSO uses bounded channel (max 65536) → batching worker (max 64 per batch) → bidirectional streaming RPC
+  - Server supports pause/resume for zero-downtime config updates
+  - Request proxying via tikv-forwarded-host metadata enables communication through network-isolated nodes
+---
+
+## 2026-03-17 - US-007
+- What was implemented: Created impl_docs/cdc_and_backup.md covering CDC architecture (event generation from Raft apply, delegate model with per-region multi-downstream fan-out, downstream state machine, event filtering/assembly, streaming protocol with feature gates, incremental scan initialization, old value handling with LRU cache, TxnSource bitmap for BDR loop detection, memory quota enforcement), raftstore observer pattern (CmdObserver/RoleObserver/RegionChangeObserver traits, ObserveLevel, CmdBatch with ObserveId ABA protection, registration priorities), full backup (SST file export pipeline, BackupWriter dual-CF architecture, ExternalStorage trait with S3/GCS/Azure/local/HDFS backends, disk snapshot support with lease-based write prevention, SoftLimit CPU-based concurrency), backup-stream/PITR (TwoPhaseResolver for concurrent initial scan and incremental events, SubscriptionTracer state machine, EventLoader with DeltaScanner, three-phase checkpoint lifecycle, TempFilePool with swap-to-disk, etcd metadata storage, BackupStreamObserver with SegmentSet range filtering), resolved timestamp (Resolver with dual lock tracking for normal vs large transactions, AdvanceTsWorker with LeadershipResolver quorum verification, lock-only filter optimization, ScannerPool initialization, ChangeRow command parsing, RegionReadProgress safe_ts publication), and component interactions
+- Files changed: impl_docs/cdc_and_backup.md (new)
+- **Learnings for future iterations:**
+  - CDC, backup-stream, and resolved_ts all register with the same CoprocessorHost but with different priorities — CDC at 0, resolved_ts at 1000
+  - ObserveLevel determines what data raftstore includes in CmdBatch: LockRelated (just CF_LOCK + CF_WRITE) vs All (includes CF_DEFAULT)
+  - CDC Delegate supports multiple Downstreams per region with independent state machines and per-downstream filtering
+  - Backup-stream uses TwoPhaseResolver wrapping resolved_ts's Resolver — phase 1 buffers incremental locks during initial scan
+  - Full backup uses direct engine snapshots, NOT the raftstore observer pattern — fundamentally different from CDC/backup-stream
+  - ExternalStorage trait in components/external_storage/ provides unified cloud storage abstraction used by both backup and backup-stream
+  - Disk snapshot mode (disk_snap.rs) uses lease-based write prevention with SnapshotBrWaitApplyRequest for Raft-level consistency
+  - Resolved TS uses dual tracking: normal locks in BTreeMap (O(1) min lookup), large txns use TxnStatusCache for min_commit_ts
+  - LeadershipResolver batches CheckLeader RPCs per store with gzip compression for quorum verification before advancing resolved_ts
+  - Checkpoint management in backup-stream has three phases: resolved_ts → frozen (pre-flush) → checkpoint_ts (post-flush)
+  - Metadata stored in etcd under /tidb/br-stream/ with store-level and region-level checkpoints encoded as big-endian u64
+---
+
+## 2026-03-17 - US-008
+- What was implemented: Created impl_docs/resource_control_security_config.md covering resource control (ResourceGroupManager, ResourceController virtual-time priority scheduling, ResourceLimiter token buckets, RU cost model, GroupQuotaAdjustWorker background quota adjustment, PriorityCtlStrategy, integration with read pool and TxnScheduler and storage layer, metrics), encryption at rest (two-tier key hierarchy with master key and data keys, DataKeyManager with file/key dictionaries, key rotation background worker, FileBackend/KmsBackend/MultiMasterKeyBackend, AES-128/192/256-CTR and SM4-CTR methods, encrypted file format with header, RocksDB integration via WrappedEncryptionKeyManager, backup encryption), TLS security (SecurityConfig, SecurityManager client/server TLS, mTLS with CnChecker CN validation, certificate hot-reload Fetcher, log redaction), configuration system (TikvConfig struct hierarchy with 25+ sub-configs, OnlineConfig trait and derive macro with skip/hidden/submodule attributes, ConfigChange diff-update model, ConfigController with per-module dispatch, ConfigManager implementations, TOML loading and validation pipeline, critical config checking), and logging/diagnostics (slog-based LogDispatcher routing by tag, GlobalLevelFilter with atomic runtime level changes, TikvFormat and JSON formats, slow log with threshold filtering, RotatingFileLogger)
+- Files changed: impl_docs/resource_control_security_config.md (new)
+- **Learnings for future iterations:**
+  - Resource control uses virtual-time scheduling (not pure token bucket) for read pool priority — implemented as YATP TaskPriorityProvider
+  - Priority limiter adjustment is currently DISABLED (issue #18939) — only background quota adjustment is active
+  - Encryption file_dict is plaintext (for debugging), key_dict is encrypted with master key — separation of metadata
+  - DataKeyManager uses AtomicU64 for current_key_id enabling lock-free lookups in hot path
+  - Master key rotation uses previous_master_key fallback — dual-key support during transition
+  - Certificate hot-reload uses file modification time tracking, not filesystem watchers
+  - OnlineConfig derive macro generates diff/update/encoder — field attributes control what's changeable at runtime
+  - ConfigController dispatches per-module and rolls back individual modules on failure (not all-or-nothing)
+  - Log dispatcher routes by slog tag: "slow_log*" → slow drain, "rocksdb_log*" → rocksdb drain, default → normal drain
+  - Slow log filtering is based on "takes" key in log record, not log level — uses SlowLogFilter
+---

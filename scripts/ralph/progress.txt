@@ -1,0 +1,32 @@
+# Ralph Progress Log
+Started: Mon Mar  9 23:11:47 JST 2026
+## Codebase Patterns
+- Module name is `goomacs`, use `go vet ./...` for typechecking
+- Binary name is `goomacs`, excluded in .gitignore
+- tcell v2 is used for terminal handling (github.com/gdamore/tcell/v2)
+- Buffer struct in buffer.go holds text as [][]rune with CursorR/CursorC and Modified flag
+- Run tests with `go test ./... -v`
+---
+
+## 2026-03-09 - US-001
+- Initialized go.mod with module `goomacs`
+- Added tcell/v2 dependency
+- Created main.go with tcell.Screen init, raw mode, cleanup on exit, C-c to quit
+- Added .gitignore for binary
+- Files changed: main.go, go.mod, go.sum, .gitignore
+- **Learnings for future iterations:**
+  - Go 1.24+ is required by tcell v2.13.8
+  - `go vet ./...` is sufficient for typecheck
+  - Screen.Fini() via defer handles cleanup
+---
+
+## 2026-03-09 - US-002
+- Implemented Buffer struct with [][]rune line storage and cursor tracking
+- InsertChar, InsertNewline, Backspace, DeleteChar operations
+- 12 unit tests covering all operations including edge cases
+- Files changed: buffer.go, buffer_test.go
+- **Learnings for future iterations:**
+  - Buffer methods set `b.Modified = true` on any edit — future stories should check this flag
+  - DeleteChar handles both mid-line deletion and line joining (end-of-line case)
+  - Backspace at beginning of line joins with previous line, cursor goes to join point
+---

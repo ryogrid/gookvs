@@ -1,0 +1,231 @@
+{
+  "project": "gookvs Design Documentation",
+  "branchName": "ralph/gookvs-design-docs",
+  "description": "Generate comprehensive English design documents for gookvs, a TiKV-like distributed KVS in Go, under design_docs/ — referencing impl_docs/ and TiKV source as oracles.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Create architecture overview document",
+      "description": "As an AI agent, I want an architecture overview of gookvs so that I understand the Go-based system structure, package layout, goroutine model, and request lifecycle before implementing subsystems.",
+      "acceptanceCriteria": [
+        "Creates design_docs/00_architecture_overview.md",
+        "Documents overall gookvs system architecture as a Go-based distributed transactional KV store",
+        "Includes component dependency graph with recommended Go package structure (cmd/, pkg/, internal/)",
+        "Documents goroutine model: which components run in which goroutines, channel-based communication patterns",
+        "Contains mermaid sequence diagrams tracing KV read and KV write request lifecycles (gRPC -> Raft -> storage -> response)",
+        "Describes cluster topology: PD-based discovery, region assignment, leader balancing",
+        "Explains key design decisions: where gookvs diverges from TiKV's internal design and why",
+        "Contains mermaid diagrams for: system architecture, component dependency graph, request lifecycle sequences, goroutine model (minimum 4 diagrams)",
+        "References impl_docs/architecture_overview.md as source; diverges where Go idioms warrant it",
+        "Provides 2-3 library options with pros/cons table for key infrastructure (gRPC framework, logging, metrics)"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Create initial priority and scope document",
+      "description": "As a user deciding scope, I want an initial priority ranking seeded from the architecture overview so that scope planning can begin early.",
+      "acceptanceCriteria": [
+        "Creates design_docs/08_priority_and_scope.md",
+        "Organizes components/features identified in the architecture overview into 4 tiers: Tier 1 (Essential), Tier 2 (Important), Tier 3 (Nice-to-have), Tier 4 (Optional)",
+        "Includes a summary table with columns: component name | tier | complexity (S/M/L/XL) | dependencies | status (designed/pending)",
+        "Provides recommended implementation order within Tier 1",
+        "Notes which TiKV test areas map to each component for future test adaptation"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "Create key encoding and data formats document",
+      "description": "As an AI agent, I want byte-level key encoding and data format specifications so that I can implement storage layers compatible with TiKV's external key format.",
+      "acceptanceCriteria": [
+        "Creates design_docs/01_key_encoding_and_data_formats.md",
+        "Documents key encoding scheme: user keys to internal keys (compatible with TiKV's external format for client compatibility)",
+        "Specifies MVCC key format: version/timestamp encoding, ordering guarantees",
+        "Documents Lock, Write, and Default column family layouts",
+        "Provides Go struct definitions with key method signatures for internal data representations",
+        "Presents 2-3 RocksDB Go binding options with pros/cons comparison table",
+        "Documents protobuf message handling: reuse of TiKV's .proto definitions",
+        "Contains mermaid diagrams for: key encoding transformation flow, column family data layout (minimum 2 diagrams)",
+        "References impl_docs/key_encoding_and_data_formats.md as source"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "Update priority and scope after key encoding design",
+      "description": "As a user deciding scope, I want the priority document updated with key encoding and data format details.",
+      "acceptanceCriteria": [
+        "Updates design_docs/08_priority_and_scope.md",
+        "Adds/refines entries for key encoding, MVCC format, column family management, protobuf handling components",
+        "Updates status column for key encoding subsystem to 'designed'",
+        "Updates dependency information based on newly identified interfaces"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "Create Raft and replication document",
+      "description": "As an AI agent, I want Raft and region management design specifications so that I can implement the consensus and replication layer using Go Raft libraries.",
+      "acceptanceCriteria": [
+        "Creates design_docs/02_raft_and_replication.md",
+        "Documents Raft implementation strategy with 2-3 Go Raft library options (e.g., etcd/raft, hashicorp/raft) with pros/cons table",
+        "Specifies region abstraction: key range mapping, region epoch semantics",
+        "Documents region lifecycle: creation, split, merge with exact sequences and conditions",
+        "Describes Go channel-based message dispatch model (replacing TiKV's batch-system)",
+        "Specifies snapshot generation and application",
+        "Lists safety invariants that prevent data loss or corruption",
+        "Contains mermaid diagrams for: region lifecycle state machine, message dispatch flow, Raft replication sequence (minimum 3 diagrams)",
+        "Provides key Go interface definitions (Region, RaftNode, MessageRouter) with method signatures",
+        "References impl_docs/raft_and_replication.md as source; diverges for Go channel-based architecture"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Update priority and scope after Raft design",
+      "description": "As a user deciding scope, I want the priority document updated with Raft and replication details.",
+      "acceptanceCriteria": [
+        "Updates design_docs/08_priority_and_scope.md",
+        "Adds/refines entries for Raft consensus, region management, split/merge, snapshot, message dispatch components",
+        "Updates status column for Raft subsystem to 'designed'",
+        "Updates dependency and complexity estimates based on Raft library choice"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "Create transaction and MVCC document",
+      "description": "As an AI agent, I want Percolator protocol and MVCC design specifications so that I can implement the transaction layer with testable Go interfaces.",
+      "acceptanceCriteria": [
+        "Creates design_docs/03_transaction_and_mvcc.md",
+        "Specifies Percolator protocol: prewrite/commit/rollback/check-txn-status algorithms",
+        "Documents lock types (pessimistic, optimistic, shared) and their state machines",
+        "Specifies write record types (Put, Delete, Lock, Rollback) and semantics",
+        "Provides Go interface definitions for MVCC reader/writer with method signatures",
+        "Describes conflict detection and resolution as observable behavior",
+        "Documents timestamp oracle interaction",
+        "Specifies GC mechanism and resolved timestamp computation",
+        "Contains mermaid diagrams for: transaction lifecycle sequence, lock state machines, conflict resolution flow (minimum 3 diagrams)",
+        "References impl_docs/transaction_and_mvcc.md as source"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "Update priority and scope after transaction design",
+      "description": "As a user deciding scope, I want the priority document updated with transaction and MVCC details.",
+      "acceptanceCriteria": [
+        "Updates design_docs/08_priority_and_scope.md",
+        "Adds/refines entries for Percolator protocol, MVCC, latch/concurrency control, GC, resolved TS components",
+        "Updates status column for transaction subsystem to 'designed'",
+        "Refines tier placement based on transaction complexity analysis"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Create coprocessor document",
+      "description": "As an AI agent, I want the coprocessor push-down computation design so that I can implement the query execution layer with composable Go executor interfaces.",
+      "acceptanceCriteria": [
+        "Creates design_docs/04_coprocessor.md",
+        "Documents coprocessor request handling model",
+        "Specifies DAG executor pipeline: executor types (TableScan, IndexScan, Selection, Aggregation, TopN, Limit) with Go interface definitions and composition pattern",
+        "Documents expression evaluation framework",
+        "Specifies memory and time quota enforcement mechanisms",
+        "Contains mermaid diagrams for: executor pipeline flow, request processing sequence (minimum 2 diagrams)",
+        "References impl_docs/coprocessor.md as source"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Create gRPC API and server document",
+      "description": "As an AI agent, I want the server layer design so that I can implement a gRPC server compatible with TiKV's external API.",
+      "acceptanceCriteria": [
+        "Creates design_docs/05_grpc_api_and_server.md",
+        "Lists complete gRPC API surface (must be compatible with TiKV's external API)",
+        "Documents request routing from RPCs to internal operations",
+        "Describes flow control and backpressure mechanisms using Go patterns",
+        "Documents PD client protocol as abstract boundary",
+        "Specifies inter-node Raft message transport",
+        "Provides Go gRPC server setup and middleware design with interface definitions",
+        "Presents 2-3 options for gRPC middleware/interceptor patterns with pros/cons",
+        "Contains mermaid diagrams for: request routing flow, gRPC service hierarchy (minimum 2 diagrams)",
+        "References impl_docs/grpc_api_and_server.md as source"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-011",
+      "title": "Create CDC and backup document",
+      "description": "As an AI agent, I want CDC and backup subsystem designs so that I can implement change capture and data protection with Go-native patterns.",
+      "acceptanceCriteria": [
+        "Creates design_docs/06_cdc_and_backup.md",
+        "Documents CDC architecture in Go: event generation, streaming via goroutines/channels",
+        "Describes Raft observer pattern adapted to Go interfaces",
+        "Documents backup process: SST export, external storage abstraction",
+        "Specifies log backup (PITR) architecture",
+        "Presents 2-3 options for external storage abstraction libraries (S3/GCS/Azure) with pros/cons",
+        "Contains mermaid diagrams for: CDC event flow, backup process sequence (minimum 2 diagrams)",
+        "References impl_docs/cdc_and_backup.md as source"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-012",
+      "title": "Create resource control, security, and config document",
+      "description": "As an AI agent, I want resource control, security, and configuration designs so that I can implement operational infrastructure using Go ecosystem conventions.",
+      "acceptanceCriteria": [
+        "Creates design_docs/07_resource_control_security_config.md",
+        "Documents resource control: quota model, priority scheduling",
+        "Specifies encryption at rest: key management hierarchy",
+        "Documents TLS configuration",
+        "Specifies configuration system: Go struct hierarchy, runtime config change propagation",
+        "Presents 2-3 options for logging library (slog, zerolog, zap) with pros/cons table",
+        "Contains mermaid diagrams for: resource control flow, config propagation (minimum 2 diagrams)",
+        "References impl_docs/resource_control_security_config.md as source"
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-013",
+      "title": "Finalize priority and scope document",
+      "description": "As a user deciding scope, I want the priority document finalized with all subsystems ranked, implementation order confirmed, and test adaptation notes complete.",
+      "acceptanceCriteria": [
+        "Updates design_docs/08_priority_and_scope.md with final entries for coprocessor, gRPC/server, CDC/backup, resource control/security/config subsystems",
+        "All components have status 'designed' in summary table",
+        "All 4 tiers have recommended implementation order finalized",
+        "Each component includes: tier justification, complexity estimate (S/M/L/XL), dependencies, and TiKV test area mapping",
+        "Includes a final executive summary with total estimated effort per tier"
+      ],
+      "priority": 13,
+      "passes": true,
+      "notes": ""
+    }
+  ]
+}

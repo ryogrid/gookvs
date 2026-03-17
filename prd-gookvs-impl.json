@@ -1,0 +1,313 @@
+{
+  "project": "gookvs Implementation",
+  "branchName": "gookvs-impl",
+  "description": "Implement gookvs, a TiKV-like distributed transactional KVS in Go. Test-driven: convert TiKV test cases to Go first, then implement. Scope: Tier-1 all + Tier-2 (minus TLS/mTLS) + Tier-4 Admin CLI.",
+  "userStories": [
+    {
+      "id": "IMPL-001",
+      "title": "Proto: generate Go code from kvproto",
+      "tier": 1,
+      "step": 1,
+      "description": "Reuse kvproto .proto files and generate Go code via protoc-gen-go / protoc-gen-go-grpc.",
+      "acceptanceCriteria": [
+        "kvproto .proto files are present in proto/",
+        "Go code is generated and compiles successfully",
+        "Generated gRPC service stubs are importable"
+      ],
+      "testSource": "N/A (generated code)",
+      "passes": false
+    },
+    {
+      "id": "IMPL-002",
+      "title": "pkg/codec: memcomparable byte encoding",
+      "tier": 1,
+      "step": 2,
+      "description": "Implement memcomparable byte encoding, number encoding (uint64, int64, float64), and VarInt. Port TiKV codec tests.",
+      "acceptanceCriteria": [
+        "TiKV codec tests ported to Go and passing",
+        "EncodeBytes/DecodeBytes produce memcomparable output",
+        "Number encoding/decoding is byte-identical to TiKV",
+        "Fuzz tests for round-trip correctness"
+      ],
+      "testSource": "components/codec/src/byte.rs (~14 tests), number.rs (~19 tests)",
+      "passes": false
+    },
+    {
+      "id": "IMPL-003",
+      "title": "pkg/keys: user key / internal key encoding",
+      "tier": 1,
+      "step": 3,
+      "description": "Implement user key to internal key conversion, local key builders for Raft/region state keys.",
+      "acceptanceCriteria": [
+        "TiKV keys tests ported to Go and passing",
+        "Key encoding matches TiKV format exactly",
+        "Local key builders (region state, raft state) work correctly"
+      ],
+      "testSource": "components/keys/src/ (~15 tests)",
+      "passes": false
+    },
+    {
+      "id": "IMPL-004",
+      "title": "pkg/cfnames: column family constants",
+      "tier": 1,
+      "step": 4,
+      "description": "Define column family name constants: CF_DEFAULT, CF_LOCK, CF_WRITE, CF_RAFT.",
+      "acceptanceCriteria": [
+        "Constants match TiKV exactly: \"default\", \"lock\", \"write\", \"raft\"",
+        "Package compiles and is importable"
+      ],
+      "testSource": "N/A (constants only)",
+      "passes": false
+    },
+    {
+      "id": "IMPL-005",
+      "title": "pkg/txntypes: Lock, Write, Mutation structs",
+      "tier": 1,
+      "step": 5,
+      "description": "Implement Lock, Write, Mutation structs with binary serialization byte-identical to TiKV.",
+      "acceptanceCriteria": [
+        "TiKV txn_types tests ported to Go and passing",
+        "Lock/Write serialize/deserialize round-trip correctly",
+        "Binary format is byte-identical to TiKV"
+      ],
+      "testSource": "components/txn_types/src/lock.rs (~17 tests), write.rs (~4 tests)",
+      "passes": false
+    },
+    {
+      "id": "IMPL-006",
+      "title": "internal/engine/traits: KvEngine interfaces",
+      "tier": 1,
+      "step": 6,
+      "description": "Define Go interfaces for KvEngine, Snapshot, WriteBatch, and iterators.",
+      "acceptanceCriteria": [
+        "Interfaces defined and documented",
+        "Engine trait tests ported from TiKV",
+        "Interfaces support 4 column families"
+      ],
+      "testSource": "components/engine_traits/ tests",
+      "passes": false
+    },
+    {
+      "id": "IMPL-007",
+      "title": "internal/engine/rocks: RocksDB backend",
+      "tier": 1,
+      "step": 7,
+      "description": "Implement RocksDB backend via grocksdb with 4 column families.",
+      "acceptanceCriteria": [
+        "RocksDB engine tests ported and passing",
+        "CRUD operations work across 4 column families",
+        "WriteBatch atomic operations work",
+        "Iterator and snapshot operations work"
+      ],
+      "testSource": "components/engine_rocks/src/ tests, components/engine_test/",
+      "passes": false
+    },
+    {
+      "id": "IMPL-008",
+      "title": "pkg/pdclient: PD client",
+      "tier": 1,
+      "step": 8,
+      "description": "Implement PD client for bootstrap, heartbeats, and TSO.",
+      "acceptanceCriteria": [
+        "PD client tests ported and passing",
+        "Can bootstrap cluster with PD",
+        "TSO timestamp allocation works",
+        "Region heartbeat works"
+      ],
+      "testSource": "components/pd_client/ tests",
+      "passes": false
+    },
+    {
+      "id": "IMPL-009",
+      "title": "internal/raftstore: Raft consensus and region management",
+      "tier": 1,
+      "step": 9,
+      "description": "Implement raftstore with router (9a), core peer loop (9b), snapshot (9c), and region split (9d).",
+      "acceptanceCriteria": [
+        "Router: sync.Map-based message dispatch works",
+        "Core: single-region propose/apply via etcd/raft works",
+        "Snapshot: SST export and ingest works",
+        "Split: region split on size threshold works",
+        "Raftstore integration tests pass"
+      ],
+      "testSource": "components/raftstore/src/store/ tests, tests/integrations/raftstore/",
+      "passes": false
+    },
+    {
+      "id": "IMPL-010",
+      "title": "internal/storage/mvcc: MVCC reader/writer",
+      "tier": 1,
+      "step": 10,
+      "description": "Implement MvccTxn (write accumulator), MvccReader, PointGetter, Scanner.",
+      "acceptanceCriteria": [
+        "MVCC tests ported and passing",
+        "MvccTxn accumulates writes correctly",
+        "PointGetter reads correct version",
+        "Scanner with SEEK_BOUND=32 optimization works"
+      ],
+      "testSource": "src/storage/mvcc/ reader/writer tests (~40 tests)",
+      "passes": false
+    },
+    {
+      "id": "IMPL-011",
+      "title": "internal/storage/txn: scheduler, latch, concurrency, actions",
+      "tier": 1,
+      "step": 11,
+      "description": "Implement latch system (11a), ConcurrencyManager (11b), TxnScheduler and Percolator actions (11c).",
+      "acceptanceCriteria": [
+        "Latch tests ported and passing (deadlock-free serialization)",
+        "ConcurrencyManager max_ts tracking works",
+        "Percolator 2PC: prewrite/commit/rollback/check_txn_status work",
+        "TxnScheduler dispatches commands correctly"
+      ],
+      "testSource": "src/storage/txn/ tests, components/concurrency_manager/ tests (~50 tests)",
+      "passes": false
+    },
+    {
+      "id": "IMPL-012",
+      "title": "internal/server: gRPC server and KV service",
+      "tier": 1,
+      "step": 12,
+      "description": "Implement gRPC server with KV service RPCs, routing, and BatchCommands.",
+      "acceptanceCriteria": [
+        "Server tests ported and passing",
+        "KvGet, KvPrewrite, KvCommit RPCs work end-to-end",
+        "BatchCommands bidirectional stream works",
+        "M5 milestone: TiKV-compatible client can execute KV operations"
+      ],
+      "testSource": "src/server/ tests, tests/integrations/server/",
+      "passes": false
+    },
+    {
+      "id": "IMPL-013",
+      "title": "internal/config: configuration system",
+      "tier": 2,
+      "step": "T2-1",
+      "description": "Implement config struct hierarchy, TOML loading via BurntSushi/toml, and validation pipeline.",
+      "acceptanceCriteria": [
+        "Config loads from TOML file",
+        "Validation catches invalid values",
+        "Default values are sensible"
+      ],
+      "testSource": "tests/integrations/config/",
+      "passes": false
+    },
+    {
+      "id": "IMPL-014",
+      "title": "internal/log: logging and diagnostics",
+      "tier": 2,
+      "step": "T2-2",
+      "description": "Implement log/slog + zap backend + LogDispatcher + slow log + file rotation via lumberjack.",
+      "acceptanceCriteria": [
+        "Structured logging works with slog interface",
+        "LogDispatcher routes to multiple outputs",
+        "Slow log captures slow operations",
+        "File rotation works"
+      ],
+      "testSource": "Adapt TiKV log format tests; test LogDispatcher routing",
+      "passes": false
+    },
+    {
+      "id": "IMPL-015",
+      "title": "internal/server/transport: inter-node Raft transport",
+      "tier": 2,
+      "step": "T2-4",
+      "description": "Implement RaftClient for inter-node Raft message transport and snapshot transfer.",
+      "acceptanceCriteria": [
+        "Raft messages sent between nodes correctly",
+        "Snapshot transfer via chunked gRPC works",
+        "Connection pooling and batching work"
+      ],
+      "testSource": "src/server/raft_client.rs tests",
+      "passes": false
+    },
+    {
+      "id": "IMPL-016",
+      "title": "internal/server/status: HTTP status and diagnostics server",
+      "tier": 2,
+      "step": "T2-5",
+      "description": "Implement HTTP status server with pprof, metrics, and config endpoints.",
+      "acceptanceCriteria": [
+        "pprof endpoints accessible",
+        "Prometheus metrics endpoint works",
+        "Config endpoint returns current config"
+      ],
+      "testSource": "src/server/status_server/ tests",
+      "passes": false
+    },
+    {
+      "id": "IMPL-017",
+      "title": "Flow control and backpressure",
+      "tier": 2,
+      "step": "T2-6",
+      "description": "Implement read pool EWMA, write flow controller, and scheduler memory quota.",
+      "acceptanceCriteria": [
+        "Read pool backpressure triggers at threshold",
+        "Write flow controller limits write rate",
+        "Scheduler memory quota enforcement works"
+      ],
+      "testSource": "components/server/src/ flow control tests",
+      "passes": false
+    },
+    {
+      "id": "IMPL-018",
+      "title": "internal/coprocessor: query push-down framework",
+      "tier": 2,
+      "step": "T2-7",
+      "description": "Implement DAG executor pipeline, RPN expressions, and aggregations.",
+      "acceptanceCriteria": [
+        "TableScan executor works",
+        "Selection (filter) executor works",
+        "RPN expression evaluation works",
+        "Aggregation functions work",
+        "Coprocessor tests ported and passing"
+      ],
+      "testSource": "src/coprocessor/ tests, components/tidb_query_*/ tests",
+      "passes": false
+    },
+    {
+      "id": "IMPL-019",
+      "title": "Async commit and 1PC optimizations",
+      "tier": 2,
+      "step": "T2-8",
+      "description": "Implement async commit and 1PC transaction optimizations.",
+      "acceptanceCriteria": [
+        "Async commit reduces latency for qualifying transactions",
+        "1PC avoids CF_LOCK writes for single-region small transactions",
+        "Async commit tests ported and passing"
+      ],
+      "testSource": "src/storage/txn/actions/ async commit tests",
+      "passes": false
+    },
+    {
+      "id": "IMPL-020",
+      "title": "Pessimistic transactions",
+      "tier": 2,
+      "step": "T2-9",
+      "description": "Implement pessimistic lock acquire, upgrade, and rollback.",
+      "acceptanceCriteria": [
+        "Pessimistic lock acquire works",
+        "Lock upgrade from pessimistic to optimistic works",
+        "Pessimistic rollback works",
+        "Pessimistic transaction tests ported and passing"
+      ],
+      "testSource": "src/storage/txn/actions/ pessimistic tests",
+      "passes": false
+    },
+    {
+      "id": "IMPL-021",
+      "title": "cmd/gookvs-ctl: Admin CLI",
+      "tier": 4,
+      "step": "T4-2",
+      "description": "Implement admin CLI for inspecting regions, dumping SST, and triggering manual operations.",
+      "acceptanceCriteria": [
+        "Can inspect region metadata",
+        "Can dump SST file contents",
+        "Can trigger manual compaction",
+        "CLI help and usage work correctly"
+      ],
+      "testSource": "cmd/tikv-ctl/ tests",
+      "passes": false
+    }
+  ]
+}
