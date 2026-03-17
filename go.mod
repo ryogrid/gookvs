@@ -3,15 +3,17 @@ module github.com/ryogrid/gookvs
 go 1.22.2
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/pingcap/kvproto v0.0.0-20260313174008-e3b325474572
+	github.com/prometheus/client_golang v1.15.0
 	github.com/stretchr/testify v1.11.1
 	go.etcd.io/etcd/raft/v3 v3.5.17
 	google.golang.org/grpc v1.59.0
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (
-	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/DataDog/zstd v1.4.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
@@ -31,7 +33,6 @@ require (
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/prometheus/client_golang v1.15.0 // indirect
 	github.com/prometheus/client_model v0.3.0 // indirect
 	github.com/prometheus/common v0.42.0 // indirect
 	github.com/prometheus/procfs v0.9.0 // indirect
@@ -42,6 +43,5 @@ require (
 	golang.org/x/text v0.14.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20231016165738-49dd2c1f3d0b // indirect
 	google.golang.org/protobuf v1.33.0 // indirect
-	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

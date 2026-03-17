@@ -17,6 +17,7 @@ import (
 	"github.com/ryogrid/gookvs/pkg/txntypes"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 )
 
@@ -62,6 +63,9 @@ func NewServer(cfg ServerConfig, storage *Storage) *Server {
 
 	// Register the TikvService.
 	tikvpb.RegisterTikvServer(grpcSrv, &tikvService{server: s})
+
+	// Enable gRPC server reflection for tools like grpcurl.
+	reflection.Register(grpcSrv)
 
 	return s
 }
