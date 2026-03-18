@@ -12,6 +12,7 @@ import (
 	"github.com/ryogrid/gookvs/internal/storage/txn"
 	"github.com/ryogrid/gookvs/internal/storage/txn/concurrency"
 	"github.com/ryogrid/gookvs/internal/storage/txn/latch"
+	"github.com/ryogrid/gookvs/pkg/cfnames"
 	"github.com/ryogrid/gookvs/pkg/txntypes"
 )
 
@@ -359,6 +360,227 @@ func (s *Storage) CheckTxnStatus(primaryKey []byte, startTS txntypes.TimeStamp) 
 	defer reader.Close()
 
 	return txn.CheckTxnStatus(reader, primaryKey, startTS)
+}
+
+// PessimisticLock acquires pessimistic locks on the given keys (standalone mode).
+func (s *Storage) PessimisticLock(keys [][]byte, primary []byte, startTS, forUpdateTS txntypes.TimeStamp, lockTTL uint64) []error {
+	cmdID := s.allocCmdID()
+	lock := s.latches.GenLock(keys)
+	for !s.latches.Acquire(lock, cmdID) {
+	}
+	defer s.latches.Release(lock, cmdID)
+
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	props := txn.PessimisticLockProps{
+		StartTS:     startTS,
+		ForUpdateTS: forUpdateTS,
+		Primary:     primary,
+		LockTTL:     lockTTL,
+	}
+	mvccTxn := mvcc.NewMvccTxn(startTS)
+	errs := make([]error, len(keys))
+	for i, key := range keys {
+		errs[i] = txn.AcquirePessimisticLock(mvccTxn, reader, props, key)
+	}
+
+	hasError := false
+	for _, err := range errs {
+		if err != nil {
+			hasError = true
+			break
+		}
+	}
+	if !hasError {
+		if err := s.ApplyModifies(mvccTxn.Modifies); err != nil {
+			for i := range errs {
+				errs[i] = err
+			}
+		}
+	}
+	return errs
+}
+
+// PessimisticLockModifies returns modifies for cluster mode.
+func (s *Storage) PessimisticLockModifies(keys [][]byte, primary []byte, startTS, forUpdateTS txntypes.TimeStamp, lockTTL uint64) ([]mvcc.Modify, []error) {
+	cmdID := s.allocCmdID()
+	lock := s.latches.GenLock(keys)
+	for !s.latches.Acquire(lock, cmdID) {
+	}
+	defer s.latches.Release(lock, cmdID)
+
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	props := txn.PessimisticLockProps{
+		StartTS:     startTS,
+		ForUpdateTS: forUpdateTS,
+		Primary:     primary,
+		LockTTL:     lockTTL,
+	}
+	mvccTxn := mvcc.NewMvccTxn(startTS)
+	errs := make([]error, len(keys))
+	for i, key := range keys {
+		errs[i] = txn.AcquirePessimisticLock(mvccTxn, reader, props, key)
+	}
+
+	for _, err := range errs {
+		if err != nil {
+			return nil, errs
+		}
+	}
+	return mvccTxn.Modifies, errs
+}
+
+// PessimisticRollbackKeys removes pessimistic locks (standalone mode).
+func (s *Storage) PessimisticRollbackKeys(keys [][]byte, startTS, forUpdateTS txntypes.TimeStamp) []error {
+	cmdID := s.allocCmdID()
+	lock := s.latches.GenLock(keys)
+	for !s.latches.Acquire(lock, cmdID) {
+	}
+	defer s.latches.Release(lock, cmdID)
+
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	mvccTxn := mvcc.NewMvccTxn(startTS)
+	mvccKeys := make([]mvcc.Key, len(keys))
+	for i, k := range keys {
+		mvccKeys[i] = k
+	}
+	errs := txn.PessimisticRollback(mvccTxn, reader, mvccKeys, startTS, forUpdateTS)
+
+	hasError := false
+	for _, err := range errs {
+		if err != nil {
+			hasError = true
+			break
+		}
+	}
+	if !hasError && len(mvccTxn.Modifies) > 0 {
+		if err := s.ApplyModifies(mvccTxn.Modifies); err != nil {
+			for i := range errs {
+				errs[i] = err
+			}
+		}
+	}
+	return errs
+}
+
+// TxnHeartBeat extends the TTL of a transaction's primary lock.
+func (s *Storage) TxnHeartBeat(primaryKey []byte, startTS txntypes.TimeStamp, adviseLockTTL uint64) (uint64, error) {
+	keys := [][]byte{primaryKey}
+	cmdID := s.allocCmdID()
+	lock := s.latches.GenLock(keys)
+	for !s.latches.Acquire(lock, cmdID) {
+	}
+	defer s.latches.Release(lock, cmdID)
+
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	mvccTxn := mvcc.NewMvccTxn(startTS)
+	ttl, err := txn.TxnHeartBeat(mvccTxn, reader, primaryKey, startTS, adviseLockTTL)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(mvccTxn.Modifies) > 0 {
+		if err := s.ApplyModifies(mvccTxn.Modifies); err != nil {
+			return 0, err
+		}
+	}
+	return ttl, nil
+}
+
+// ResolveLock resolves all locks for a transaction (commit or rollback).
+func (s *Storage) ResolveLock(startTS, commitTS txntypes.TimeStamp, keys [][]byte) error {
+	if len(keys) == 0 {
+		// Scan for all locks matching startTS.
+		keys = s.scanLocksForTxn(startTS)
+		if len(keys) == 0 {
+			return nil
+		}
+	}
+
+	cmdID := s.allocCmdID()
+	lock := s.latches.GenLock(keys)
+	for !s.latches.Acquire(lock, cmdID) {
+	}
+	defer s.latches.Release(lock, cmdID)
+
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	mvccTxn := mvcc.NewMvccTxn(startTS)
+	for _, key := range keys {
+		if err := txn.ResolveLock(mvccTxn, reader, key, startTS, commitTS); err != nil {
+			return err
+		}
+	}
+
+	return s.ApplyModifies(mvccTxn.Modifies)
+}
+
+// ResolveLockModifies returns modifies for cluster mode.
+func (s *Storage) ResolveLockModifies(startTS, commitTS txntypes.TimeStamp, keys [][]byte) ([]mvcc.Modify, error) {
+	if len(keys) == 0 {
+		keys = s.scanLocksForTxn(startTS)
+		if len(keys) == 0 {
+			return nil, nil
+		}
+	}
+
+	cmdID := s.allocCmdID()
+	lock := s.latches.GenLock(keys)
+	for !s.latches.Acquire(lock, cmdID) {
+	}
+	defer s.latches.Release(lock, cmdID)
+
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	mvccTxn := mvcc.NewMvccTxn(startTS)
+	for _, key := range keys {
+		if err := txn.ResolveLock(mvccTxn, reader, key, startTS, commitTS); err != nil {
+			return nil, err
+		}
+	}
+
+	return mvccTxn.Modifies, nil
+}
+
+// scanLocksForTxn scans CF_LOCK for all keys locked by the given transaction.
+func (s *Storage) scanLocksForTxn(startTS txntypes.TimeStamp) [][]byte {
+	snap := s.engine.NewSnapshot()
+	defer snap.Close()
+
+	iter := snap.NewIterator(cfnames.CFLock, traits.IterOptions{})
+	defer iter.Close()
+
+	var keys [][]byte
+	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+		lockData := iter.Value()
+		lock, err := txntypes.UnmarshalLock(lockData)
+		if err != nil {
+			continue
+		}
+		if lock.StartTS == startTS {
+			userKey, err := mvcc.DecodeLockKey(iter.Key())
+			if err != nil {
+				continue
+			}
+			keys = append(keys, userKey)
+		}
+	}
+	return keys
 }
 
 // Engine returns the underlying engine for direct access (used in tests).

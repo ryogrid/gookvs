@@ -211,6 +211,45 @@ func CheckTxnStatus(reader *mvcc.MvccReader, primaryKey mvcc.Key, startTS txntyp
 	return &TxnStatus{}, nil
 }
 
+// TxnHeartBeat updates the TTL of an existing lock on the primary key.
+// Returns the actual TTL set on the lock after the update.
+func TxnHeartBeat(txn *mvcc.MvccTxn, reader *mvcc.MvccReader, primaryKey mvcc.Key, startTS txntypes.TimeStamp, adviseTTL uint64) (uint64, error) {
+	lock, err := reader.LoadLock(primaryKey)
+	if err != nil {
+		return 0, err
+	}
+	if lock == nil || lock.StartTS != startTS {
+		return 0, ErrTxnLockNotFound
+	}
+
+	if adviseTTL > lock.TTL {
+		lock.TTL = adviseTTL
+		txn.PutLock(primaryKey, lock)
+	}
+
+	return lock.TTL, nil
+}
+
+// ResolveLock resolves a single key's lock for a given transaction.
+// If commitTS > 0, the lock is committed; if commitTS == 0, the lock is rolled back.
+// If no lock exists for this key/startTS, the operation is silently skipped.
+func ResolveLock(txn *mvcc.MvccTxn, reader *mvcc.MvccReader, key mvcc.Key, startTS, commitTS txntypes.TimeStamp) error {
+	lock, err := reader.LoadLock(key)
+	if err != nil {
+		return err
+	}
+	if lock == nil || lock.StartTS != startTS {
+		return nil // No lock to resolve; silently skip.
+	}
+
+	if commitTS > 0 {
+		// Commit the lock.
+		return Commit(txn, reader, key, startTS, commitTS)
+	}
+	// Rollback the lock.
+	return Rollback(txn, reader, key, startTS)
+}
+
 func mutationOpToLockType(op MutationOp) txntypes.LockType {
 	switch op {
 	case MutationOpPut:

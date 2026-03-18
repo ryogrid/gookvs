@@ -397,6 +397,98 @@ func (svc *tikvService) KvCheckTxnStatus(ctx context.Context, req *kvrpcpb.Check
 	return resp, nil
 }
 
+// --- Pessimistic Lock / ResolveLock / TxnHeartBeat handlers ---
+
+// KvPessimisticLock implements the KvPessimisticLock RPC.
+func (svc *tikvService) KvPessimisticLock(ctx context.Context, req *kvrpcpb.PessimisticLockRequest) (*kvrpcpb.PessimisticLockResponse, error) {
+	resp := &kvrpcpb.PessimisticLockResponse{}
+	keys := make([][]byte, len(req.GetMutations()))
+	for i, m := range req.GetMutations() {
+		keys[i] = m.GetKey()
+	}
+	primary := req.GetPrimaryLock()
+	startTS := txntypes.TimeStamp(req.GetStartVersion())
+	forUpdateTS := txntypes.TimeStamp(req.GetForUpdateTs())
+	lockTTL := req.GetLockTtl()
+
+	if coord := svc.server.coordinator; coord != nil {
+		modifies, errs := svc.server.storage.PessimisticLockModifies(keys, primary, startTS, forUpdateTS, lockTTL)
+		for _, err := range errs {
+			if err != nil {
+				resp.Errors = append(resp.Errors, errToKeyError(err))
+			}
+		}
+		if len(resp.Errors) > 0 || len(modifies) == 0 {
+			return resp, nil
+		}
+		if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+		}
+	} else {
+		errs := svc.server.storage.PessimisticLock(keys, primary, startTS, forUpdateTS, lockTTL)
+		for _, err := range errs {
+			if err != nil {
+				resp.Errors = append(resp.Errors, errToKeyError(err))
+			}
+		}
+	}
+	return resp, nil
+}
+
+// KvPessimisticRollback implements the KvPessimisticRollback RPC.
+func (svc *tikvService) KvPessimisticRollback(ctx context.Context, req *kvrpcpb.PessimisticRollbackRequest) (*kvrpcpb.PessimisticRollbackResponse, error) {
+	resp := &kvrpcpb.PessimisticRollbackResponse{}
+	startTS := txntypes.TimeStamp(req.GetStartVersion())
+	forUpdateTS := txntypes.TimeStamp(req.GetForUpdateTs())
+
+	errs := svc.server.storage.PessimisticRollbackKeys(req.GetKeys(), startTS, forUpdateTS)
+	for _, err := range errs {
+		if err != nil {
+			resp.Errors = append(resp.Errors, errToKeyError(err))
+		}
+	}
+	return resp, nil
+}
+
+// KvTxnHeartBeat implements the KvTxnHeartBeat RPC.
+func (svc *tikvService) KvTxnHeartBeat(ctx context.Context, req *kvrpcpb.TxnHeartBeatRequest) (*kvrpcpb.TxnHeartBeatResponse, error) {
+	resp := &kvrpcpb.TxnHeartBeatResponse{}
+	startTS := txntypes.TimeStamp(req.GetStartVersion())
+
+	ttl, err := svc.server.storage.TxnHeartBeat(req.GetPrimaryLock(), startTS, req.GetAdviseLockTtl())
+	if err != nil {
+		resp.Error = errToKeyError(err)
+		return resp, nil
+	}
+	resp.LockTtl = ttl
+	return resp, nil
+}
+
+// KvResolveLock implements the KvResolveLock RPC.
+func (svc *tikvService) KvResolveLock(ctx context.Context, req *kvrpcpb.ResolveLockRequest) (*kvrpcpb.ResolveLockResponse, error) {
+	resp := &kvrpcpb.ResolveLockResponse{}
+	startTS := txntypes.TimeStamp(req.GetStartVersion())
+	commitTS := txntypes.TimeStamp(req.GetCommitVersion())
+
+	if coord := svc.server.coordinator; coord != nil {
+		modifies, err := svc.server.storage.ResolveLockModifies(startTS, commitTS, req.GetKeys())
+		if err != nil {
+			resp.Error = errToKeyError(err)
+			return resp, nil
+		}
+		if len(modifies) > 0 {
+			if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
+				return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+			}
+		}
+	} else {
+		if err := svc.server.storage.ResolveLock(startTS, commitTS, req.GetKeys()); err != nil {
+			resp.Error = errToKeyError(err)
+		}
+	}
+	return resp, nil
+}
+
 // --- Raw KV handlers ---
 
 // RawGet implements the RawGet RPC.
@@ -586,6 +678,22 @@ func (svc *tikvService) handleBatchCmd(ctx context.Context, req *tikvpb.BatchCom
 	case *tikvpb.BatchCommandsRequest_Request_CheckTxnStatus:
 		r, _ := svc.KvCheckTxnStatus(ctx, cmd.CheckTxnStatus)
 		resp.Cmd = &tikvpb.BatchCommandsResponse_Response_CheckTxnStatus{CheckTxnStatus: r}
+
+	case *tikvpb.BatchCommandsRequest_Request_PessimisticLock:
+		r, _ := svc.KvPessimisticLock(ctx, cmd.PessimisticLock)
+		resp.Cmd = &tikvpb.BatchCommandsResponse_Response_PessimisticLock{PessimisticLock: r}
+
+	case *tikvpb.BatchCommandsRequest_Request_PessimisticRollback:
+		r, _ := svc.KvPessimisticRollback(ctx, cmd.PessimisticRollback)
+		resp.Cmd = &tikvpb.BatchCommandsResponse_Response_PessimisticRollback{PessimisticRollback: r}
+
+	case *tikvpb.BatchCommandsRequest_Request_TxnHeartBeat:
+		r, _ := svc.KvTxnHeartBeat(ctx, cmd.TxnHeartBeat)
+		resp.Cmd = &tikvpb.BatchCommandsResponse_Response_TxnHeartBeat{TxnHeartBeat: r}
+
+	case *tikvpb.BatchCommandsRequest_Request_ResolveLock:
+		r, _ := svc.KvResolveLock(ctx, cmd.ResolveLock)
+		resp.Cmd = &tikvpb.BatchCommandsResponse_Response_ResolveLock{ResolveLock: r}
 
 	case *tikvpb.BatchCommandsRequest_Request_RawGet:
 		r, _ := svc.RawGet(ctx, cmd.RawGet)
