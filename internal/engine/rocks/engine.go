@@ -156,6 +156,7 @@ func (e *Engine) NewSnapshot() traits.Snapshot {
 func (e *Engine) NewWriteBatch() traits.WriteBatch {
 	return &writeBatch{
 		batch: e.db.NewBatch(),
+		db:    e.db,
 	}
 }
 
@@ -198,6 +199,33 @@ func (e *Engine) GetProperty(cf string, name string) (string, error) {
 	// Pebble has limited property support. Return metrics as a string.
 	metrics := e.db.Metrics()
 	return fmt.Sprintf("%v", metrics), nil
+}
+
+// Compact compacts the specified key range.
+func (e *Engine) Compact(start, end []byte) error {
+	return e.db.Compact(start, end, true)
+}
+
+// CompactCF compacts a specific column family's key range.
+func (e *Engine) CompactCF(cf string) error {
+	prefix, err := cfPrefix(cf)
+	if err != nil {
+		return err
+	}
+	start := []byte{prefix}
+	end := cfUpperBound(prefix)
+	return e.db.Compact(start, end, true)
+}
+
+// CompactAll compacts the entire database across all CFs.
+func (e *Engine) CompactAll() error {
+	// Compact each CF individually since Pebble requires start < end.
+	for _, cf := range []string{"default", "lock", "write", "raft"} {
+		if err := e.CompactCF(cf); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e *Engine) Close() error {
@@ -269,12 +297,20 @@ func (s *snapshot) Close() {
 	s.snap.Close()
 }
 
+// savePointState holds the batch state snapshot at a save point.
+type savePointState struct {
+	repr     []byte // serialized batch state via Batch.Repr()
+	count    int    // operation count at save point
+	dataSize int    // data size at save point
+}
+
 // writeBatch implements traits.WriteBatch.
 type writeBatch struct {
 	batch      *pebble.Batch
+	db         *pebble.DB // needed to create new batch on rollback
 	count      int
 	dataSize   int
-	savePoints []int // count at each save point
+	savePoints []savePointState
 	mu         sync.Mutex
 }
 
@@ -357,7 +393,14 @@ func (wb *writeBatch) Clear() {
 func (wb *writeBatch) SetSavePoint() {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
-	wb.savePoints = append(wb.savePoints, wb.count)
+	repr := wb.batch.Repr()
+	snapshot := make([]byte, len(repr))
+	copy(snapshot, repr)
+	wb.savePoints = append(wb.savePoints, savePointState{
+		repr:     snapshot,
+		count:    wb.count,
+		dataSize: wb.dataSize,
+	})
 }
 
 func (wb *writeBatch) RollbackToSavePoint() error {
@@ -366,10 +409,28 @@ func (wb *writeBatch) RollbackToSavePoint() error {
 	if len(wb.savePoints) == 0 {
 		return fmt.Errorf("rocks: no save point set")
 	}
-	// Pebble batches don't support save points natively.
-	// For now, we just pop the save point and return an error if operations
-	// were added since the save point, as we can't truly roll back.
-	// A production implementation would need to track operations more carefully.
+	sp := wb.savePoints[len(wb.savePoints)-1]
+	wb.savePoints = wb.savePoints[:len(wb.savePoints)-1]
+
+	// Restore batch state from snapshot.
+	newBatch := wb.db.NewBatch()
+	if err := newBatch.SetRepr(sp.repr); err != nil {
+		newBatch.Close()
+		return fmt.Errorf("rocks: restore save point: %w", err)
+	}
+	wb.batch.Close()
+	wb.batch = newBatch
+	wb.count = sp.count
+	wb.dataSize = sp.dataSize
+	return nil
+}
+
+func (wb *writeBatch) PopSavePoint() error {
+	wb.mu.Lock()
+	defer wb.mu.Unlock()
+	if len(wb.savePoints) == 0 {
+		return fmt.Errorf("rocks: no save point set")
+	}
 	wb.savePoints = wb.savePoints[:len(wb.savePoints)-1]
 	return nil
 }

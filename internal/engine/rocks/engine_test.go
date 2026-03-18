@@ -729,3 +729,260 @@ func TestCfPrefixMap(t *testing.T) {
 		assert.NoError(t, err, "CF %q should have a prefix", cf)
 	}
 }
+
+// ============================================================================
+// SavePoint tests
+// ============================================================================
+
+func TestSavePointRollbackNone(t *testing.T) {
+	e := newTestEngine(t)
+	wb := e.NewWriteBatch()
+	err := wb.RollbackToSavePoint()
+	assert.Error(t, err, "should error when no save point set")
+}
+
+func TestSavePointPopNone(t *testing.T) {
+	e := newTestEngine(t)
+	wb := e.NewWriteBatch()
+	err := wb.PopSavePoint()
+	assert.Error(t, err, "should error when no save point set")
+}
+
+func TestSavePointRollbackOne(t *testing.T) {
+	e := newTestEngine(t)
+	wb := e.NewWriteBatch()
+
+	wb.SetSavePoint()
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("a"), []byte("1")))
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("b"), []byte("2")))
+
+	require.NoError(t, wb.RollbackToSavePoint())
+	assert.Equal(t, 0, wb.Count())
+	assert.Equal(t, 0, wb.DataSize())
+
+	// Commit empty batch should work.
+	require.NoError(t, wb.Commit())
+
+	// Keys should not exist.
+	_, err := e.Get(cfnames.CFDefault, []byte("a"))
+	assert.ErrorIs(t, err, traits.ErrNotFound)
+}
+
+func TestSavePointRollbackPartial(t *testing.T) {
+	e := newTestEngine(t)
+	wb := e.NewWriteBatch()
+
+	// Add ops before save point.
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("before"), []byte("v1")))
+	assert.Equal(t, 1, wb.Count())
+
+	wb.SetSavePoint()
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("after"), []byte("v2")))
+	assert.Equal(t, 2, wb.Count())
+
+	// Rollback should discard only "after".
+	require.NoError(t, wb.RollbackToSavePoint())
+	assert.Equal(t, 1, wb.Count())
+
+	require.NoError(t, wb.Commit())
+
+	// "before" should exist, "after" should not.
+	got, err := e.Get(cfnames.CFDefault, []byte("before"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v1"), got)
+
+	_, err = e.Get(cfnames.CFDefault, []byte("after"))
+	assert.ErrorIs(t, err, traits.ErrNotFound)
+}
+
+func TestSavePointNestedRollback(t *testing.T) {
+	e := newTestEngine(t)
+	wb := e.NewWriteBatch()
+
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("a"), []byte("1")))
+
+	wb.SetSavePoint() // SP0
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("b"), []byte("2")))
+	assert.Equal(t, 2, wb.Count())
+
+	wb.SetSavePoint() // SP1
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("c"), []byte("3")))
+	assert.Equal(t, 3, wb.Count())
+
+	// Rollback SP1 -> discard "c", keep "a" and "b".
+	require.NoError(t, wb.RollbackToSavePoint())
+	assert.Equal(t, 2, wb.Count())
+
+	// Rollback SP0 -> discard "b", keep only "a".
+	require.NoError(t, wb.RollbackToSavePoint())
+	assert.Equal(t, 1, wb.Count())
+
+	require.NoError(t, wb.Commit())
+
+	got, err := e.Get(cfnames.CFDefault, []byte("a"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("1"), got)
+
+	_, err = e.Get(cfnames.CFDefault, []byte("b"))
+	assert.ErrorIs(t, err, traits.ErrNotFound)
+	_, err = e.Get(cfnames.CFDefault, []byte("c"))
+	assert.ErrorIs(t, err, traits.ErrNotFound)
+}
+
+func TestSavePointPopThenRollback(t *testing.T) {
+	e := newTestEngine(t)
+	wb := e.NewWriteBatch()
+
+	wb.SetSavePoint() // SP0 (empty)
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("a"), []byte("1")))
+
+	wb.SetSavePoint() // SP1
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("b"), []byte("2")))
+
+	// Pop SP1 (keep all ops).
+	require.NoError(t, wb.PopSavePoint())
+
+	// Rollback SP0 -> discard everything.
+	require.NoError(t, wb.RollbackToSavePoint())
+	assert.Equal(t, 0, wb.Count())
+
+	require.NoError(t, wb.Commit())
+
+	_, err := e.Get(cfnames.CFDefault, []byte("a"))
+	assert.ErrorIs(t, err, traits.ErrNotFound)
+}
+
+func TestSavePointAllCommands(t *testing.T) {
+	e := newTestEngine(t)
+
+	// Pre-populate for delete test.
+	require.NoError(t, e.Put(cfnames.CFDefault, []byte("existing"), []byte("old")))
+
+	wb := e.NewWriteBatch()
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("keep"), []byte("v")))
+
+	wb.SetSavePoint()
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("put-key"), []byte("val")))
+	require.NoError(t, wb.Delete(cfnames.CFDefault, []byte("existing")))
+	require.NoError(t, wb.DeleteRange(cfnames.CFDefault, []byte("r1"), []byte("r2")))
+
+	require.NoError(t, wb.RollbackToSavePoint())
+	require.NoError(t, wb.Commit())
+
+	// "keep" should exist.
+	got, err := e.Get(cfnames.CFDefault, []byte("keep"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v"), got)
+
+	// "existing" should still exist (delete was rolled back).
+	got, err = e.Get(cfnames.CFDefault, []byte("existing"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("old"), got)
+
+	// "put-key" should not exist.
+	_, err = e.Get(cfnames.CFDefault, []byte("put-key"))
+	assert.ErrorIs(t, err, traits.ErrNotFound)
+}
+
+func TestSavePointCountsAndDataSize(t *testing.T) {
+	e := newTestEngine(t)
+	wb := e.NewWriteBatch()
+
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("k1"), []byte("v1")))
+	countBefore := wb.Count()
+	sizeBefore := wb.DataSize()
+
+	wb.SetSavePoint()
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("k2"), []byte("v2")))
+	assert.Equal(t, countBefore+1, wb.Count())
+	assert.Greater(t, wb.DataSize(), sizeBefore)
+
+	require.NoError(t, wb.RollbackToSavePoint())
+	assert.Equal(t, countBefore, wb.Count())
+	assert.Equal(t, sizeBefore, wb.DataSize())
+}
+
+func TestSavePointWithCFPrefix(t *testing.T) {
+	e := newTestEngine(t)
+	wb := e.NewWriteBatch()
+
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("dk"), []byte("dv")))
+	require.NoError(t, wb.Put(cfnames.CFWrite, []byte("wk"), []byte("wv")))
+
+	wb.SetSavePoint()
+	require.NoError(t, wb.Put(cfnames.CFLock, []byte("lk"), []byte("lv")))
+	require.NoError(t, wb.Put(cfnames.CFRaft, []byte("rk"), []byte("rv")))
+
+	require.NoError(t, wb.RollbackToSavePoint())
+	require.NoError(t, wb.Commit())
+
+	// Default and Write CFs should have their keys.
+	got, err := e.Get(cfnames.CFDefault, []byte("dk"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("dv"), got)
+
+	got, err = e.Get(cfnames.CFWrite, []byte("wk"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("wv"), got)
+
+	// Lock and Raft CFs should not.
+	_, err = e.Get(cfnames.CFLock, []byte("lk"))
+	assert.ErrorIs(t, err, traits.ErrNotFound)
+	_, err = e.Get(cfnames.CFRaft, []byte("rk"))
+	assert.ErrorIs(t, err, traits.ErrNotFound)
+}
+
+func TestRollbackThenCommit(t *testing.T) {
+	e := newTestEngine(t)
+	wb := e.NewWriteBatch()
+
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("a"), []byte("1")))
+
+	wb.SetSavePoint()
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("b"), []byte("2")))
+	require.NoError(t, wb.RollbackToSavePoint())
+
+	// Add more after rollback.
+	require.NoError(t, wb.Put(cfnames.CFDefault, []byte("c"), []byte("3")))
+	require.NoError(t, wb.Commit())
+
+	got, err := e.Get(cfnames.CFDefault, []byte("a"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("1"), got)
+
+	_, err = e.Get(cfnames.CFDefault, []byte("b"))
+	assert.ErrorIs(t, err, traits.ErrNotFound)
+
+	got, err = e.Get(cfnames.CFDefault, []byte("c"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("3"), got)
+}
+
+// ============================================================================
+// Compact tests
+// ============================================================================
+
+func TestCompactAll(t *testing.T) {
+	e := newTestEngine(t)
+	require.NoError(t, e.Put(cfnames.CFDefault, []byte("k"), []byte("v")))
+	require.NoError(t, e.CompactAll())
+
+	got, err := e.Get(cfnames.CFDefault, []byte("k"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v"), got)
+}
+
+func TestCompactCF(t *testing.T) {
+	e := newTestEngine(t)
+	require.NoError(t, e.Put(cfnames.CFDefault, []byte("k"), []byte("v")))
+	require.NoError(t, e.CompactCF(cfnames.CFDefault))
+
+	got, err := e.Get(cfnames.CFDefault, []byte("k"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v"), got)
+}
+
+func TestCompactEmptyDB(t *testing.T) {
+	e := newTestEngine(t)
+	require.NoError(t, e.CompactAll())
+}

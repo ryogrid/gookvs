@@ -97,6 +97,9 @@ type WriteBatch interface {
 	// RollbackToSavePoint rolls back to the last save point.
 	RollbackToSavePoint() error
 
+	// PopSavePoint removes the most recent save point without rolling back.
+	PopSavePoint() error
+
 	// Commit atomically applies all mutations in the batch.
 	Commit() error
 }
