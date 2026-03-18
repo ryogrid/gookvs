@@ -108,11 +108,13 @@ func TestPeerSingleNodeElection(t *testing.T) {
 	go p.Run(ctx)
 
 	// Wait for the peer loop to process the bootstrap Ready (which contains
-	// the conf change entry). Only then can Campaign() succeed.
+	// the conf change entry) and potentially self-elect.
 	time.Sleep(200 * time.Millisecond)
 
-	// Campaign to become leader.
-	require.NoError(t, p.Campaign())
+	// Campaign to become leader (skip if already leader due to auto-election).
+	if !p.IsLeader() {
+		require.NoError(t, p.Campaign())
+	}
 
 	// Wait for election to complete.
 	time.Sleep(300 * time.Millisecond)
@@ -153,12 +155,14 @@ func TestPeerProposeAndApply(t *testing.T) {
 
 	go p.Run(ctx)
 
-	// Wait for bootstrap Ready to be processed.
+	// Wait for bootstrap Ready to be processed and potential auto-election.
 	time.Sleep(200 * time.Millisecond)
 
-	// Become leader first.
-	require.NoError(t, p.Campaign())
-	time.Sleep(300 * time.Millisecond)
+	// Become leader first (skip Campaign if already leader due to auto-election).
+	if !p.IsLeader() {
+		require.NoError(t, p.Campaign())
+		time.Sleep(300 * time.Millisecond)
+	}
 	require.True(t, p.IsLeader())
 
 	// Propose some data.

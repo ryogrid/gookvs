@@ -220,16 +220,20 @@
 - [x] task-01-raft-snapshot: SST export/ingest and snapshot transfer (13 tests)
 - [x] task-10-coprocessor-rpc: Coprocessor gRPC integration (12 tests)
 
-### Phase 4 (Priority 4) - PARTIAL
+### Phase 4 (Priority 4) - COMPLETE
 - [x] task-12-gc-worker: GC worker for MVCC version cleanup (8 tests)
 - [x] task-13-pd-server: PD (Placement Driver) server (13 tests)
-- [ ] task-04-conf-change: Raft configuration changes (peer add/remove)
+- [x] task-04-conf-change: Raft configuration changes - peer add/remove, conf change processing, store worker (9 tests)
 
-### Phase 5-7 (Priority 5-7) - PENDING
-- [ ] task-14-pd-integration: PD client wiring (depends on task-13, task-04)
-- [ ] task-02-region-split: Region split (depends on task-04, task-14)
-- [ ] task-15-region-merge: Region merge (depends on task-02, task-04, task-14)
+### Phase 5 (Priority 5) - COMPLETE
+- [x] task-14-pd-integration: PDWorker with store/region heartbeats, task processing, PD command routing (5 tests)
+
+### Phase 6 (Priority 6) - COMPLETE
+- [x] task-02-region-split: SplitCheckWorker, size estimation, ExecBatchSplit, split key calculation (11 tests)
+
+### Phase 7 (Priority 7) - COMPLETE
+- [x] task-15-region-merge: PrepareMerge, CommitMerge, RollbackMerge, CatchUpLogs, MergeState (10 tests)
 
 ## Summary
 All 21 IMPL user stories complete. Total new tests: 179 across 8 new packages.
-Additional impl: 11 of 15 tasks complete with ~130 new tests.
+All 15 additional implementation tasks complete with ~165 new tests.

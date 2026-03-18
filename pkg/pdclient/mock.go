@@ -35,6 +35,9 @@ type MockClient struct {
 
 	// Heartbeat responses: regionID -> scheduled commands.
 	heartbeatResponses map[uint64]*pdpb.RegionHeartbeatResponse
+
+	// Store stats: storeID -> last heartbeat stats.
+	storeStats map[uint64]*pdpb.StoreStats
 }
 
 // NewMockClient creates a new mock PD client.
@@ -45,6 +48,7 @@ func NewMockClient(clusterID uint64) *MockClient {
 		regions:            make(map[uint64]*metapb.Region),
 		leaders:            make(map[uint64]*metapb.Peer),
 		heartbeatResponses: make(map[uint64]*pdpb.RegionHeartbeatResponse),
+		storeStats:         make(map[uint64]*pdpb.StoreStats),
 	}
 	c.nextID.Store(1000) // Start IDs at 1000 to avoid conflicts.
 	c.tsoPhysical.Store(1)
@@ -155,9 +159,20 @@ func (c *MockClient) ReportRegionHeartbeat(_ context.Context, req *pdpb.RegionHe
 	return nil
 }
 
-func (c *MockClient) StoreHeartbeat(_ context.Context, _ *pdpb.StoreStats) error {
-	// No-op for mock.
+func (c *MockClient) StoreHeartbeat(_ context.Context, stats *pdpb.StoreStats) error {
+	if stats != nil {
+		c.mu.Lock()
+		c.storeStats[stats.GetStoreId()] = stats
+		c.mu.Unlock()
+	}
 	return nil
+}
+
+// GetStoreStats returns the last store heartbeat stats for the given store.
+func (c *MockClient) GetStoreStats(storeID uint64) *pdpb.StoreStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.storeStats[storeID]
 }
 
 func (c *MockClient) AskBatchSplit(_ context.Context, _ *metapb.Region, count uint32) (*pdpb.AskBatchSplitResponse, error) {

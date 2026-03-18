@@ -234,6 +234,140 @@ func (sc *StoreCoordinator) Stop() {
 	sc.dones = make(map[uint64]chan struct{})
 }
 
+// RegionCount returns the number of active regions.
+func (sc *StoreCoordinator) RegionCount() int {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	return len(sc.peers)
+}
+
+// IsBusy returns whether the store is under heavy load.
+func (sc *StoreCoordinator) IsBusy() bool {
+	return false // TODO: integrate with flow control
+}
+
+// RunStoreWorker processes store-level messages from the Router.
+// Should be started as a goroutine.
+func (sc *StoreCoordinator) RunStoreWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-sc.router.StoreCh():
+			sc.handleStoreMsg(msg)
+		}
+	}
+}
+
+func (sc *StoreCoordinator) handleStoreMsg(msg raftstore.StoreMsg) {
+	switch msg.Type {
+	case raftstore.StoreMsgTypeCreatePeer:
+		req := msg.Data.(*raftstore.CreatePeerRequest)
+		_ = sc.CreatePeer(req)
+	case raftstore.StoreMsgTypeDestroyPeer:
+		req := msg.Data.(*raftstore.DestroyPeerRequest)
+		_ = sc.DestroyPeer(req)
+	case raftstore.StoreMsgTypeRaftMessage:
+		raftMsg := msg.Data.(*raft_serverpb.RaftMessage)
+		sc.maybeCreatePeerForMessage(raftMsg)
+	}
+}
+
+// CreatePeer creates and starts a new peer for the given region.
+func (sc *StoreCoordinator) CreatePeer(req *raftstore.CreatePeerRequest) error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	regionID := req.Region.GetId()
+	if _, exists := sc.peers[regionID]; exists {
+		return fmt.Errorf("raftstore: peer for region %d already exists", regionID)
+	}
+
+	peer, err := raftstore.NewPeer(
+		regionID, req.PeerID, sc.storeID,
+		req.Region, sc.engine, sc.cfg,
+		nil, // nil peers = non-bootstrap, recover from engine or start empty
+	)
+	if err != nil {
+		return err
+	}
+
+	// Wire sendFunc and applyFunc (same pattern as BootstrapRegion).
+	peer.SetSendFunc(func(msgs []raftpb.Message) {
+		for i := range msgs {
+			sc.sendRaftMessage(regionID, req.Region, req.PeerID, &msgs[i])
+		}
+	})
+	peer.SetApplyFunc(func(regionID uint64, entries []raftpb.Entry) {
+		sc.applyEntries(entries)
+	})
+
+	if err := sc.router.Register(regionID, peer.Mailbox); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	sc.peers[regionID] = peer
+	sc.cancels[regionID] = cancel
+	sc.dones[regionID] = done
+
+	go func() {
+		peer.Run(ctx)
+		close(done)
+	}()
+
+	return nil
+}
+
+// DestroyPeer stops and removes a peer for the given region.
+func (sc *StoreCoordinator) DestroyPeer(req *raftstore.DestroyPeerRequest) error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	regionID := req.RegionID
+	cancel, ok := sc.cancels[regionID]
+	if !ok {
+		return fmt.Errorf("raftstore: peer for region %d not found", regionID)
+	}
+
+	// Cancel the peer goroutine.
+	cancel()
+	<-sc.dones[regionID]
+
+	// Unregister from Router.
+	sc.router.Unregister(regionID)
+
+	// Remove from internal maps.
+	delete(sc.peers, regionID)
+	delete(sc.cancels, regionID)
+	delete(sc.dones, regionID)
+
+	return nil
+}
+
+// maybeCreatePeerForMessage creates a peer if a RaftMessage arrives for an unknown region.
+func (sc *StoreCoordinator) maybeCreatePeerForMessage(msg *raft_serverpb.RaftMessage) {
+	regionID := msg.GetRegionId()
+	if sc.router.HasRegion(regionID) {
+		return
+	}
+
+	region := &metapb.Region{
+		Id: regionID,
+		Peers: []*metapb.Peer{
+			msg.GetFromPeer(),
+			msg.GetToPeer(),
+		},
+	}
+
+	req := &raftstore.CreatePeerRequest{
+		Region: region,
+		PeerID: msg.GetToPeer().GetId(),
+	}
+	_ = sc.CreatePeer(req)
+}
+
 // sendRaftMessage converts and sends a single raftpb.Message via gRPC transport.
 func (sc *StoreCoordinator) sendRaftMessage(regionID uint64, region *metapb.Region, fromPeerID uint64, msg *raftpb.Message) {
 	var toStoreID uint64

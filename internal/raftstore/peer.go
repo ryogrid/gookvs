@@ -336,17 +336,10 @@ func (p *Peer) handleReady() {
 	// Apply committed entries.
 	if len(rd.CommittedEntries) > 0 {
 		// Process conf changes first (must be applied via RawNode.ApplyConfChange).
+		// This also updates region metadata (peer list, epoch).
 		for _, e := range rd.CommittedEntries {
-			if e.Type == raftpb.EntryConfChange {
-				var cc raftpb.ConfChange
-				if err := cc.Unmarshal(e.Data); err == nil {
-					p.rawNode.ApplyConfChange(cc)
-				}
-			} else if e.Type == raftpb.EntryConfChangeV2 {
-				var cc raftpb.ConfChangeV2
-				if err := cc.Unmarshal(e.Data); err == nil {
-					p.rawNode.ApplyConfChange(cc)
-				}
+			if e.Type == raftpb.EntryConfChange || e.Type == raftpb.EntryConfChangeV2 {
+				p.applyConfChangeEntry(e)
 			}
 		}
 		// Send to apply worker for state machine application.
