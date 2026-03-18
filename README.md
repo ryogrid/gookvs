@@ -251,38 +251,6 @@ go test ./internal/server/... -v -count=1
 go test ./pkg/codec/... -v -count=1
 ```
 
-### Test Summary
-
-| Package | Tests | Description |
-|---------|------:|-------------|
-| `pkg/codec` | 23 | Byte/number encoding round-trips and ordering |
-| `pkg/keys` | 16 | Key format, ranges, region ID extraction |
-| `pkg/cfnames` | 3 | Column family constants |
-| `pkg/txntypes` | 12 | Lock/Write serialization round-trips |
-| `pkg/pdclient` | 16 | PD client operations (mock) |
-| `internal/config` | 22 | Config loading, validation, diff, clone |
-| `internal/log` | 22 | Log dispatch, slow log, file rotation |
-| `internal/pd` | 13 | PD server (TSO, metadata, heartbeats) |
-| `internal/engine/traits` | 3 | Interface compliance |
-| `internal/engine/rocks` | 38 | CRUD, CF, snapshot, batch, iterator, bounds |
-| `internal/storage/mvcc` | 38 | Multi-version reads, SI/RC isolation, scanner |
-| `internal/storage/txn` | 45 | Percolator, async commit, 1PC, pessimistic txns |
-| `internal/storage/txn/latch` | 11 | Latch acquire/release, concurrent safety |
-| `internal/storage/txn/concurrency` | 7 | Lock table, max_ts tracking |
-| `internal/storage/txn/scheduler` | 9 | Transaction command dispatcher |
-| `internal/storage/gc` | 8 | MVCC garbage collection worker |
-| `internal/raftstore` | 88 | Peer lifecycle, storage, conf change, snapshot, merge, log GC, cleanup |
-| `internal/raftstore/router` | 14 | Concurrent message routing |
-| `internal/raftstore/split` | 11 | Region split checker |
-| `internal/server` | 99 | gRPC handlers, coordinator, raw KV, PD worker |
-| `internal/server/transport` | 22 | Raft transport, connection pool, batching |
-| `internal/server/status` | 13 | HTTP status endpoints |
-| `internal/server/flow` | 25 | Flow control, EWMA, memory quota |
-| `internal/coprocessor` | 45 | RPN, table scan, selection, aggregation |
-| `cmd/gookvs-ctl` | 20 | Admin CLI commands |
-| `e2e` | 35 | End-to-end: cluster, PD, Raw KV, GC, txn RPCs, region ops |
-| **Total** | **601** | **27 packages, all passing** |
-
 ## Client-Server Verification
 
 ### Starting the Server
