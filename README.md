@@ -2,29 +2,39 @@
 
 A Go-based distributed transactional key-value store modeled after [TiKV](https://github.com/tikv/tikv). It implements the TiKV wire protocol (kvproto) and provides MVCC-based transactions using the Percolator two-phase commit protocol.
 
+<p align="center">
+  <img src="gookvs_logo.jpg" alt="gookvs logo" />
+</p>
+
 ## Project Overview
 
 gookvs reproduces the core architecture of TiKV in Go:
 
 - **Codec layer** — order-preserving memcomparable key encoding
 - **Storage engine** — Pebble-backed KV engine with column family emulation
-- **MVCC** — multi-version concurrency control with snapshot isolation and read-committed support
-- **Transaction layer** — Percolator 2PC, async commit, 1PC optimization, pessimistic transactions
+- **MVCC** — multi-version concurrency control with snapshot isolation, read-committed support, and range scanner
+- **Transaction layer** — Percolator 2PC, async commit, 1PC optimization, pessimistic transactions, transaction scheduler
+- **MVCC garbage collection** — three-state GC worker for old version cleanup
+- **Raw KV API** — non-transactional get/put/delete/scan/batch operations
 - **Raft consensus** — etcd/raft integration with region-based routing and inter-node transport
+- **Raft lifecycle** — log compaction, snapshot generation/application, configuration changes (AddNode/RemoveNode)
+- **Region management** — region split (size-based with midpoint key), region merge (prepare/commit/rollback)
+- **Placement Driver (PD)** — TSO allocation, cluster metadata, store/region heartbeats, split scheduling
 - **Coprocessor** — push-down execution with RPN expressions, table scan, selection, aggregation
 - **gRPC server** — TiKV-compatible RPC interface via `pingcap/kvproto`
 - **HTTP status server** — pprof, Prometheus metrics, health checks
 - **Configuration** — TOML config with validation, CLI flag overrides
 - **Logging** — structured logging with slow-log routing and file rotation
 - **Flow control** — EWMA-based backpressure and memory quota
-- **Admin CLI** — `gookvs-ctl` for inspecting data, MVCC info, compaction
+- **Admin CLI** — `gookvs-ctl` for inspecting data, MVCC info, compaction, region listing
 
 ## Directory Structure
 
 ```
 cmd/
   gookvs-server/          # Server binary entry point
-  gookvs-ctl/             # Admin CLI (scan, get, mvcc, dump, size, compact)
+  gookvs-ctl/             # Admin CLI (scan, get, mvcc, dump, size, compact, region)
+  gookvs-pd/              # Placement Driver server binary
 pkg/                      # Public packages (importable by external code)
   codec/                  # Memcomparable byte/number encoding
   keys/                   # User key <-> internal key encoding (DataKey, RaftLogKey, etc.)
@@ -34,23 +44,36 @@ pkg/                      # Public packages (importable by external code)
 internal/                 # Private implementation packages
   config/                 # TOML config loading, validation, ReadableSize/Duration types
   log/                    # Structured logging, LogDispatcher, SlowLogHandler, file rotation
+  pd/                     # PD server (TSO allocator, metadata store, 16 gRPC RPCs)
   engine/
     traits/               # KvEngine, Snapshot, WriteBatch, Iterator interfaces
     rocks/                # Pebble-backed engine with CF emulation via key prefixing
   storage/
-    mvcc/                 # MVCC key encoding, MvccTxn, MvccReader, PointGetter
+    mvcc/                 # MVCC key encoding, MvccTxn, MvccReader, PointGetter, Scanner
     txn/                  # Percolator actions (Prewrite, Commit, Rollback, CheckTxnStatus)
       latch/              # Deadlock-free key latch system
       concurrency/        # In-memory lock table + max_ts tracking
+      scheduler/          # Transaction command dispatcher
       async_commit.go     # Async commit, 1PC optimization
       pessimistic.go      # Pessimistic lock acquire, upgrade, rollback
+    gc/                   # MVCC garbage collection worker (three-state machine)
   raftstore/              # Raft peer loop, PeerStorage, message types
     router/               # Region-based message routing (sync.Map)
+    split/                # Region split checker (size-based, midpoint key)
+    raftlog_gc.go         # Raft log compaction (GC tick, background deletion)
+    snapshot.go           # Raft snapshot generation, transfer, and application
+    conf_change.go        # Raft configuration changes (AddNode, RemoveNode)
+    merge.go              # Region merge (PrepareMerge, CommitMerge, RollbackMerge)
+    store_worker.go       # Store worker utilities (CleanupRegionData)
   server/                 # gRPC server, TikvService implementation, Storage bridge
+    coordinator.go        # StoreCoordinator (peer lifecycle, region bootstrap, message dispatch)
+    raw_storage.go        # Raw KV storage (non-transactional API)
+    pd_worker.go          # PD heartbeat worker (store/region heartbeats, split reporting)
     transport/            # Inter-node Raft transport, connection pooling, message batching
     status/               # HTTP status server (pprof, metrics, health, config)
     flow/                 # Flow control, EWMA backpressure, memory quota
   coprocessor/            # Push-down execution: RPN, TableScan, Selection, Aggregation
+e2e/                      # End-to-end integration tests (cluster, PD, Raw KV, GC, etc.)
 proto/                    # Reference .proto files from kvproto
 design_docs/              # Architecture and design documents (00-08)
 tasks/                    # Project tracking (todo.md)
@@ -74,12 +97,15 @@ Module path: `github.com/ryogrid/gookvs`
 ## Building
 
 ```bash
-# Build both server and CLI binaries
+# Build all binaries
 make build
 
 # This produces:
 #   ./gookvs-server
 #   ./gookvs-ctl
+
+# Build PD server separately
+go build -o gookvs-pd ./cmd/gookvs-pd
 ```
 
 ## Running the Server
@@ -104,6 +130,19 @@ The server exposes:
 - **HTTP** on `--status-addr` (default `127.0.0.1:20180`) — pprof, metrics, health
 
 Shut down gracefully with `SIGINT` or `SIGTERM`.
+
+## Running the PD Server
+
+```bash
+# Start the Placement Driver server
+./gookvs-pd --addr 0.0.0.0:2379
+
+# PD provides:
+#   - TSO (timestamp oracle) allocation
+#   - Cluster metadata management (store/region CRUD)
+#   - Region scheduling (split ID allocation, heartbeat processing)
+#   - GC safe point management
+```
 
 ## Running a Cluster
 
@@ -182,21 +221,27 @@ The `make cluster-verify` target (or `go run scripts/cluster-verify.go`) perform
 # Show MVCC versions for a key
 ./gookvs-ctl mvcc --db /tmp/gookvs-data --key 68656c6c6f
 
-# Dump raw key-value pairs
-./gookvs-ctl dump --db /tmp/gookvs-data --cf write --limit 50
+# Dump raw key-value pairs (with optional --decode for human-readable output)
+./gookvs-ctl dump --db /tmp/gookvs-data --cf write --limit 50 --decode
 
 # Show approximate data size
 ./gookvs-ctl size --db /tmp/gookvs-data
 
 # Trigger manual compaction
 ./gookvs-ctl compact --db /tmp/gookvs-data --cf default
+
+# List regions
+./gookvs-ctl region --db /tmp/gookvs-data
 ```
 
 ## Running Tests
 
 ```bash
-# Run all tests (verbose, no cache)
+# Run unit and integration tests
 make test
+
+# Run end-to-end tests
+make test-e2e
 
 # Run go vet
 make vet
@@ -217,20 +262,26 @@ go test ./pkg/codec/... -v -count=1
 | `pkg/pdclient` | 16 | PD client operations (mock) |
 | `internal/config` | 22 | Config loading, validation, diff, clone |
 | `internal/log` | 22 | Log dispatch, slow log, file rotation |
+| `internal/pd` | 13 | PD server (TSO, metadata, heartbeats) |
 | `internal/engine/traits` | 3 | Interface compliance |
 | `internal/engine/rocks` | 38 | CRUD, CF, snapshot, batch, iterator, bounds |
-| `internal/storage/mvcc` | 20 | Multi-version reads, SI/RC isolation |
+| `internal/storage/mvcc` | 38 | Multi-version reads, SI/RC isolation, scanner |
 | `internal/storage/txn` | 45 | Percolator, async commit, 1PC, pessimistic txns |
 | `internal/storage/txn/latch` | 11 | Latch acquire/release, concurrent safety |
 | `internal/storage/txn/concurrency` | 7 | Lock table, max_ts tracking |
-| `internal/raftstore` | 19 | Bootstrap, election, proposal, peer storage |
+| `internal/storage/txn/scheduler` | 9 | Transaction command dispatcher |
+| `internal/storage/gc` | 8 | MVCC garbage collection worker |
+| `internal/raftstore` | 88 | Peer lifecycle, storage, conf change, snapshot, merge, log GC, cleanup |
 | `internal/raftstore/router` | 14 | Concurrent message routing |
-| `internal/server` | 18 | Full gRPC end-to-end tests |
+| `internal/raftstore/split` | 11 | Region split checker |
+| `internal/server` | 99 | gRPC handlers, coordinator, raw KV, PD worker |
 | `internal/server/transport` | 22 | Raft transport, connection pool, batching |
 | `internal/server/status` | 13 | HTTP status endpoints |
 | `internal/server/flow` | 25 | Flow control, EWMA, memory quota |
 | `internal/coprocessor` | 45 | RPN, table scan, selection, aggregation |
-| **Total** | **394** | **20 packages, all passing** |
+| `cmd/gookvs-ctl` | 20 | Admin CLI commands |
+| `e2e` | 35 | End-to-end: cluster, PD, Raw KV, GC, txn RPCs, region ops |
+| **Total** | **601** | **27 packages, all passing** |
 
 ## Client-Server Verification
 
@@ -247,10 +298,15 @@ go test ./pkg/codec/... -v -count=1
 grpcurl -plaintext 127.0.0.1:20160 list
 
 # The server exposes the tikvpb.Tikv service with these RPCs:
-#   KvGet, KvScan, KvBatchGet
-#   KvPrewrite, KvCommit
-#   KvBatchRollback, KvCleanup, KvCheckTxnStatus
-#   BatchCommands (bidirectional streaming)
+#   Transactional: KvGet, KvScan, KvBatchGet, KvPrewrite, KvCommit,
+#     KvBatchRollback, KvCleanup, KvCheckTxnStatus,
+#     KvPessimisticLock, KVPessimisticRollback,
+#     KvTxnHeartBeat, KvResolveLock, KvGC
+#   Raw KV: RawGet, RawPut, RawDelete, RawScan,
+#     RawBatchGet, RawBatchPut, RawBatchDelete, RawDeleteRange
+#   Coprocessor: Coprocessor, CoprocessorStream
+#   Raft: Raft, BatchRaft
+#   Batch: BatchCommands (bidirectional streaming)
 ```
 
 ### Programmatic Go Client Example
@@ -347,36 +403,46 @@ go tool pprof http://127.0.0.1:20180/debug/pprof/profile?seconds=10
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     gRPC Server                         │
-│              (tikvpb.TikvServer interface)               │
-│  KvGet, KvScan, KvPrewrite, KvCommit, BatchCommands     │
-├──────────────────────┬──────────────────────────────────┤
-│   HTTP Status Server │        Flow Control              │
-│  (pprof, metrics,    │  (EWMA backpressure,             │
-│   health, config)    │   memory quota)                  │
-├──────────────────────┴──────────────────────────────────┤
-│                    Storage Bridge                        │
-│       (latch acquisition, MVCC transaction               │
-│        management, engine coordination)                  │
-├───────────────┬─────────────────┬───────────────────────┤
-│  Transaction  │   Coprocessor   │      Raftstore        │
-│  - Percolator │  - RPN engine   │  - etcd/raft          │
-│  - Async      │  - TableScan    │  - PeerStorage        │
-│    commit/1PC │  - Selection    │  - Router             │
-│  - Pessimistic│  - Aggregation  │  - Transport          │
-├───────────────┤                 │  (connection pool,    │
-│     MVCC      │                 │   message batching)   │
-│  - MvccReader │                 │                       │
-│  - PointGetter│                 │                       │
-│  - MvccTxn    │                 │                       │
-├───────────────┴─────────────────┴───────────────────────┤
-│               Engine (traits.KvEngine)                   │
-│          Pebble backend with CF emulation                │
-│          (default, lock, write, raft)                    │
-├─────────────────────────────────────────────────────────┤
-│     Config (TOML)  │  Logging (slog + lumberjack)       │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                          gRPC Server                                 │
+│                   (tikvpb.TikvServer interface)                      │
+│  Txn: KvGet, KvScan, KvPrewrite, KvCommit, Pessimistic, Resolve     │
+│  Raw: RawGet, RawPut, RawDelete, RawScan, Batch*                    │
+│  Coprocessor, BatchCommands, Raft, BatchRaft, KvGC                   │
+├───────────────────┬──────────────────────────────────────────────────┤
+│  HTTP Status      │            Flow Control                          │
+│  (pprof, metrics, │  (EWMA backpressure, memory quota)               │
+│   health, config) │                                                  │
+├───────────────────┴──────────────────────────────────────────────────┤
+│                       Storage Bridge                                 │
+│          (latch acquisition, MVCC transaction management,            │
+│           engine coordination, Raw KV storage)                       │
+├──────────────┬────────────────┬──────────────────────────────────────┤
+│ Transaction  │  Coprocessor   │          Raftstore                   │
+│ - Percolator │  - RPN engine  │  - etcd/raft peers                   │
+│ - Async      │  - TableScan   │  - PeerStorage                      │
+│   commit/1PC │  - Selection   │  - Router + Transport                │
+│ - Pessimistic│  - Aggregation │  - StoreCoordinator                  │
+│ - Scheduler  │                │  - Raft log compaction               │
+├──────────────┤                │  - Snapshot gen/apply                │
+│    MVCC      │                │  - Conf change (Add/Remove)          │
+│ - MvccReader │                │  - Region split (size-based)         │
+│ - PointGetter│                │  - Region merge                      │
+│ - MvccTxn    │                │    (prepare/commit/rollback)         │
+│ - Scanner    │                │                                      │
+├──────────────┤                ├──────────────────────────────────────┤
+│   GC Worker  │                │       Placement Driver (PD)          │
+│ - 3-state GC │                │  - TSO allocator                     │
+│ - KvGC RPC   │                │  - Metadata store                    │
+│              │                │  - Heartbeat processing              │
+│              │                │  - Split scheduling                  │
+├──────────────┴────────────────┴──────────────────────────────────────┤
+│                    Engine (traits.KvEngine)                           │
+│               Pebble backend with CF emulation                       │
+│               (default, lock, write, raft)                           │
+├──────────────────────────────────────────────────────────────────────┤
+│        Config (TOML)     │     Logging (slog + lumberjack)           │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Implemented User Stories
@@ -404,6 +470,22 @@ go tool pprof http://127.0.0.1:20180/debug/pprof/profile?seconds=10
 | IMPL-019 | internal/storage/txn (async commit and 1PC) | Done |
 | IMPL-020 | internal/storage/txn (pessimistic transactions) | Done |
 | IMPL-021 | cmd/gookvs-ctl (admin CLI) | Done |
+| IMPL-022 | WriteBatch SavePoint (copy-on-savepoint) | Done |
+| IMPL-023 | Raw KV API (RawGet/Put/Delete/Scan/Batch) | Done |
+| IMPL-024 | MVCC Scanner (range queries) | Done |
+| IMPL-025 | TxnScheduler (command dispatcher) | Done |
+| IMPL-026 | RPC wiring (pessimistic lock, resolve, heartbeat) | Done |
+| IMPL-027 | Raft log compaction (GC tick, background deletion) | Done |
+| IMPL-028 | Raft snapshot (SST export/ingest, async generation) | Done |
+| IMPL-029 | Coprocessor gRPC integration | Done |
+| IMPL-030 | MVCC GC worker (three-state machine, KvGC RPC) | Done |
+| IMPL-031 | PD server (TSO, metadata, 16 gRPC RPCs) | Done |
+| IMPL-032 | Raft configuration changes (AddNode/RemoveNode) | Done |
+| IMPL-033 | PD integration (heartbeats, split reporting) | Done |
+| IMPL-034 | Region split (size-based checker, batch split) | Done |
+| IMPL-035 | Region merge (prepare/commit/rollback) | Done |
+| IMPL-036 | CleanupRegionData (peer destruction cleanup) | Done |
+| IMPL-037 | End-to-end integration test suite | Done |
 
 ## Acknowledgments
 
