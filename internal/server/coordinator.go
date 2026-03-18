@@ -343,6 +343,11 @@ func (sc *StoreCoordinator) DestroyPeer(req *raftstore.DestroyPeerRequest) error
 	delete(sc.cancels, regionID)
 	delete(sc.dones, regionID)
 
+	// Clean up persisted Raft state for this region.
+	if err := raftstore.CleanupRegionData(sc.engine, regionID); err != nil {
+		return fmt.Errorf("raftstore: cleanup region %d data: %w", regionID, err)
+	}
+
 	return nil
 }
 
