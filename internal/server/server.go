@@ -14,6 +14,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/raft_serverpb"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
 	copkg "github.com/ryogrid/gookvs/internal/coprocessor"
+	"github.com/ryogrid/gookvs/internal/storage/gc"
 	"github.com/ryogrid/gookvs/internal/storage/mvcc"
 	"github.com/ryogrid/gookvs/internal/storage/txn"
 	"github.com/ryogrid/gookvs/pkg/txntypes"
@@ -35,6 +36,7 @@ type Server struct {
 	grpcServer  *grpc.Server
 	storage     *Storage
 	rawStorage  *RawStorage
+	gcWorker    *gc.GCWorker
 	coordinator *StoreCoordinator
 	listener    net.Listener
 
@@ -56,11 +58,14 @@ func NewServer(cfg ServerConfig, storage *Storage) *Server {
 	opts := buildServerOptions(cfg)
 	grpcSrv := grpc.NewServer(opts...)
 
+	gcWorker := gc.NewGCWorker(storage.Engine(), gc.DefaultGCConfig())
+
 	s := &Server{
 		cfg:        cfg,
 		grpcServer: grpcSrv,
 		storage:    storage,
 		rawStorage: NewRawStorage(storage.Engine()),
+		gcWorker:   gcWorker,
 		ctx:        ctx,
 		cancel:     cancel,
 	}
@@ -617,6 +622,36 @@ func (svc *tikvService) RawDeleteRange(ctx context.Context, req *kvrpcpb.RawDele
 	resp := &kvrpcpb.RawDeleteRangeResponse{}
 	if err := svc.server.rawStorage.DeleteRange(req.GetCf(), req.GetStartKey(), req.GetEndKey()); err != nil {
 		resp.Error = err.Error()
+	}
+	return resp, nil
+}
+
+// --- GC handler ---
+
+// KvGC implements the KvGC RPC.
+func (svc *tikvService) KvGC(ctx context.Context, req *kvrpcpb.GCRequest) (*kvrpcpb.GCResponse, error) {
+	resp := &kvrpcpb.GCResponse{}
+	if svc.server.gcWorker == nil {
+		return resp, nil
+	}
+
+	done := make(chan error, 1)
+	task := gc.GCTask{
+		SafePoint: txntypes.TimeStamp(req.GetSafePoint()),
+		Callback:  func(err error) { done <- err },
+	}
+	if err := svc.server.gcWorker.Schedule(task); err != nil {
+		resp.Error = errToKeyError(err)
+		return resp, nil
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			resp.Error = errToKeyError(err)
+		}
+	case <-ctx.Done():
+		resp.Error = errToKeyError(ctx.Err())
 	}
 	return resp, nil
 }
