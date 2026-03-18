@@ -1,0 +1,378 @@
+{
+  "batch_name": "gookvs-additional-impl",
+  "created": "2026-03-18",
+  "config": {
+    "stop_on_failure": false,
+    "auto_commit": true,
+    "teammates": ["coder", "reviewer", "tester"]
+  },
+  "tasks": [
+    {
+      "id": "task-08-writebatch-savepoint",
+      "description": "Implement WriteBatch.RollbackToSavePoint using Copy-on-SavePoint approach. Design doc: design_docs/additional_impl/08_writebatch_savepoint.md. Use Pebble's batch Repr()/SetRepr() to snapshot and restore batch state at save points. Add PopSavePoint() to WriteBatch interface. Modify internal/engine/rocks/engine.go and internal/engine/traits/traits.go.",
+      "priority": 1,
+      "phase": 1,
+      "dependencies": [],
+      "acceptance_criteria": [
+        "SetSavePoint() captures batch state via Pebble Repr()",
+        "RollbackToSavePoint() restores batch state from saved snapshot",
+        "Nested save points work correctly (stack-based)",
+        "PopSavePoint() added to WriteBatch interface",
+        "Unit tests pass: save/rollback, nested save points, empty batch rollback",
+        "go build succeeds with no errors",
+        "go test ./internal/engine/... passes"
+      ],
+      "files": [
+        "internal/engine/traits/traits.go",
+        "internal/engine/rocks/engine.go",
+        "internal/engine/rocks/engine_test.go"
+      ]
+    },
+    {
+      "id": "task-11-raw-kv-api",
+      "description": "Implement Raw KV API (RawGet, RawPut, RawDelete, RawScan, RawBatchGet, RawBatchPut). Design doc: design_docs/additional_impl/11_raw_kv_api.md. Create RawStorage type bypassing MVCC, add gRPC handlers to tikvService. Supports both standalone and cluster modes.",
+      "priority": 1,
+      "phase": 1,
+      "dependencies": [],
+      "acceptance_criteria": [
+        "RawStorage type created in internal/server/raw_storage.go",
+        "RawGet, RawPut, RawDelete, RawScan gRPC handlers implemented on tikvService",
+        "RawBatchGet, RawBatchPut handlers implemented",
+        "Raw operations bypass MVCC layer, use CF_DEFAULT directly",
+        "Standalone mode writes directly to engine",
+        "Unit tests pass for all Raw* operations",
+        "go build succeeds",
+        "go test ./internal/server/... passes"
+      ],
+      "files": [
+        "internal/server/server.go",
+        "internal/server/raw_storage.go",
+        "internal/server/raw_storage_test.go"
+      ]
+    },
+    {
+      "id": "task-09-cli-improvements",
+      "description": "Implement CLI improvements: region command, enhanced dump with MVCC decoding, actual Pebble compaction. Design doc: design_docs/additional_impl/09_cli_improvements.md. Add cmdRegion() scanning CF_RAFT, add --decode flag to dump, replace SyncWAL with Pebble Compact().",
+      "priority": 1,
+      "phase": 1,
+      "dependencies": [],
+      "acceptance_criteria": [
+        "region command implemented: scans CF_RAFT for RegionStateKey entries",
+        "region --id <id> shows specific region metadata",
+        "region --all lists all regions",
+        "dump --decode flag decodes MVCC keys and Write/Lock records",
+        "compact command calls Pebble Compact() instead of SyncWAL",
+        "CompactCF() and CompactAll() methods added to rocks.Engine",
+        "Unit tests pass for all three improvements",
+        "go build succeeds",
+        "go test ./cmd/gookvs-ctl/... passes"
+      ],
+      "files": [
+        "cmd/gookvs-ctl/main.go",
+        "internal/engine/rocks/engine.go",
+        "cmd/gookvs-ctl/main_test.go"
+      ]
+    },
+    {
+      "id": "task-06-mvcc-scanner",
+      "description": "Implement MVCC Scanner for efficient range queries. Design doc: design_docs/additional_impl/06_mvcc_scanner.md. Create Scanner struct in internal/storage/mvcc/ with forward/backward scan, lock checking, version visibility, key deduplication. Replace ad-hoc Scan() in server/storage.go.",
+      "priority": 1,
+      "phase": 1,
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Scanner struct created in internal/storage/mvcc/scanner.go",
+        "ScannerConfig with ts, isolation level, key range, limit, reverse flag",
+        "Forward scan iterates CF_WRITE in descending commitTS order per user key",
+        "Lock checking for SI isolation (returns ErrKeyIsLocked)",
+        "Key deduplication: returns only latest visible version per user key",
+        "Value retrieval from short value or CF_DEFAULT",
+        "ScanStatistics tracks scanned keys and bytes",
+        "server/storage.go Scan() refactored to use Scanner",
+        "Unit tests pass: basic scan, reverse scan, lock detection, version filtering",
+        "go build succeeds",
+        "go test ./internal/storage/mvcc/... passes"
+      ],
+      "files": [
+        "internal/storage/mvcc/scanner.go",
+        "internal/storage/mvcc/scanner_test.go",
+        "internal/server/storage.go"
+      ]
+    },
+    {
+      "id": "task-03-raft-log-compaction",
+      "description": "Implement Raft log compaction (GC/truncation). Design doc: design_docs/additional_impl/03_raft_log_compaction.md. Handle PeerTickRaftLogGC tick, add CompactLog proposal through Raft, implement apply-side truncation, add background physical deletion.",
+      "priority": 2,
+      "phase": 2,
+      "dependencies": [],
+      "acceptance_criteria": [
+        "PeerTickRaftLogGC handled in peer.go handleMessage()",
+        "Log GC tick evaluates threshold (count and size based)",
+        "CompactLog admin command proposed through Raft",
+        "Apply side advances TruncatedIndex in ApplyState",
+        "Background worker deletes old log entries via DeleteRange on CF_RAFT",
+        "Config fields: raft-log-gc-threshold, raft-log-gc-count-limit consumed",
+        "Unit tests pass for tick evaluation and truncation",
+        "go build succeeds",
+        "go test ./internal/raftstore/... passes"
+      ],
+      "files": [
+        "internal/raftstore/peer.go",
+        "internal/raftstore/storage.go",
+        "internal/raftstore/msg.go",
+        "internal/raftstore/peer_test.go"
+      ]
+    },
+    {
+      "id": "task-07-rpc-wiring",
+      "description": "Wire pessimistic lock, ResolveLock, TxnHeartBeat, async commit, and 1PC into gRPC endpoints. Design doc: design_docs/additional_impl/07_rpc_wiring.md. Add KvPessimisticLock, KvPessimisticRollback, KvResolveLock, KvTxnHeartBeat handlers. Modify KvPrewrite to support async commit and 1PC paths.",
+      "priority": 2,
+      "phase": 2,
+      "dependencies": ["task-06-mvcc-scanner"],
+      "acceptance_criteria": [
+        "KvPessimisticLock gRPC handler calls AcquirePessimisticLock",
+        "KvPessimisticRollback gRPC handler calls PessimisticRollback",
+        "KvResolveLock gRPC handler resolves all locks for a transaction",
+        "KvTxnHeartBeat gRPC handler extends lock TTL",
+        "KvPrewrite checks use_async_commit flag and calls PrewriteAsyncCommit",
+        "KvPrewrite checks try_one_pc flag and calls PrewriteAndCommit1PC",
+        "Storage methods added: PessimisticLock, ResolveLock, TxnHeartBeat",
+        "BatchCommands routing updated for new RPCs",
+        "Unit tests pass for all new handlers",
+        "go build succeeds",
+        "go test ./internal/server/... passes"
+      ],
+      "files": [
+        "internal/server/server.go",
+        "internal/server/storage.go",
+        "internal/storage/txn/actions.go",
+        "internal/server/server_test.go"
+      ]
+    },
+    {
+      "id": "task-05-txn-scheduler",
+      "description": "Implement TxnScheduler command dispatcher. Design doc: design_docs/additional_impl/05_txn_scheduler.md. Create TxnScheduler with command queue, worker pool, latch integration. Replace direct action calls in Storage with scheduler dispatch.",
+      "priority": 2,
+      "phase": 2,
+      "dependencies": [],
+      "acceptance_criteria": [
+        "TxnScheduler struct with worker goroutine pool",
+        "Command interface with concrete types: PrewriteCmd, CommitCmd, RollbackCmd, etc.",
+        "Worker pool size driven by SchedulerConcurrency config",
+        "Latch acquisition integrated into scheduler (acquire before execute, release after)",
+        "Storage methods delegate to scheduler instead of direct action calls",
+        "Callback-based async results",
+        "Unit tests pass: command dispatch, latch contention, concurrent execution",
+        "go build succeeds",
+        "go test ./internal/storage/txn/... passes"
+      ],
+      "files": [
+        "internal/storage/txn/scheduler.go",
+        "internal/storage/txn/scheduler_test.go",
+        "internal/server/storage.go"
+      ]
+    },
+    {
+      "id": "task-01-raft-snapshot",
+      "description": "Implement Raft snapshot SST export/ingest and transport. Design doc: design_docs/additional_impl/01_raft_snapshot.md. Implement PeerStorage.Snapshot() with actual data, snapshot generation state machine, chunked gRPC transfer, and ApplySnapshot for ingest.",
+      "priority": 3,
+      "phase": 3,
+      "dependencies": ["task-03-raft-log-compaction"],
+      "acceptance_criteria": [
+        "PeerStorage.Snapshot() generates snapshot with actual region data from all CFs",
+        "SnapshotData type serializes CF data (default, lock, write) for a region key range",
+        "Snapshot generation runs asynchronously (state machine: Relax/Generating)",
+        "Chunked gRPC transfer via existing transport.SendSnapshot",
+        "ApplySnapshot: ingest received snapshot data into engine atomically",
+        "Post-apply: update ApplyState, hard state, truncated index",
+        "Unit tests pass for snapshot generation and application",
+        "go build succeeds",
+        "go test ./internal/raftstore/... passes"
+      ],
+      "files": [
+        "internal/raftstore/storage.go",
+        "internal/raftstore/snapshot.go",
+        "internal/raftstore/peer.go",
+        "internal/raftstore/snapshot_test.go"
+      ]
+    },
+    {
+      "id": "task-04-conf-change",
+      "description": "Implement Raft configuration changes (peer add/remove). Design doc: design_docs/additional_impl/04_conf_change.md. Enhance handleReady() to perform cluster-level actions, add store worker goroutine for CreatePeer/DestroyPeer, update region metadata.",
+      "priority": 4,
+      "phase": 4,
+      "dependencies": ["task-01-raft-snapshot"],
+      "acceptance_criteria": [
+        "handleReady() updates region.Peers on conf change commit",
+        "Store worker goroutine handles StoreMsgTypeCreatePeer and StoreMsgTypeDestroyPeer",
+        "AddPeer: leader sends message to target store, new peer created and registered",
+        "RemovePeer: peer destroyed and unregistered from Router",
+        "Region metadata (metapb.Region) updated atomically",
+        "ChangePeerResult produced and handled",
+        "Unit tests pass for add/remove peer scenarios",
+        "go build succeeds",
+        "go test ./internal/raftstore/... passes"
+      ],
+      "files": [
+        "internal/raftstore/peer.go",
+        "internal/raftstore/store_worker.go",
+        "internal/server/coordinator.go",
+        "internal/raftstore/peer_test.go"
+      ]
+    },
+    {
+      "id": "task-10-coprocessor-rpc",
+      "description": "Integrate coprocessor with gRPC endpoint. Design doc: design_docs/additional_impl/10_coprocessor_rpc.md. Add Endpoint.Handle() to decode DAG requests, build executor pipeline, execute, encode response. Add tikvService.Coprocessor() handler.",
+      "priority": 3,
+      "phase": 3,
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Endpoint.Handle(req) decodes DAGRequest from protobuf",
+        "Pipeline builder creates executor chain from DAG",
+        "Coprocessor gRPC handler on tikvService",
+        "Response encoded as protobuf coprocessor.Response",
+        "Key range to region mapping for request validation",
+        "Unit tests pass for request decoding and pipeline execution",
+        "go build succeeds",
+        "go test ./internal/coprocessor/... passes"
+      ],
+      "files": [
+        "internal/coprocessor/coprocessor.go",
+        "internal/coprocessor/endpoint.go",
+        "internal/server/server.go",
+        "internal/coprocessor/endpoint_test.go"
+      ]
+    },
+    {
+      "id": "task-13-pd-server",
+      "description": "Implement PD (Placement Driver) server. Design doc: design_docs/additional_impl/13_pd_server.md. Create standalone PD binary (cmd/gookvs-pd/) with TSO allocator, cluster metadata store (Pebble), region tree, heartbeat processing, ID allocation, bootstrap.",
+      "priority": 4,
+      "phase": 4,
+      "dependencies": [],
+      "acceptance_criteria": [
+        "cmd/gookvs-pd/main.go entry point created",
+        "PDServer struct with TSO allocator (physical<<18|logical, monotonic, crash-safe)",
+        "Pebble-backed metadata store for cluster/store/region info",
+        "RegionTree for region key-range lookup",
+        "Bootstrap RPC: first store bootstraps cluster with initial region",
+        "GetTS (TSO) allocates monotonically increasing timestamps",
+        "StoreHeartbeat and RegionHeartbeat processing",
+        "AskBatchSplit allocates IDs, ReportBatchSplit updates metadata",
+        "AllocID provides monotonic unique IDs",
+        "GetRegion, GetRegionByID, ScanRegions for region lookup",
+        "gRPC server implements pdpb.PD service",
+        "Unit tests pass for TSO, metadata store, region tree",
+        "go build ./cmd/gookvs-pd/ succeeds"
+      ],
+      "files": [
+        "cmd/gookvs-pd/main.go",
+        "internal/pd/server.go",
+        "internal/pd/tso.go",
+        "internal/pd/metadata.go",
+        "internal/pd/region_tree.go",
+        "internal/pd/server_test.go"
+      ]
+    },
+    {
+      "id": "task-12-gc-worker",
+      "description": "Implement GC worker for old MVCC version cleanup. Design doc: design_docs/additional_impl/12_gc_worker.md. Create GCWorker goroutine, MVCC GC algorithm (scan CF_WRITE, delete old versions below safe point), KvGC gRPC endpoint.",
+      "priority": 4,
+      "phase": 4,
+      "dependencies": ["task-06-mvcc-scanner"],
+      "acceptance_criteria": [
+        "GCWorker struct with background goroutine",
+        "MVCC GC algorithm: scan CF_WRITE for keys with commitTS < safe_point",
+        "Per-key GC: keep latest version, delete older Put/Delete records and CF_DEFAULT values",
+        "GCTask defines key range and safe point for a GC run",
+        "KvGC gRPC endpoint triggers GC for key range",
+        "Rate limiting to avoid impacting read/write performance",
+        "PD client methods GetGCSafePoint/UpdateGCSafePoint added",
+        "Unit tests pass for GC algorithm and worker lifecycle",
+        "go build succeeds",
+        "go test ./internal/storage/gc/... passes"
+      ],
+      "files": [
+        "internal/storage/gc/gc.go",
+        "internal/storage/gc/gc_worker.go",
+        "internal/storage/gc/gc_test.go",
+        "internal/server/server.go",
+        "pkg/pdclient/client.go"
+      ]
+    },
+    {
+      "id": "task-14-pd-integration",
+      "description": "Wire PD client into gookvs-server: heartbeat loops, TSO usage, PD command processing. Design doc: design_docs/additional_impl/14_pd_integration.md. Create PDWorker goroutine, implement store/region heartbeat, handle PD scheduling commands.",
+      "priority": 5,
+      "phase": 5,
+      "dependencies": ["task-13-pd-server", "task-04-conf-change"],
+      "acceptance_criteria": [
+        "PD client instantiated in main.go using --pd-endpoints",
+        "PDWorker goroutine for store heartbeat (periodic, reports capacity/region count)",
+        "PeerTickPdHeartbeat handled: leader peers send region heartbeat to PD",
+        "PD scheduling commands processed (TransferLeader, ChangePeer)",
+        "TSO used for transaction timestamp allocation",
+        "Graceful degradation when PD is unreachable",
+        "Unit tests pass for PDWorker and heartbeat logic",
+        "go build succeeds",
+        "go test ./internal/... passes"
+      ],
+      "files": [
+        "cmd/gookvs-server/main.go",
+        "internal/server/pd_worker.go",
+        "internal/raftstore/peer.go",
+        "internal/server/coordinator.go",
+        "internal/server/pd_worker_test.go"
+      ]
+    },
+    {
+      "id": "task-02-region-split",
+      "description": "Implement region split: size check, boundary calculation, split execution. Design doc: design_docs/additional_impl/02_region_split.md. Add SplitChecker with periodic tick, split key calculation, AdminSplit proposal through Raft, post-split peer creation.",
+      "priority": 6,
+      "phase": 6,
+      "dependencies": ["task-04-conf-change", "task-14-pd-integration"],
+      "acceptance_criteria": [
+        "SplitChecker runs on PeerTickSplitRegionCheck",
+        "Region size estimation via key range iteration",
+        "Split key selection (approximate middle key)",
+        "AdminSplit proposed through Raft when region exceeds split-size",
+        "Split execution: create new region with right half of key range",
+        "Post-split: new peer created via StoreCoordinator, registered with Router",
+        "PD notified via AskBatchSplit/ReportBatchSplit",
+        "Region metadata updated (start_key, end_key, epoch)",
+        "Unit tests pass for split checker, key calculation, split execution",
+        "go build succeeds",
+        "go test ./internal/raftstore/... passes"
+      ],
+      "files": [
+        "internal/raftstore/split_checker.go",
+        "internal/raftstore/peer.go",
+        "internal/server/coordinator.go",
+        "internal/raftstore/split_checker_test.go"
+      ]
+    },
+    {
+      "id": "task-15-region-merge",
+      "description": "Implement region merge: PrepareMerge, CommitMerge, RollbackMerge. Design doc: design_docs/additional_impl/15_region_merge.md. Two-phase merge protocol: source region proposes PrepareMerge, target region proposes CommitMerge.",
+      "priority": 7,
+      "phase": 7,
+      "dependencies": ["task-02-region-split", "task-04-conf-change", "task-14-pd-integration"],
+      "acceptance_criteria": [
+        "PeerTickCheckMerge handled: detects undersized regions",
+        "PrepareMerge admin command: marks source region as merging",
+        "CommitMerge admin command: target region absorbs source data",
+        "RollbackMerge: handles merge failure gracefully",
+        "Post-merge: source region destroyed, target key range expanded",
+        "Epoch-based safety prevents stale requests during merge",
+        "PD notified of merge completion",
+        "Unit tests pass for merge protocol and edge cases",
+        "go build succeeds",
+        "go test ./internal/raftstore/... passes"
+      ],
+      "files": [
+        "internal/raftstore/peer.go",
+        "internal/raftstore/merge.go",
+        "internal/server/coordinator.go",
+        "internal/raftstore/merge_test.go"
+      ]
+    }
+  ]
+}
