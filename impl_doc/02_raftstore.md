@@ -142,7 +142,7 @@ classDiagram
         -raftLogSizeHint uint64
         -lastCompactedIdx uint64
         -logGCWorkerCh chan RaftLogGCTask
-        -pdTaskCh chan interface{}
+        -pdTaskCh chan interface
         -stopped atomic.Bool
         -isLeader atomic.Bool
         -initialized bool
@@ -150,7 +150,7 @@ classDiagram
         +Propose(data []byte) error
         +Campaign() error
         +Status() raft.Status
-        +SetPDTaskCh(ch chan interface{})
+        +SetPDTaskCh(ch chan interface)
         +SetLogGCWorkerCh(ch chan RaftLogGCTask)
         -handleMessage(msg PeerMsg)
         -propose(cmd *RaftCommand)
@@ -197,7 +197,7 @@ classDiagram
 
     class PeerMsg {
         +Type PeerMsgType
-        +Data interface{}
+        +Data interface
     }
 
     class RaftCommand {
