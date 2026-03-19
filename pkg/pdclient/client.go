@@ -282,6 +282,13 @@ func (c *grpcClient) ReportRegionHeartbeat(ctx context.Context, req *pdpb.Region
 	if err := stream.Send(req); err != nil {
 		return fmt.Errorf("pdclient: region heartbeat send: %w", err)
 	}
+	if err := stream.CloseSend(); err != nil {
+		return fmt.Errorf("pdclient: region heartbeat close: %w", err)
+	}
+	// Wait for the server to acknowledge the heartbeat.
+	if _, err := stream.Recv(); err != nil {
+		return fmt.Errorf("pdclient: region heartbeat recv: %w", err)
+	}
 	return nil
 }
 
