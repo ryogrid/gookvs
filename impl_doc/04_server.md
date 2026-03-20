@@ -191,7 +191,7 @@ The `Tikv` service declares the full TiKV-compatible API. Below is the implement
 | `KvPrewrite` | `PrewriteRequest` / `PrewriteResponse` | Yes |
 | `KvCommit` | `CommitRequest` / `CommitResponse` | Yes |
 | `KvBatchGet` | `BatchGetRequest` / `BatchGetResponse` | Yes |
-| `KvBatchRollback` | `BatchRollbackRequest` / `BatchRollbackResponse` | Yes |
+| `KvBatchRollback` | `BatchRollbackRequest` / `BatchRollbackResponse` | Yes (cluster mode uses `BatchRollbackModifies` + multi-region Raft proposal) |
 | `KvCleanup` | `CleanupRequest` / `CleanupResponse` | Yes |
 | `KvCheckTxnStatus` | `CheckTxnStatusRequest` / `CheckTxnStatusResponse` | Yes |
 | `KvPessimisticLock` | `PessimisticLockRequest` / `PessimisticLockResponse` | Yes (dual-mode: cluster proposes via Raft, standalone applies locally) |
@@ -259,7 +259,7 @@ KvGet(ctx, GetRequest) -> GetResponse
 
 1. Extract `key` and `version` from the `GetRequest`.
 2. Call `storage.Get(key, TimeStamp(version))`.
-3. On `ErrKeyIsLocked`: return `GetResponse` with `Error.Locked` set (including `LockInfo` with the key and lock version). This is a *logical* error, not a gRPC error.
+3. On lock error: use `errors.As(err, &lockErr)` to extract `*mvcc.LockError`, then populate `LockInfo` via `lockToLockInfo(lockErr.Key, lockErr.Lock)` with full lock metadata (`PrimaryLock`, `LockVersion`, `LockTtl`, `TxnSize`, `ForUpdateTs`, `UseAsyncCommit`, `MinCommitTs`, `Secondaries`). This is a *logical* error, not a gRPC error.
 4. On other errors: return a gRPC `Internal` status error.
 5. If `value == nil`: set `resp.NotFound = true`.
 6. Otherwise: set `resp.Value = value`.
@@ -286,7 +286,7 @@ KvPrewrite(ctx, PrewriteRequest) -> PrewriteResponse
 **Cluster mode** (when `coordinator != nil`):
 1. Call `storage.PrewriteModifies(mutations, primary, startTS, lockTTL)` -- this performs MVCC checks and computes `[]mvcc.Modify` without writing to the engine.
 2. If any per-mutation errors exist, convert them via `errToKeyError` and return immediately.
-3. Call `coordinator.ProposeModifies(regionID=1, modifies, 10s timeout)` -- this serializes the modifications as a `RaftCmdRequest`, proposes via Raft, and blocks until the entry is committed and applied on all replicas.
+3. Call `proposeModifiesToRegionsWithRegionError(coord, modifies, 10s timeout)` -- this groups modifications by region via `groupModifiesByRegion()` and proposes to each region's leader separately via Raft. Returns a structured `regionError` on routing failures (NotLeader, RegionNotFound).
 4. Return the response.
 
 **Standalone mode** (when `coordinator == nil`):
@@ -302,7 +302,7 @@ The `KvPrewrite` handler inspects request flags to select the optimal path:
 ### 4.4 KvCommit Handler Flow (dual mode)
 
 Follows the same dual-mode pattern as KvPrewrite:
-- **Cluster**: `storage.CommitModifies` -> `coordinator.ProposeModifies` -> Raft -> applied.
+- **Cluster**: `storage.CommitModifies` -> `proposeModifiesToRegionsWithRegionError(coord, modifies, ...)` which groups modifications by region and proposes to each region's leader separately via Raft.
 - **Standalone**: `storage.Commit` -> direct engine write.
 
 ---
@@ -340,10 +340,12 @@ For `PrewriteModifies`, `CommitModifies`:
 
 Steps 1-4 are identical to the standalone path, but step 5 is skipped. Instead:
 - The method returns `[]mvcc.Modify` to the caller (the gRPC handler).
-- The handler calls `coordinator.ProposeModifies(regionID, modifies, timeout)`.
+- The handler calls `proposeModifiesToRegionsWithRegionError(coord, modifies, timeout)` which groups modifications by region and proposes to each region's leader separately.
 - `ProposeModifies` converts modifies to `[]*raft_cmdpb.Request` via `ModifiesToRequests`, wraps them in a `RaftCmdRequest`, and sends a `PeerMsgTypeRaftCommand` to the peer's mailbox via the router.
 - The peer proposes the entry to Raft. After consensus, the `applyFunc` callback fires.
 - `applyEntries` unmarshals each committed entry back to `RaftCmdRequest`, converts the requests to modifies via `RequestsToModifies`, and calls `storage.ApplyModifies`.
+
+**Note:** `KvBatchRollback`, `KvPessimisticLock`, and `KvResolveLock` also use `proposeModifiesToRegionsWithRegionError` for multi-region routing in cluster mode.
 
 ### 5.4 CheckTxnStatus
 
@@ -395,6 +397,44 @@ type RawStorage struct {
 | `DeleteModify(cf, key)` | Returns an `engine.Modify` (Delete) for use with Raft proposals |
 
 `PutModify` and `DeleteModify` do not write to the engine themselves. They return `engine.Modify` structs that the gRPC handler collects and passes to `coordinator.ProposeModifies` in cluster mode.
+
+### 5.7 BatchRollbackModifies
+
+```go
+func (s *Storage) BatchRollbackModifies(keys [][]byte, startTS txntypes.TimeStamp) ([]mvcc.Modify, error)
+```
+
+Returns `[]mvcc.Modify` without applying — used by the `KvBatchRollback` handler in cluster mode to propose rollback modifications via Raft. Acquires latches for the given keys, creates an `MvccTxn`, calls `txn.Rollback` for each key, and returns the collected modifications.
+
+### 5.8 Multi-Region Helpers
+
+The following helper methods on `tikvService` enable cross-region Raft proposals for operations where mutations may span multiple regions:
+
+```go
+func (svc *tikvService) groupModifiesByRegion(modifies []mvcc.Modify) map[uint64][]mvcc.Modify
+```
+
+Groups modifications by target region using the coordinator's `ResolveRegionForKey()`. Returns `map[regionID → []Modify]`.
+
+```go
+func (svc *tikvService) proposeModifiesToRegions(coord *StoreCoordinator, modifies []mvcc.Modify, timeout time.Duration) error
+```
+
+Groups modifications by region and calls `coord.ProposeModifies()` for each region group sequentially. Returns the first error encountered.
+
+```go
+func (svc *tikvService) proposeModifiesToRegionsWithRegionError(coord *StoreCoordinator, modifies []mvcc.Modify, timeout time.Duration) (*errorpb.Error, error)
+```
+
+Like `proposeModifiesToRegions` but converts proposal errors to structured region errors via `proposeErrorToRegionError()`. Returns `(*errorpb.Error, nil)` for region routing errors (NotLeader, RegionNotFound) or `(nil, error)` for other errors. Used by `KvPrewrite`, `KvCommit`, `KvBatchRollback`, `KvPessimisticLock`, and `KvResolveLock` handlers in cluster mode.
+
+### 5.9 lockToLockInfo
+
+```go
+func lockToLockInfo(key []byte, lock *txntypes.Lock) *kvrpcpb.LockInfo
+```
+
+Converts an internal `Lock` and user key to a protobuf `kvrpcpb.LockInfo` with full metadata: `PrimaryLock`, `LockVersion`, `Key`, `LockTtl`, `TxnSize`, `LockForUpdateTs`, `UseAsyncCommit`, `MinCommitTs`, `Secondaries`. Maps `LockType` to proto `Op` enum (`LockTypePut → Op_Put`, `LockTypeDelete → Op_Del`, etc.). Used by `KvGet`, `KvScan`, and `KvBatchGet` handlers to propagate lock information to clients for lock resolution.
 
 **TTL Support**: `RawStorage` supports per-key TTL (Time-To-Live) with a 9-byte encoding overhead appended to values: 8 bytes for the expiry timestamp (big-endian Unix nanoseconds) + 1 byte flag. All read operations (`Get`, `BatchGet`, `Scan`, `BatchScan`, `Checksum`) automatically filter expired entries. `Put` accepts an optional TTL parameter.
 

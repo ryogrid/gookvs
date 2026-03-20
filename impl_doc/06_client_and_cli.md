@@ -301,6 +301,8 @@ graph TB
     subgraph "pkg/client"
         CLIENT["Client<br/>(entry point)"]
         RAWKV["RawKVClient<br/>(Raw KV API)"]
+        TXNKV["TxnKVClient<br/>(Transactional KV API)"]
+        LOCKRES["LockResolver<br/>(stale lock cleanup)"]
         CACHE["RegionCache<br/>(sorted-slice binary search)"]
         SENDER["RegionRequestSender<br/>(gRPC pool + retry)"]
         RESOLVER["PDStoreResolver<br/>(TTL-cached store lookup)"]
@@ -317,11 +319,17 @@ graph TB
     end
 
     CLIENT --> RAWKV
+    CLIENT --> TXNKV
     CLIENT --> CACHE
     CLIENT --> RESOLVER
     CLIENT --> SENDER
     RAWKV --> SENDER
     RAWKV --> CACHE
+    TXNKV --> SENDER
+    TXNKV --> CACHE
+    TXNKV --> LOCKRES
+    LOCKRES --> SENDER
+    LOCKRES --> PDCLIENT
     SENDER --> CACHE
     SENDER --> RESOLVER
     CACHE --> PDCLIENT
@@ -350,6 +358,7 @@ type Config struct {
 | Method | Description |
 |---|---|
 | `RawKV()` | Returns a `RawKVClient` for key-value operations |
+| `TxnKV()` | Returns a `*TxnKVClient` for transactional key-value operations |
 | `Close()` | Closes sender connections and PD client |
 
 ### 6.4 RawKVClient
@@ -459,6 +468,178 @@ sequenceDiagram
     RawKV-->>App: (value, false, nil)
 ```
 
+### 6.9 TxnKVClient
+
+`TxnKVClient` provides the transactional KV API with cross-region 2PC, lock resolution, and multiple commit modes.
+
+```go
+type TxnKVClient struct {
+    sender   *RegionRequestSender
+    cache    *RegionCache
+    pdClient pdclient.Client
+    resolver *LockResolver
+}
+```
+
+**Construction**: `NewTxnKVClient(sender, cache, pdClient)` creates a new `TxnKVClient` and initializes its `LockResolver`.
+
+| Method | Description |
+|---|---|
+| `Begin(ctx, opts ...TxnOption)` | Allocates a start timestamp from PD via `GetTS` and returns a `*TxnHandle`. Accepts functional options. |
+| `Close()` | Releases resources (currently a no-op). |
+
+**TxnOptions and functional options:**
+
+```go
+type TxnOptions struct {
+    Mode           TxnMode    // TxnModeOptimistic (default) or TxnModePessimistic
+    UseAsyncCommit bool
+    Try1PC         bool
+    LockTTL        uint64     // default: 3000 ms
+}
+
+type TxnOption func(*TxnOptions)
+```
+
+| Option | Effect |
+|---|---|
+| `WithPessimistic()` | Sets `Mode = TxnModePessimistic` — pessimistic locks are acquired eagerly on `Set`/`Delete` |
+| `WithAsyncCommit()` | Sets `UseAsyncCommit = true` — reduces commit latency by making transaction logically committed at prewrite |
+| `With1PC()` | Sets `Try1PC = true` — attempts single-phase commit when all mutations fit in one region |
+| `WithLockTTL(ttl)` | Sets lock TTL in milliseconds |
+
+### 6.10 TxnHandle
+
+`TxnHandle` represents an in-progress transaction. Mutations are buffered in a local `membuf` map and flushed during commit.
+
+```go
+type TxnHandle struct {
+    mu         sync.Mutex
+    client     *TxnKVClient
+    startTS    txntypes.TimeStamp
+    opts       TxnOptions
+    membuf     map[string]mutationEntry  // key → {op, value}
+    lockKeys   [][]byte                  // pessimistic lock keys
+    committed  bool
+    rolledBack bool
+}
+```
+
+| Method | Description |
+|---|---|
+| `Get(ctx, key)` | Reads from `membuf` first, then issues `KvGet` RPC. Retries up to 3 times on lock conflicts using `LockResolver`. Returns `(value, error)`. |
+| `BatchGet(ctx, keys)` | Multi-key read with membuf-first strategy. Returns `([]KvPair, error)`. |
+| `Set(ctx, key, value)` | Buffers a Put mutation. In pessimistic mode, acquires a pessimistic lock via `KvPessimisticLock` RPC. |
+| `Delete(ctx, key)` | Buffers a Delete mutation. In pessimistic mode, acquires a pessimistic lock. |
+| `Commit(ctx)` | Creates a `twoPhaseCommitter` and executes the 2PC protocol. Returns early if `membuf` is empty. |
+| `Rollback(ctx)` | Aborts the transaction. In pessimistic mode, sends `KVPessimisticRollback`; otherwise sends `KvBatchRollback` grouped by region. Idempotent. |
+| `StartTS()` | Returns the transaction's start timestamp. |
+
+**Error handling:** `Get` and `BatchGet` detect lock conflicts via `LockInfo` in the RPC response and call `LockResolver.ResolveLocks` before retrying.
+
+### 6.11 LockResolver
+
+`LockResolver` resolves stale locks encountered during reads by checking the owning transaction's status and committing or rolling back the lock accordingly.
+
+```go
+type LockResolver struct {
+    sender   *RegionRequestSender
+    cache    *RegionCache
+    pdClient pdclient.Client
+
+    mu        sync.Mutex
+    resolving map[lockKey]chan struct{}  // dedup map: {primary, startTS} → wait channel
+}
+```
+
+| Method | Description |
+|---|---|
+| `ResolveLocks(ctx, locks)` | Resolves a list of `*kvrpcpb.LockInfo` by calling `resolveSingleLock` for each. |
+
+**`resolveSingleLock` flow:**
+
+1. Build a `lockKey` from the lock's primary key and start timestamp.
+2. Check the `resolving` map — if another goroutine is already resolving this lock, wait on the channel.
+3. Otherwise, register a channel in `resolving` and proceed.
+4. Call `checkTxnStatus(ctx, primaryKey, lockTS)` — sends `KvCheckTxnStatus` RPC to the primary key's region with `RollbackIfNotExist = true`.
+5. Call `resolveLock(ctx, lock, commitTS)` — sends `KvResolveLock` RPC to the locked key's region. If `commitTS > 0`, the lock is committed; if `commitTS == 0`, it is rolled back.
+6. Close the channel and remove from `resolving` to wake waiters.
+
+### 6.12 twoPhaseCommitter
+
+`twoPhaseCommitter` executes the Percolator two-phase commit protocol for a transaction.
+
+```go
+type twoPhaseCommitter struct {
+    client       *TxnKVClient
+    startTS      txntypes.TimeStamp
+    commitTS     txntypes.TimeStamp
+    mutations    []mutationWithKey
+    primary      []byte
+    opts         TxnOptions
+    prewriteDone bool
+}
+```
+
+**`execute(ctx)` flow:**
+
+1. **`selectPrimary()`** — sorts mutations by key, selects the first key as primary.
+2. **`prewrite(ctx)`** — groups mutations by region via `groupMutationsByRegion()`. Prewrites the primary region synchronously, then prewrites secondary regions in parallel using `errgroup`. Each `prewriteRegion` sends a `KvPrewrite` RPC with `PrimaryLock`, `StartVersion`, `LockTtl`, and `TxnSize`. If `Try1PC` is set and all mutations fit in one region, sets `TryOnePc = true`. If `UseAsyncCommit` is set, populates `Secondaries` list.
+3. On prewrite failure: calls `rollback()` in background and returns the error.
+4. **`getCommitTS`** — allocates a new timestamp from PD via `pdClient.GetTS()`.
+5. **`commitPrimary(ctx)`** — sends `KvCommit` RPC for the primary key synchronously. Skips if 1PC already committed (commitTS set during prewrite).
+6. On commit failure: calls `rollback()` and returns the error.
+7. **`commitSecondaries(ctx)`** — commits all secondary keys in a background goroutine. Groups by region and sends `KvCommit` for each group. Best-effort (errors are ignored since the primary is already committed).
+8. Returns success immediately after primary commit.
+
+**Rollback on failure:** `rollback()` groups all mutation keys by region and sends `KvBatchRollback` for each region group in parallel.
+
+### 6.13 Transactional Request Flow
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant TxnKV as TxnKVClient
+    participant TxnH as TxnHandle
+    participant Committer as twoPhaseCommitter
+    participant PD as PD Server
+    participant Store as gookv-server
+
+    App->>TxnKV: Begin(ctx)
+    TxnKV->>PD: GetTS()
+    PD-->>TxnKV: startTS
+    TxnKV-->>App: TxnHandle
+
+    App->>TxnH: Set(ctx, "account:A", "900")
+    Note over TxnH: Buffer in membuf
+
+    App->>TxnH: Set(ctx, "account:B", "1100")
+    Note over TxnH: Buffer in membuf
+
+    App->>TxnH: Commit(ctx)
+    TxnH->>Committer: execute(ctx)
+
+    Note over Committer: Phase 1 — Prewrite
+    Committer->>Store: KvPrewrite(primary region)
+    Store-->>Committer: ok
+    Committer->>Store: KvPrewrite(secondary regions, parallel)
+    Store-->>Committer: ok
+
+    Note over Committer: Allocate commitTS
+    Committer->>PD: GetTS()
+    PD-->>Committer: commitTS
+
+    Note over Committer: Phase 2 — Commit
+    Committer->>Store: KvCommit(primary key, sync)
+    Store-->>Committer: ok
+
+    Note over Committer: Background
+    Committer->>Store: KvCommit(secondary keys, async)
+
+    Committer-->>TxnH: nil (success)
+    TxnH-->>App: nil
+```
+
 ---
 
 ## 7. Implementation Status
@@ -477,3 +658,4 @@ sequenceDiagram
 | CLI: `dump --decode` | Implemented | MVCC key/value decoding for write and lock CFs |
 | PD client library | Implemented | Full gRPC client with multi-endpoint failover and retry + mock for testing |
 | Client library (`pkg/client`) | Implemented | Multi-region RawKVClient, RegionCache, PDStoreResolver, RegionRequestSender |
+| TxnKVClient (`pkg/client`) | Implemented | TxnHandle, LockResolver, twoPhaseCommitter, 2PC/async-commit/1PC/pessimistic |

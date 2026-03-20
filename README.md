@@ -42,7 +42,7 @@ pkg/                      # Public packages (importable by external code)
   cfnames/                # Column family constants (default, lock, write, raft)
   txntypes/               # Lock, Write, Mutation structs with binary serialization
   pdclient/               # Placement Driver client (gRPC + mock, multi-endpoint failover)
-  client/                 # Multi-region client library (RawKVClient, RegionCache, PDStoreResolver)
+  client/                 # Multi-region client library (RawKVClient, TxnKVClient, RegionCache, LockResolver)
 internal/                 # Private implementation packages
   config/                 # TOML config loading, validation, ReadableSize/Duration types
   log/                    # Structured logging, LogDispatcher, SlowLogHandler, file rotation
@@ -171,6 +171,22 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Printf("CAS: swapped=%v prev=%s\n", swapped, prev)
+
+	// --- Transactional KV (cross-region 2PC) ---
+	txnkv := c.TxnKV()
+
+	txn, err := txnkv.Begin(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	txn.Set(ctx, []byte("account:A"), []byte("900"))
+	txn.Set(ctx, []byte("account:B"), []byte("1100"))
+
+	if err := txn.Commit(ctx); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("Transaction committed")
 }
 ```
 
@@ -179,8 +195,8 @@ func main() {
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │                        Client Library                                │
-│          pkg/client: RawKVClient, RegionCache,                       │
-│          PDStoreResolver, RegionRequestSender                        │
+│          pkg/client: RawKVClient, TxnKVClient, RegionCache,           │
+│          PDStoreResolver, RegionRequestSender, LockResolver           │
 │          (multi-region routing, retry, connection pool)               │
 ├──────────────────────────────────────────────────────────────────────┤
 │                          gRPC Server                                 │
@@ -288,6 +304,7 @@ func main() {
 | IMPL-052 | GC safe point PD centralization (pdclient methods, KvGC integration) | Done |
 | IMPL-053 | KvDeleteRange (ModifyTypeDeleteRange, gRPC handler, Raft serialization) | Done |
 | IMPL-054 | PD scheduling (Scheduler, replica repair, leader balance, PDWorker delivery) | Done |
+| IMPL-055 | pkg/client (cross-region TxnClient, LockResolver, 2PC committer) | Done |
 
 ## Known Limitations
 
@@ -303,7 +320,6 @@ The following features are intentionally deferred or not yet fully connected. Se
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| TxnClient (2PC cross-region) | Not implemented | Only `RawKVClient` is provided. A transactional client with per-region prewrite/commit coordination is deferred to future design. |
 | TSO batching | Not implemented | Each `GetTS` call opens a new stream. Batching multiple allocations into a single RPC is a low-priority optimization. |
 
 ### Placement Driver (PD)

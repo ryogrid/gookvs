@@ -242,7 +242,7 @@ type PointGetter struct {
 
 `Get(key)` proceeds in three steps:
 
-1. **Lock check (SI only):** Calls `reader.LoadLock(key)`. If a lock exists with `StartTS <= ts` and is not in `bypassLocks`, returns `ErrKeyIsLocked`. Under RC isolation, this step is skipped entirely.
+1. **Lock check (SI only):** Calls `reader.LoadLock(key)`. If a lock exists with `StartTS <= ts` and is not in `bypassLocks`, returns `&LockError{Key: key, Lock: lock}`. The `LockError` struct (defined in `point_getter.go`) carries the conflicting key and lock metadata. `errors.Is(err, ErrKeyIsLocked)` still works via `LockError.Is()`. Under RC isolation, this step is skipped entirely.
 
 2. **Find visible write:** Calls `reader.GetWrite(key, ts)` to find the latest data-changing write (Put) visible at `ts`. If no write is found (or it was a Delete), returns `(nil, nil)`.
 
@@ -312,7 +312,7 @@ type Scanner struct {
 
 3. **Bound check:** The selected user key is checked against `UpperBound` (forward) or `LowerBound` (backward). If out of range, the scan terminates.
 
-4. **Lock handling (SI only):** If the lock cursor has an entry for the current user key, `handleLock` checks for conflicts. Pessimistic locks are skipped. If a non-pessimistic lock exists with `StartTS <= ReadTS` and is not in `BypassLocks`, the scanner returns `ErrKeyIsLocked`. After checking, the lock cursor is advanced past this key.
+4. **Lock handling (SI only):** If the lock cursor has an entry for the current user key, `handleLock` checks for conflicts. Pessimistic locks are skipped. If a non-pessimistic lock exists with `StartTS <= ReadTS` and is not in `BypassLocks`, the scanner returns `&LockError{Key: userKey, Lock: lock}` (which satisfies `errors.Is(err, ErrKeyIsLocked)` via the `Is()` method). After checking, the lock cursor is advanced past this key.
 
 5. **Write handling:** If the write cursor has an entry for the current user key, `handleWrite` searches for the latest visible version.
 
