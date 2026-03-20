@@ -15,32 +15,34 @@ gookv reproduces the core architecture of TiKV in Go:
 - **MVCC** — multi-version concurrency control with snapshot isolation, read-committed support, and range scanner
 - **Transaction layer** — Percolator 2PC, async commit, 1PC optimization, pessimistic transactions, transaction scheduler
 - **MVCC garbage collection** — three-state GC worker for old version cleanup
-- **Raw KV API** — non-transactional get/put/delete/scan/batch operations
+- **Raw KV API** — non-transactional get/put/delete/scan/batch operations with TTL, compare-and-swap, and checksum support
+- **Client library** — multi-region client (`pkg/client`) with automatic region routing, PD-backed store discovery, connection pooling, and retry logic
 - **Raft consensus** — etcd/raft integration with region-based routing and inter-node transport
 - **Raft lifecycle** — log compaction, snapshot generation/application, configuration changes (AddNode/RemoveNode)
-- **Region management** — region split (size-based with midpoint key), region merge (prepare/commit/rollback)
-- **Placement Driver (PD)** — TSO allocation, cluster metadata, store/region heartbeats, split scheduling
+- **Region management** — region split (PD-coordinated, size-based with midpoint key), region merge (prepare/commit/rollback)
+- **Placement Driver (PD)** — TSO allocation, cluster metadata, store/region heartbeats, split scheduling, multi-endpoint failover with retry
 - **Coprocessor** — push-down execution with RPN expressions, table scan, selection, aggregation
 - **gRPC server** — TiKV-compatible RPC interface via `pingcap/kvproto`
 - **HTTP status server** — pprof, Prometheus metrics, health checks
 - **Configuration** — TOML config with validation, CLI flag overrides
 - **Logging** — structured logging with slow-log routing and file rotation
 - **Flow control** — EWMA-based backpressure and memory quota
-- **Admin CLI** — `gookv-ctl` for inspecting data, MVCC info, compaction, region listing
+- **Admin CLI** — `gookv-ctl` for inspecting data, MVCC info, LSM compaction, SST file parsing, region listing
 
 ## Directory Structure
 
 ```
 cmd/
   gookv-server/          # Server binary entry point
-  gookv-ctl/             # Admin CLI (scan, get, mvcc, dump, size, compact, region)
+  gookv-ctl/             # Admin CLI (scan, get, mvcc, dump, size, compact, region, SST parsing)
   gookv-pd/              # Placement Driver server binary
 pkg/                      # Public packages (importable by external code)
   codec/                  # Memcomparable byte/number encoding
   keys/                   # User key <-> internal key encoding (DataKey, RaftLogKey, etc.)
   cfnames/                # Column family constants (default, lock, write, raft)
   txntypes/               # Lock, Write, Mutation structs with binary serialization
-  pdclient/               # Placement Driver client (gRPC + mock)
+  pdclient/               # Placement Driver client (gRPC + mock, multi-endpoint failover)
+  client/                 # Multi-region client library (RawKVClient, RegionCache, PDStoreResolver)
 internal/                 # Private implementation packages
   config/                 # TOML config loading, validation, ReadableSize/Duration types
   log/                    # Structured logging, LogDispatcher, SlowLogHandler, file rotation
@@ -66,8 +68,9 @@ internal/                 # Private implementation packages
     merge.go              # Region merge (PrepareMerge, CommitMerge, RollbackMerge)
     store_worker.go       # Store worker utilities (CleanupRegionData)
   server/                 # gRPC server, TikvService implementation, Storage bridge
-    coordinator.go        # StoreCoordinator (peer lifecycle, region bootstrap, message dispatch)
-    raw_storage.go        # Raw KV storage (non-transactional API)
+    coordinator.go        # StoreCoordinator (peer lifecycle, region bootstrap, PD-coordinated split)
+    storage.go            # Transaction-aware storage bridge (2PC, async commit, 1PC, pessimistic, scan lock)
+    raw_storage.go        # Raw KV storage (non-transactional API with TTL, CAS, checksum)
     pd_worker.go          # PD heartbeat worker (store/region heartbeats, split reporting)
     transport/            # Inter-node Raft transport, connection pooling, message batching
     status/               # HTTP status server (pprof, metrics, health, config)
@@ -317,11 +320,17 @@ rm -rf /tmp/gookv-pd-cluster
 # Dump raw key-value pairs (with optional --decode for human-readable output)
 ./gookv-ctl dump --db /tmp/gookv-data --cf write --limit 50 --decode
 
+# Dump entries directly from an SST file (no running database required)
+./gookv-ctl dump --sst /tmp/gookv-data/000042.sst --limit 50
+
 # Show approximate data size
 ./gookv-ctl size --db /tmp/gookv-data
 
-# Trigger manual compaction
+# Trigger full LSM compaction
 ./gookv-ctl compact --db /tmp/gookv-data --cf default
+
+# Flush WAL only (no compaction)
+./gookv-ctl compact --db /tmp/gookv-data --flush-only
 
 # List regions
 ./gookv-ctl region --db /tmp/gookv-data
@@ -342,6 +351,10 @@ make vet
 # Run tests for a specific package
 go test ./internal/server/... -v -count=1
 go test ./pkg/codec/... -v -count=1
+
+# Run codec fuzz tests (short duration)
+go test ./pkg/codec/... -fuzz=FuzzEncodeBytes -fuzztime=10s
+go test ./pkg/codec/... -fuzz=FuzzEncodeUint64 -fuzztime=10s
 ```
 
 ## Client-Server Verification
@@ -361,10 +374,12 @@ grpcurl -plaintext 127.0.0.1:20160 list
 # The server exposes the tikvpb.Tikv service with these RPCs:
 #   Transactional: KvGet, KvScan, KvBatchGet, KvPrewrite, KvCommit,
 #     KvBatchRollback, KvCleanup, KvCheckTxnStatus,
+#     KvCheckSecondaryLocks, KvScanLock,
 #     KvPessimisticLock, KVPessimisticRollback,
 #     KvTxnHeartBeat, KvResolveLock, KvGC
 #   Raw KV: RawGet, RawPut, RawDelete, RawScan,
-#     RawBatchGet, RawBatchPut, RawBatchDelete, RawDeleteRange
+#     RawBatchGet, RawBatchPut, RawBatchDelete, RawDeleteRange,
+#     RawBatchScan, RawGetKeyTTL, RawCompareAndSwap, RawChecksum
 #   Coprocessor: Coprocessor, CoprocessorStream
 #   Raft: Raft, BatchRaft
 #   Batch: BatchCommands (bidirectional streaming)
@@ -445,6 +460,80 @@ func main() {
 # Get: key=hello value=world not_found=false
 ```
 
+### Using the Client Library (`pkg/client`)
+
+The `pkg/client` package provides a high-level client with automatic multi-region routing, PD-backed store discovery, and transparent retry on region errors.
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/ryogrid/gookv/pkg/client"
+)
+
+func main() {
+	ctx := context.Background()
+
+	// Connect via PD (handles region discovery and store resolution automatically)
+	c, err := client.NewClient(ctx, client.Config{
+		PDAddrs: []string{"127.0.0.1:2379"},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer c.Close()
+
+	rawkv := c.RawKV()
+
+	// Single-key operations
+	if err := rawkv.Put(ctx, []byte("key1"), []byte("value1")); err != nil {
+		log.Fatal(err)
+	}
+
+	val, notFound, err := rawkv.Get(ctx, []byte("key1"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Get: value=%s notFound=%v\n", val, notFound)
+
+	// TTL support
+	if err := rawkv.PutWithTTL(ctx, []byte("temp"), []byte("expires"), 60); err != nil {
+		log.Fatal(err)
+	}
+
+	// Batch operations (transparently split across regions)
+	pairs := []client.KvPair{
+		{Key: []byte("a"), Value: []byte("1")},
+		{Key: []byte("b"), Value: []byte("2")},
+		{Key: []byte("c"), Value: []byte("3")},
+	}
+	if err := rawkv.BatchPut(ctx, pairs); err != nil {
+		log.Fatal(err)
+	}
+
+	// Cross-region scan
+	results, err := rawkv.Scan(ctx, []byte("a"), []byte("z"), 100)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, kv := range results {
+		fmt.Printf("  %s = %s\n", kv.Key, kv.Value)
+	}
+
+	// Atomic compare-and-swap
+	swapped, prev, err := rawkv.CompareAndSwap(ctx,
+		[]byte("key1"), []byte("value2"), []byte("value1"), false)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("CAS: swapped=%v prev=%s\n", swapped, prev)
+}
+```
+
 ### Checking Server Health
 
 ```bash
@@ -465,11 +554,18 @@ go tool pprof http://127.0.0.1:20180/debug/pprof/profile?seconds=10
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
+│                        Client Library                                │
+│          pkg/client: RawKVClient, RegionCache,                       │
+│          PDStoreResolver, RegionRequestSender                        │
+│          (multi-region routing, retry, connection pool)               │
+├──────────────────────────────────────────────────────────────────────┤
 │                          gRPC Server                                 │
 │                   (tikvpb.TikvServer interface)                      │
-│  Txn: KvGet, KvScan, KvPrewrite, KvCommit, Pessimistic, Resolve     │
-│  Raw: RawGet, RawPut, RawDelete, RawScan, Batch*                    │
+│  Txn: KvGet, KvScan, KvPrewrite, KvCommit, Pessimistic, Resolve,    │
+│       KvCheckSecondaryLocks, KvScanLock                              │
+│  Raw: RawGet, RawPut, RawDelete, RawScan, Batch*, TTL, CAS, Cksum   │
 │  Coprocessor, BatchCommands, Raft, BatchRaft, KvGC                   │
+│  Region validation: validateRegionContext (leader, epoch, key range) │
 ├───────────────────┬──────────────────────────────────────────────────┤
 │  HTTP Status      │            Flow Control                          │
 │  (pprof, metrics, │  (EWMA backpressure, memory quota)               │
@@ -477,7 +573,7 @@ go tool pprof http://127.0.0.1:20180/debug/pprof/profile?seconds=10
 ├───────────────────┴──────────────────────────────────────────────────┤
 │                       Storage Bridge                                 │
 │          (latch acquisition, MVCC transaction management,            │
-│           engine coordination, Raw KV storage)                       │
+│           async commit, 1PC, Raw KV with TTL/CAS/checksum)           │
 ├──────────────┬────────────────┬──────────────────────────────────────┤
 │ Transaction  │  Coprocessor   │          Raftstore                   │
 │ - Percolator │  - RPN engine  │  - etcd/raft peers                   │
@@ -487,7 +583,7 @@ go tool pprof http://127.0.0.1:20180/debug/pprof/profile?seconds=10
 │ - Scheduler  │                │  - Raft log compaction               │
 ├──────────────┤                │  - Snapshot gen/apply                │
 │    MVCC      │                │  - Conf change (Add/Remove)          │
-│ - MvccReader │                │  - Region split (size-based)         │
+│ - MvccReader │                │  - Region split (PD-coordinated)     │
 │ - PointGetter│                │  - Region merge                      │
 │ - MvccTxn    │                │    (prepare/commit/rollback)         │
 │ - Scanner    │                │                                      │
@@ -497,6 +593,7 @@ go tool pprof http://127.0.0.1:20180/debug/pprof/profile?seconds=10
 │ - KvGC RPC   │                │  - Metadata store                    │
 │              │                │  - Heartbeat processing              │
 │              │                │  - Split scheduling                  │
+│              │                │  - Multi-endpoint failover           │
 ├──────────────┴────────────────┴──────────────────────────────────────┤
 │                    Engine (traits.KvEngine)                           │
 │               Pebble backend with CF emulation                       │
@@ -547,6 +644,17 @@ go tool pprof http://127.0.0.1:20180/debug/pprof/profile?seconds=10
 | IMPL-035 | Region merge (prepare/commit/rollback) | Done |
 | IMPL-036 | CleanupRegionData (peer destruction cleanup) | Done |
 | IMPL-037 | End-to-end integration test suite | Done |
+| IMPL-038 | Async commit / 1PC gRPC path integration (KvPrewrite routing, PD-based TSO) | Done |
+| IMPL-039 | KvCheckSecondaryLocks, KvScanLock RPCs | Done |
+| IMPL-040 | Raw KV extensions (RawBatchScan, RawGetKeyTTL, RawCompareAndSwap, RawChecksum) | Done |
+| IMPL-041 | Raw KV TTL support (per-key expiry encoding, automatic filtering) | Done |
+| IMPL-042 | PD client multi-endpoint failover and retry | Done |
+| IMPL-043 | PD-coordinated region split (split check tick, AskBatchSplit, child bootstrap) | Done |
+| IMPL-044 | Region validation in gRPC handlers (validateRegionContext) | Done |
+| IMPL-045 | Engine traits conformance test suite (17 test cases) | Done |
+| IMPL-046 | Codec fuzz tests (6 fuzz targets) | Done |
+| IMPL-047 | CLI improvements (compact with full LSM compaction, dump --sst for SST parsing) | Done |
+| IMPL-048 | Client library for multi-region routing (pkg/client) | Done |
 
 ## Acknowledgments
 
