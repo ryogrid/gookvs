@@ -17,6 +17,8 @@ import (
 	"github.com/ryogrid/gookv/internal/storage/gc"
 	"github.com/ryogrid/gookv/internal/storage/mvcc"
 	"github.com/ryogrid/gookv/internal/storage/txn"
+	"github.com/ryogrid/gookv/pkg/cfnames"
+	"github.com/ryogrid/gookv/pkg/pdclient"
 	"github.com/ryogrid/gookv/pkg/txntypes"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -38,6 +40,7 @@ type Server struct {
 	rawStorage  *RawStorage
 	gcWorker    *gc.GCWorker
 	coordinator *StoreCoordinator
+	pdClient    pdclient.Client // optional PD client for TSO allocation (nil = no PD)
 	listener    net.Listener
 
 	ctx    context.Context
@@ -223,7 +226,7 @@ func (svc *tikvService) KvScan(ctx context.Context, req *kvrpcpb.ScanRequest) (*
 	return resp, nil
 }
 
-// KvPrewrite implements the first phase of 2PC.
+// KvPrewrite implements the first phase of 2PC, with async commit and 1PC support.
 func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteRequest) (*kvrpcpb.PrewriteResponse, error) {
 	resp := &kvrpcpb.PrewriteResponse{}
 
@@ -251,6 +254,70 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 	primary := req.GetPrimaryLock()
 	lockTTL := req.GetLockTtl()
 
+	// --- 1PC path ---
+	if req.GetTryOnePc() && txn.Is1PCEligible(mutations, 0) {
+		commitTS := startTS + 1
+		if coord := svc.server.coordinator; coord != nil {
+			modifies, errs, onePCCommitTS := svc.server.storage.Prewrite1PCModifies(mutations, primary, startTS, commitTS, lockTTL)
+			for _, err := range errs {
+				if err != nil {
+					resp.Errors = append(resp.Errors, errToKeyError(err))
+				}
+			}
+			if len(resp.Errors) > 0 || len(modifies) == 0 {
+				return resp, nil
+			}
+			if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
+				return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+			}
+			resp.OnePcCommitTs = uint64(onePCCommitTS)
+		} else {
+			errs, onePCCommitTS := svc.server.storage.Prewrite1PC(mutations, primary, startTS, commitTS, lockTTL)
+			for _, err := range errs {
+				if err != nil {
+					resp.Errors = append(resp.Errors, errToKeyError(err))
+				}
+			}
+			if len(resp.Errors) == 0 {
+				resp.OnePcCommitTs = uint64(onePCCommitTS)
+			}
+		}
+		return resp, nil
+	}
+
+	// --- Async commit path ---
+	if req.GetUseAsyncCommit() && txn.IsAsyncCommitEligible(mutations, 0) {
+		secondaries := req.GetSecondaries()
+		maxCommitTS := txntypes.TimeStamp(req.GetMaxCommitTs())
+		if coord := svc.server.coordinator; coord != nil {
+			modifies, errs, minCommitTS := svc.server.storage.PrewriteAsyncCommitModifies(mutations, primary, startTS, lockTTL, secondaries, maxCommitTS)
+			for _, err := range errs {
+				if err != nil {
+					resp.Errors = append(resp.Errors, errToKeyError(err))
+				}
+			}
+			if len(resp.Errors) > 0 || len(modifies) == 0 {
+				return resp, nil
+			}
+			if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
+				return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+			}
+			resp.MinCommitTs = uint64(minCommitTS)
+		} else {
+			errs, minCommitTS := svc.server.storage.PrewriteAsyncCommit(mutations, primary, startTS, lockTTL, secondaries, maxCommitTS)
+			for _, err := range errs {
+				if err != nil {
+					resp.Errors = append(resp.Errors, errToKeyError(err))
+				}
+			}
+			if len(resp.Errors) == 0 {
+				resp.MinCommitTs = uint64(minCommitTS)
+			}
+		}
+		return resp, nil
+	}
+
+	// --- Standard 2PC path ---
 	// Cluster mode: compute modifications then propose via Raft.
 	if coord := svc.server.coordinator; coord != nil {
 		modifies, errs := svc.server.storage.PrewriteModifies(mutations, primary, startTS, lockTTL)
@@ -500,6 +567,84 @@ func (svc *tikvService) KvResolveLock(ctx context.Context, req *kvrpcpb.ResolveL
 	return resp, nil
 }
 
+// --- Async Commit / ScanLock handlers ---
+
+// KvCheckSecondaryLocks implements the KvCheckSecondaryLocks RPC for async commit.
+func (svc *tikvService) KvCheckSecondaryLocks(ctx context.Context, req *kvrpcpb.CheckSecondaryLocksRequest) (*kvrpcpb.CheckSecondaryLocksResponse, error) {
+	resp := &kvrpcpb.CheckSecondaryLocksResponse{}
+	startTS := txntypes.TimeStamp(req.GetStartVersion())
+
+	statuses, commitTS, err := svc.server.storage.CheckSecondaryLocks(req.GetKeys(), startTS)
+	if err != nil {
+		resp.Error = errToKeyError(err)
+		return resp, nil
+	}
+
+	for _, s := range statuses {
+		if s.Lock != nil {
+			resp.Locks = append(resp.Locks, lockToLockInfo(s.Key, s.Lock))
+		}
+	}
+	if commitTS != 0 {
+		resp.CommitTs = uint64(commitTS)
+	}
+
+	return resp, nil
+}
+
+// KvScanLock implements the KvScanLock RPC, scanning for locks with StartTS <= maxVersion.
+func (svc *tikvService) KvScanLock(ctx context.Context, req *kvrpcpb.ScanLockRequest) (*kvrpcpb.ScanLockResponse, error) {
+	resp := &kvrpcpb.ScanLockResponse{}
+
+	results, err := svc.server.storage.ScanLock(
+		txntypes.TimeStamp(req.GetMaxVersion()),
+		req.GetStartKey(),
+		req.GetEndKey(),
+		req.GetLimit(),
+	)
+	if err != nil {
+		resp.Error = errToKeyError(err)
+		return resp, nil
+	}
+
+	for _, r := range results {
+		resp.Locks = append(resp.Locks, lockToLockInfo(r.Key, r.Lock))
+	}
+
+	return resp, nil
+}
+
+// lockToLockInfo converts an internal Lock and its user key to a kvrpcpb.LockInfo proto.
+func lockToLockInfo(key []byte, lock *txntypes.Lock) *kvrpcpb.LockInfo {
+	info := &kvrpcpb.LockInfo{
+		PrimaryLock:     lock.Primary,
+		LockVersion:     uint64(lock.StartTS),
+		Key:             key,
+		LockTtl:         lock.TTL,
+		TxnSize:         lock.TxnSize,
+		LockForUpdateTs: uint64(lock.ForUpdateTS),
+		UseAsyncCommit:  lock.UseAsyncCommit,
+		MinCommitTs:     uint64(lock.MinCommitTS),
+		Secondaries:     lock.Secondaries,
+	}
+
+	// Map internal LockType to proto Op.
+	switch lock.LockType {
+	case txntypes.LockTypePut:
+		info.LockType = kvrpcpb.Op_Put
+	case txntypes.LockTypeDelete:
+		info.LockType = kvrpcpb.Op_Del
+	case txntypes.LockTypeLock:
+		info.LockType = kvrpcpb.Op_Lock
+	case txntypes.LockTypePessimistic:
+		info.LockType = kvrpcpb.Op_PessimisticLock
+	default:
+		info.LockType = kvrpcpb.Op_Put
+	}
+
+	return info
+}
+
 // --- Raw KV handlers ---
 
 // RawGet implements the RawGet RPC.
@@ -521,13 +666,14 @@ func (svc *tikvService) RawGet(ctx context.Context, req *kvrpcpb.RawGetRequest) 
 // RawPut implements the RawPut RPC.
 func (svc *tikvService) RawPut(ctx context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
 	resp := &kvrpcpb.RawPutResponse{}
+	ttl := req.GetTtl()
 	if coord := svc.server.coordinator; coord != nil {
-		modify := svc.server.rawStorage.PutModify(req.GetCf(), req.GetKey(), req.GetValue())
+		modify := svc.server.rawStorage.PutModify(req.GetCf(), req.GetKey(), req.GetValue(), ttl)
 		if err := coord.ProposeModifies(1, []mvcc.Modify{modify}, 10*time.Second); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
 		}
 	} else {
-		if err := svc.server.rawStorage.Put(req.GetCf(), req.GetKey(), req.GetValue()); err != nil {
+		if err := svc.server.rawStorage.Put(req.GetCf(), req.GetKey(), req.GetValue(), ttl); err != nil {
 			resp.Error = err.Error()
 		}
 	}
@@ -586,20 +732,53 @@ func (svc *tikvService) RawBatchPut(ctx context.Context, req *kvrpcpb.RawBatchPu
 	for i, p := range req.GetPairs() {
 		pairs[i] = KvPair{Key: p.GetKey(), Value: p.GetValue()}
 	}
+
+	// Resolve per-key TTLs: prefer Ttls (per-key), fall back to deprecated Ttl (uniform).
+	ttls := resolveBatchTTLs(req.GetTtls(), req.GetTtl(), len(pairs))
+
 	if coord := svc.server.coordinator; coord != nil {
 		modifies := make([]mvcc.Modify, len(pairs))
 		for i, p := range pairs {
-			modifies[i] = svc.server.rawStorage.PutModify(req.GetCf(), p.Key, p.Value)
+			var t uint64
+			if i < len(ttls) {
+				t = ttls[i]
+			}
+			modifies[i] = svc.server.rawStorage.PutModify(req.GetCf(), p.Key, p.Value, t)
 		}
 		if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
 		}
 	} else {
-		if err := svc.server.rawStorage.BatchPut(req.GetCf(), pairs); err != nil {
+		if err := svc.server.rawStorage.BatchPutWithTTL(req.GetCf(), pairs, ttls); err != nil {
 			resp.Error = err.Error()
 		}
 	}
 	return resp, nil
+}
+
+// resolveBatchTTLs resolves per-key TTLs from the request fields.
+// If ttls has exactly one element, it applies to all keys.
+// If ttls matches nPairs, use as-is.
+// Otherwise fall back to the deprecated uniform ttl field.
+func resolveBatchTTLs(ttls []uint64, uniformTTL uint64, nPairs int) []uint64 {
+	if len(ttls) == nPairs {
+		return ttls
+	}
+	if len(ttls) == 1 {
+		result := make([]uint64, nPairs)
+		for i := range result {
+			result[i] = ttls[0]
+		}
+		return result
+	}
+	if uniformTTL > 0 {
+		result := make([]uint64, nPairs)
+		for i := range result {
+			result[i] = uniformTTL
+		}
+		return result
+	}
+	return nil
 }
 
 // RawBatchDelete implements the RawBatchDelete RPC.
@@ -627,6 +806,89 @@ func (svc *tikvService) RawDeleteRange(ctx context.Context, req *kvrpcpb.RawDele
 	if err := svc.server.rawStorage.DeleteRange(req.GetCf(), req.GetStartKey(), req.GetEndKey()); err != nil {
 		resp.Error = err.Error()
 	}
+	return resp, nil
+}
+
+// RawBatchScan implements the RawBatchScan RPC.
+func (svc *tikvService) RawBatchScan(ctx context.Context, req *kvrpcpb.RawBatchScanRequest) (*kvrpcpb.RawBatchScanResponse, error) {
+	resp := &kvrpcpb.RawBatchScanResponse{}
+
+	ranges := make([]KeyRange, len(req.GetRanges()))
+	for i, r := range req.GetRanges() {
+		ranges[i] = KeyRange{StartKey: r.GetStartKey(), EndKey: r.GetEndKey()}
+	}
+
+	pairs, err := svc.server.rawStorage.BatchScan(
+		req.GetCf(), ranges, req.GetEachLimit(), req.GetKeyOnly(), req.GetReverse(),
+	)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "raw batch scan failed: %v", err)
+	}
+	for _, p := range pairs {
+		resp.Kvs = append(resp.Kvs, &kvrpcpb.KvPair{Key: p.Key, Value: p.Value})
+	}
+	return resp, nil
+}
+
+// RawGetKeyTTL implements the RawGetKeyTTL RPC.
+func (svc *tikvService) RawGetKeyTTL(ctx context.Context, req *kvrpcpb.RawGetKeyTTLRequest) (*kvrpcpb.RawGetKeyTTLResponse, error) {
+	resp := &kvrpcpb.RawGetKeyTTLResponse{}
+
+	ttl, notFound, err := svc.server.rawStorage.GetKeyTTL(req.GetCf(), req.GetKey())
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, nil
+	}
+	if notFound {
+		resp.NotFound = true
+	} else {
+		resp.Ttl = ttl
+	}
+	return resp, nil
+}
+
+// RawCompareAndSwap implements the RawCompareAndSwap RPC.
+func (svc *tikvService) RawCompareAndSwap(ctx context.Context, req *kvrpcpb.RawCASRequest) (*kvrpcpb.RawCASResponse, error) {
+	resp := &kvrpcpb.RawCASResponse{}
+
+	succeed, prevNotExist, prevValue, err := svc.server.rawStorage.CompareAndSwap(
+		req.GetCf(),
+		req.GetKey(),
+		req.GetValue(),
+		req.GetPreviousValue(),
+		req.GetPreviousNotExist(),
+		req.GetDelete(),
+		req.GetTtl(),
+	)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, nil
+	}
+
+	resp.Succeed = succeed
+	resp.PreviousNotExist = prevNotExist
+	resp.PreviousValue = prevValue
+	return resp, nil
+}
+
+// RawChecksum implements the RawChecksum RPC.
+func (svc *tikvService) RawChecksum(ctx context.Context, req *kvrpcpb.RawChecksumRequest) (*kvrpcpb.RawChecksumResponse, error) {
+	resp := &kvrpcpb.RawChecksumResponse{}
+
+	ranges := make([]KeyRange, len(req.GetRanges()))
+	for i, r := range req.GetRanges() {
+		ranges[i] = KeyRange{StartKey: r.GetStartKey(), EndKey: r.GetEndKey()}
+	}
+
+	checksum, totalKvs, totalBytes, err := svc.server.rawStorage.Checksum(cfnames.CFDefault, ranges)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, nil
+	}
+
+	resp.Checksum = checksum
+	resp.TotalKvs = totalKvs
+	resp.TotalBytes = totalBytes
 	return resp, nil
 }
 
@@ -783,6 +1045,14 @@ func (svc *tikvService) handleBatchCmd(ctx context.Context, req *tikvpb.BatchCom
 		r, _ := svc.KvResolveLock(ctx, cmd.ResolveLock)
 		resp.Cmd = &tikvpb.BatchCommandsResponse_Response_ResolveLock{ResolveLock: r}
 
+	case *tikvpb.BatchCommandsRequest_Request_CheckSecondaryLocks:
+		r, _ := svc.KvCheckSecondaryLocks(ctx, cmd.CheckSecondaryLocks)
+		resp.Cmd = &tikvpb.BatchCommandsResponse_Response_CheckSecondaryLocks{CheckSecondaryLocks: r}
+
+	case *tikvpb.BatchCommandsRequest_Request_ScanLock:
+		r, _ := svc.KvScanLock(ctx, cmd.ScanLock)
+		resp.Cmd = &tikvpb.BatchCommandsResponse_Response_ScanLock{ScanLock: r}
+
 	case *tikvpb.BatchCommandsRequest_Request_RawGet:
 		r, _ := svc.RawGet(ctx, cmd.RawGet)
 		resp.Cmd = &tikvpb.BatchCommandsResponse_Response_RawGet{RawGet: r}
@@ -814,6 +1084,10 @@ func (svc *tikvService) handleBatchCmd(ctx context.Context, req *tikvpb.BatchCom
 	case *tikvpb.BatchCommandsRequest_Request_RawDeleteRange:
 		r, _ := svc.RawDeleteRange(ctx, cmd.RawDeleteRange)
 		resp.Cmd = &tikvpb.BatchCommandsResponse_Response_RawDeleteRange{RawDeleteRange: r}
+
+	case *tikvpb.BatchCommandsRequest_Request_RawBatchScan:
+		r, _ := svc.RawBatchScan(ctx, cmd.RawBatchScan)
+		resp.Cmd = &tikvpb.BatchCommandsResponse_Response_RawBatchScan{RawBatchScan: r}
 
 	case *tikvpb.BatchCommandsRequest_Request_Coprocessor:
 		r, _ := svc.Coprocessor(ctx, cmd.Coprocessor)

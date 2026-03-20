@@ -113,6 +113,11 @@ type grpcClient struct {
 	// TSO batching.
 	tsoBatchSize int
 
+	// Failover / retry fields.
+	endpoints    []string      // all known PD addresses
+	currentIdx   int           // current endpoint index
+	reconnectMu  sync.Mutex    // serializes reconnection
+
 	closed atomic.Bool
 }
 
@@ -122,15 +127,26 @@ func NewClient(ctx context.Context, cfg Config) (Client, error) {
 		return nil, fmt.Errorf("pdclient: no endpoints configured")
 	}
 
+	// Apply defaults for retry config if not set.
+	if cfg.RetryInterval <= 0 {
+		cfg.RetryInterval = 500 * time.Millisecond
+	}
+	if cfg.RetryMaxCount <= 0 {
+		cfg.RetryMaxCount = 3
+	}
+	// UpdateInterval=0 means disabled by default; no override needed.
+
 	// Connect to the first available endpoint.
 	var conn *grpc.ClientConn
+	var connIdx int
 	var err error
-	for _, ep := range cfg.Endpoints {
+	for i, ep := range cfg.Endpoints {
 		conn, err = grpc.DialContext(ctx, ep,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithBlock(),
 		)
 		if err == nil {
+			connIdx = i
 			break
 		}
 	}
@@ -143,6 +159,8 @@ func NewClient(ctx context.Context, cfg Config) (Client, error) {
 		conn:         conn,
 		client:       pdpb.NewPDClient(conn),
 		tsoBatchSize: 64,
+		endpoints:    cfg.Endpoints,
+		currentIdx:   connIdx,
 	}
 
 	// Discover cluster ID.
@@ -162,76 +180,185 @@ func (c *grpcClient) header() *pdpb.RequestHeader {
 	return &pdpb.RequestHeader{ClusterId: c.clusterID}
 }
 
+// reconnect closes the existing connection and tries the next endpoint (round-robin).
+// It tries all endpoints once before giving up. Must be called with reconnectMu held.
+func (c *grpcClient) reconnect() error {
+	c.mu.Lock()
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	c.mu.Unlock()
+
+	n := len(c.endpoints)
+	for i := 0; i < n; i++ {
+		nextIdx := (c.currentIdx + 1 + i) % n
+		ep := c.endpoints[nextIdx]
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		conn, err := grpc.DialContext(ctx, ep,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+		)
+		cancel()
+		if err != nil {
+			continue
+		}
+
+		c.mu.Lock()
+		c.conn = conn
+		c.client = pdpb.NewPDClient(conn)
+		c.currentIdx = nextIdx
+		c.mu.Unlock()
+		return nil
+	}
+	return fmt.Errorf("pdclient: reconnect failed: all %d endpoints exhausted", n)
+}
+
+// withRetry retries fn up to RetryMaxCount times with exponential backoff
+// and endpoint reconnection between retries.
+func (c *grpcClient) withRetry(fn func() error) error {
+	err := fn()
+	if err == nil {
+		return nil
+	}
+
+	maxRetries := c.cfg.RetryMaxCount
+	baseInterval := c.cfg.RetryInterval
+	const maxBackoff = 5 * time.Second
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Exponential backoff: baseInterval * 2^attempt, capped at 5s.
+		backoff := baseInterval * time.Duration(1<<uint(attempt))
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+		time.Sleep(backoff)
+
+		c.reconnectMu.Lock()
+		reconnErr := c.reconnect()
+		c.reconnectMu.Unlock()
+		if reconnErr != nil {
+			continue
+		}
+
+		err = fn()
+		if err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("pdclient: retries exhausted: %w", err)
+}
+
 func (c *grpcClient) GetTS(ctx context.Context) (TimeStamp, error) {
-	stream, err := c.client.Tso(ctx)
-	if err != nil {
-		return TimeStamp{}, fmt.Errorf("pdclient: tso stream: %w", err)
-	}
+	var result TimeStamp
+	err := c.withRetry(func() error {
+		c.mu.RLock()
+		client := c.client
+		c.mu.RUnlock()
 
-	req := &pdpb.TsoRequest{
-		Header: c.header(),
-		Count:  1,
-	}
-	if err := stream.Send(req); err != nil {
-		return TimeStamp{}, fmt.Errorf("pdclient: tso send: %w", err)
-	}
+		stream, err := client.Tso(ctx)
+		if err != nil {
+			return fmt.Errorf("pdclient: tso stream: %w", err)
+		}
 
-	resp, err := stream.Recv()
-	if err != nil {
-		return TimeStamp{}, fmt.Errorf("pdclient: tso recv: %w", err)
-	}
+		req := &pdpb.TsoRequest{
+			Header: c.header(),
+			Count:  1,
+		}
+		if err := stream.Send(req); err != nil {
+			return fmt.Errorf("pdclient: tso send: %w", err)
+		}
 
-	if resp.GetHeader().GetError() != nil {
-		return TimeStamp{}, fmt.Errorf("pdclient: tso error: %s", resp.GetHeader().GetError().GetMessage())
-	}
+		resp, err := stream.Recv()
+		if err != nil {
+			return fmt.Errorf("pdclient: tso recv: %w", err)
+		}
 
-	ts := resp.GetTimestamp()
-	return TimeStamp{
-		Physical: int64(ts.GetPhysical()),
-		Logical:  int64(ts.GetLogical()),
-	}, nil
+		if resp.GetHeader().GetError() != nil {
+			return fmt.Errorf("pdclient: tso error: %s", resp.GetHeader().GetError().GetMessage())
+		}
+
+		ts := resp.GetTimestamp()
+		result = TimeStamp{
+			Physical: int64(ts.GetPhysical()),
+			Logical:  int64(ts.GetLogical()),
+		}
+		return nil
+	})
+	return result, err
 }
 
 func (c *grpcClient) GetRegion(ctx context.Context, key []byte) (*metapb.Region, *metapb.Peer, error) {
-	resp, err := c.client.GetRegion(ctx, &pdpb.GetRegionRequest{
-		Header:    c.header(),
-		RegionKey: key,
+	var region *metapb.Region
+	var leader *metapb.Peer
+	err := c.withRetry(func() error {
+		c.mu.RLock()
+		client := c.client
+		c.mu.RUnlock()
+
+		resp, err := client.GetRegion(ctx, &pdpb.GetRegionRequest{
+			Header:    c.header(),
+			RegionKey: key,
+		})
+		if err != nil {
+			return fmt.Errorf("pdclient: get region: %w", err)
+		}
+		if resp.GetHeader().GetError() != nil {
+			return fmt.Errorf("pdclient: get region error: %s", resp.GetHeader().GetError().GetMessage())
+		}
+		region = resp.GetRegion()
+		leader = resp.GetLeader()
+		return nil
 	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("pdclient: get region: %w", err)
-	}
-	if resp.GetHeader().GetError() != nil {
-		return nil, nil, fmt.Errorf("pdclient: get region error: %s", resp.GetHeader().GetError().GetMessage())
-	}
-	return resp.GetRegion(), resp.GetLeader(), nil
+	return region, leader, err
 }
 
 func (c *grpcClient) GetRegionByID(ctx context.Context, regionID uint64) (*metapb.Region, *metapb.Peer, error) {
-	resp, err := c.client.GetRegionByID(ctx, &pdpb.GetRegionByIDRequest{
-		Header:   c.header(),
-		RegionId: regionID,
+	var region *metapb.Region
+	var leader *metapb.Peer
+	err := c.withRetry(func() error {
+		c.mu.RLock()
+		client := c.client
+		c.mu.RUnlock()
+
+		resp, err := client.GetRegionByID(ctx, &pdpb.GetRegionByIDRequest{
+			Header:   c.header(),
+			RegionId: regionID,
+		})
+		if err != nil {
+			return fmt.Errorf("pdclient: get region by id: %w", err)
+		}
+		if resp.GetHeader().GetError() != nil {
+			return fmt.Errorf("pdclient: get region by id error: %s", resp.GetHeader().GetError().GetMessage())
+		}
+		region = resp.GetRegion()
+		leader = resp.GetLeader()
+		return nil
 	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("pdclient: get region by id: %w", err)
-	}
-	if resp.GetHeader().GetError() != nil {
-		return nil, nil, fmt.Errorf("pdclient: get region by id error: %s", resp.GetHeader().GetError().GetMessage())
-	}
-	return resp.GetRegion(), resp.GetLeader(), nil
+	return region, leader, err
 }
 
 func (c *grpcClient) GetStore(ctx context.Context, storeID uint64) (*metapb.Store, error) {
-	resp, err := c.client.GetStore(ctx, &pdpb.GetStoreRequest{
-		Header:  c.header(),
-		StoreId: storeID,
+	var store *metapb.Store
+	err := c.withRetry(func() error {
+		c.mu.RLock()
+		client := c.client
+		c.mu.RUnlock()
+
+		resp, err := client.GetStore(ctx, &pdpb.GetStoreRequest{
+			Header:  c.header(),
+			StoreId: storeID,
+		})
+		if err != nil {
+			return fmt.Errorf("pdclient: get store: %w", err)
+		}
+		if resp.GetHeader().GetError() != nil {
+			return fmt.Errorf("pdclient: get store error: %s", resp.GetHeader().GetError().GetMessage())
+		}
+		store = resp.GetStore()
+		return nil
 	})
-	if err != nil {
-		return nil, fmt.Errorf("pdclient: get store: %w", err)
-	}
-	if resp.GetHeader().GetError() != nil {
-		return nil, fmt.Errorf("pdclient: get store error: %s", resp.GetHeader().GetError().GetMessage())
-	}
-	return resp.GetStore(), nil
+	return store, err
 }
 
 func (c *grpcClient) Bootstrap(ctx context.Context, store *metapb.Store, region *metapb.Region) (*pdpb.BootstrapResponse, error) {
@@ -260,92 +387,134 @@ func (c *grpcClient) IsBootstrapped(ctx context.Context) (bool, error) {
 }
 
 func (c *grpcClient) PutStore(ctx context.Context, store *metapb.Store) error {
-	resp, err := c.client.PutStore(ctx, &pdpb.PutStoreRequest{
-		Header: c.header(),
-		Store:  store,
+	return c.withRetry(func() error {
+		c.mu.RLock()
+		client := c.client
+		c.mu.RUnlock()
+
+		resp, err := client.PutStore(ctx, &pdpb.PutStoreRequest{
+			Header: c.header(),
+			Store:  store,
+		})
+		if err != nil {
+			return fmt.Errorf("pdclient: put store: %w", err)
+		}
+		if resp.GetHeader().GetError() != nil {
+			return fmt.Errorf("pdclient: put store error: %s", resp.GetHeader().GetError().GetMessage())
+		}
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("pdclient: put store: %w", err)
-	}
-	if resp.GetHeader().GetError() != nil {
-		return fmt.Errorf("pdclient: put store error: %s", resp.GetHeader().GetError().GetMessage())
-	}
-	return nil
 }
 
 func (c *grpcClient) ReportRegionHeartbeat(ctx context.Context, req *pdpb.RegionHeartbeatRequest) error {
-	req.Header = c.header()
-	stream, err := c.client.RegionHeartbeat(ctx)
-	if err != nil {
-		return fmt.Errorf("pdclient: region heartbeat stream: %w", err)
-	}
-	if err := stream.Send(req); err != nil {
-		return fmt.Errorf("pdclient: region heartbeat send: %w", err)
-	}
-	if err := stream.CloseSend(); err != nil {
-		return fmt.Errorf("pdclient: region heartbeat close: %w", err)
-	}
-	// Wait for the server to acknowledge the heartbeat.
-	if _, err := stream.Recv(); err != nil {
-		return fmt.Errorf("pdclient: region heartbeat recv: %w", err)
-	}
-	return nil
+	return c.withRetry(func() error {
+		c.mu.RLock()
+		client := c.client
+		c.mu.RUnlock()
+
+		req.Header = c.header()
+		stream, err := client.RegionHeartbeat(ctx)
+		if err != nil {
+			return fmt.Errorf("pdclient: region heartbeat stream: %w", err)
+		}
+		if err := stream.Send(req); err != nil {
+			return fmt.Errorf("pdclient: region heartbeat send: %w", err)
+		}
+		if err := stream.CloseSend(); err != nil {
+			return fmt.Errorf("pdclient: region heartbeat close: %w", err)
+		}
+		// Wait for the server to acknowledge the heartbeat.
+		if _, err := stream.Recv(); err != nil {
+			return fmt.Errorf("pdclient: region heartbeat recv: %w", err)
+		}
+		return nil
+	})
 }
 
 func (c *grpcClient) StoreHeartbeat(ctx context.Context, stats *pdpb.StoreStats) error {
-	resp, err := c.client.StoreHeartbeat(ctx, &pdpb.StoreHeartbeatRequest{
-		Header: c.header(),
-		Stats:  stats,
+	return c.withRetry(func() error {
+		c.mu.RLock()
+		client := c.client
+		c.mu.RUnlock()
+
+		resp, err := client.StoreHeartbeat(ctx, &pdpb.StoreHeartbeatRequest{
+			Header: c.header(),
+			Stats:  stats,
+		})
+		if err != nil {
+			return fmt.Errorf("pdclient: store heartbeat: %w", err)
+		}
+		if resp.GetHeader().GetError() != nil {
+			return fmt.Errorf("pdclient: store heartbeat error: %s", resp.GetHeader().GetError().GetMessage())
+		}
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("pdclient: store heartbeat: %w", err)
-	}
-	if resp.GetHeader().GetError() != nil {
-		return fmt.Errorf("pdclient: store heartbeat error: %s", resp.GetHeader().GetError().GetMessage())
-	}
-	return nil
 }
 
 func (c *grpcClient) AskBatchSplit(ctx context.Context, region *metapb.Region, count uint32) (*pdpb.AskBatchSplitResponse, error) {
-	resp, err := c.client.AskBatchSplit(ctx, &pdpb.AskBatchSplitRequest{
-		Header:     c.header(),
-		Region:     region,
-		SplitCount: count,
+	var result *pdpb.AskBatchSplitResponse
+	err := c.withRetry(func() error {
+		c.mu.RLock()
+		client := c.client
+		c.mu.RUnlock()
+
+		resp, err := client.AskBatchSplit(ctx, &pdpb.AskBatchSplitRequest{
+			Header:     c.header(),
+			Region:     region,
+			SplitCount: count,
+		})
+		if err != nil {
+			return fmt.Errorf("pdclient: ask batch split: %w", err)
+		}
+		if resp.GetHeader().GetError() != nil {
+			return fmt.Errorf("pdclient: ask batch split error: %s", resp.GetHeader().GetError().GetMessage())
+		}
+		result = resp
+		return nil
 	})
-	if err != nil {
-		return nil, fmt.Errorf("pdclient: ask batch split: %w", err)
-	}
-	if resp.GetHeader().GetError() != nil {
-		return nil, fmt.Errorf("pdclient: ask batch split error: %s", resp.GetHeader().GetError().GetMessage())
-	}
-	return resp, nil
+	return result, err
 }
 
 func (c *grpcClient) ReportBatchSplit(ctx context.Context, regions []*metapb.Region) error {
-	resp, err := c.client.ReportBatchSplit(ctx, &pdpb.ReportBatchSplitRequest{
-		Header:  c.header(),
-		Regions: regions,
+	return c.withRetry(func() error {
+		c.mu.RLock()
+		client := c.client
+		c.mu.RUnlock()
+
+		resp, err := client.ReportBatchSplit(ctx, &pdpb.ReportBatchSplitRequest{
+			Header:  c.header(),
+			Regions: regions,
+		})
+		if err != nil {
+			return fmt.Errorf("pdclient: report batch split: %w", err)
+		}
+		if resp.GetHeader().GetError() != nil {
+			return fmt.Errorf("pdclient: report batch split error: %s", resp.GetHeader().GetError().GetMessage())
+		}
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("pdclient: report batch split: %w", err)
-	}
-	if resp.GetHeader().GetError() != nil {
-		return fmt.Errorf("pdclient: report batch split error: %s", resp.GetHeader().GetError().GetMessage())
-	}
-	return nil
 }
 
 func (c *grpcClient) AllocID(ctx context.Context) (uint64, error) {
-	resp, err := c.client.AllocID(ctx, &pdpb.AllocIDRequest{
-		Header: c.header(),
+	var id uint64
+	err := c.withRetry(func() error {
+		c.mu.RLock()
+		client := c.client
+		c.mu.RUnlock()
+
+		resp, err := client.AllocID(ctx, &pdpb.AllocIDRequest{
+			Header: c.header(),
+		})
+		if err != nil {
+			return fmt.Errorf("pdclient: alloc id: %w", err)
+		}
+		if resp.GetHeader().GetError() != nil {
+			return fmt.Errorf("pdclient: alloc id error: %s", resp.GetHeader().GetError().GetMessage())
+		}
+		id = resp.GetId()
+		return nil
 	})
-	if err != nil {
-		return 0, fmt.Errorf("pdclient: alloc id: %w", err)
-	}
-	if resp.GetHeader().GetError() != nil {
-		return 0, fmt.Errorf("pdclient: alloc id error: %s", resp.GetHeader().GetError().GetMessage())
-	}
-	return resp.GetId(), nil
+	return id, err
 }
 
 func (c *grpcClient) GetClusterID(_ context.Context) uint64 {
@@ -354,8 +523,11 @@ func (c *grpcClient) GetClusterID(_ context.Context) uint64 {
 
 func (c *grpcClient) Close() {
 	if c.closed.CompareAndSwap(false, true) {
+		c.mu.Lock()
 		if c.conn != nil {
 			c.conn.Close()
+			c.conn = nil
 		}
+		c.mu.Unlock()
 	}
 }

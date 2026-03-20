@@ -583,6 +583,307 @@ func (s *Storage) scanLocksForTxn(startTS txntypes.TimeStamp) [][]byte {
 	return keys
 }
 
+// PrewriteAsyncCommit performs the first phase of async commit 2PC for multiple mutations.
+// Returns per-mutation errors and the minCommitTS.
+func (s *Storage) PrewriteAsyncCommit(mutations []txn.Mutation, primary []byte, startTS txntypes.TimeStamp, lockTTL uint64, secondaries [][]byte, maxCommitTS txntypes.TimeStamp) ([]error, txntypes.TimeStamp) {
+	keys := make([][]byte, len(mutations))
+	for i, m := range mutations {
+		keys[i] = m.Key
+	}
+
+	cmdID := s.allocCmdID()
+	lock := s.latches.GenLock(keys)
+	for !s.latches.Acquire(lock, cmdID) {
+	}
+	defer s.latches.Release(lock, cmdID)
+
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	mvccTxn := mvcc.NewMvccTxn(startTS)
+
+	errs := make([]error, len(mutations))
+	var minCommitTS txntypes.TimeStamp
+
+	for i, mut := range mutations {
+		props := txn.AsyncCommitPrewriteProps{
+			PrewriteProps: txn.PrewriteProps{
+				StartTS:   startTS,
+				Primary:   primary,
+				LockTTL:   lockTTL,
+				IsPrimary: bytes.Equal(mut.Key, primary),
+			},
+			UseAsyncCommit: true,
+			Secondaries:    secondaries,
+			MaxCommitTS:    maxCommitTS,
+		}
+		errs[i] = txn.PrewriteAsyncCommit(mvccTxn, reader, props, mut)
+	}
+
+	hasError := false
+	for _, err := range errs {
+		if err != nil {
+			hasError = true
+			break
+		}
+	}
+
+	if !hasError {
+		if err := s.ApplyModifies(mvccTxn.Modifies); err != nil {
+			for i := range errs {
+				errs[i] = err
+			}
+			return errs, 0
+		}
+		// Compute minCommitTS = max(startTS+1, maxCommitTS+1)
+		minCommitTS = startTS + 1
+		if maxCommitTS > 0 && maxCommitTS+1 > minCommitTS {
+			minCommitTS = maxCommitTS + 1
+		}
+	}
+
+	return errs, minCommitTS
+}
+
+// PrewriteAsyncCommitModifies performs async commit prewrite and returns MVCC modifications
+// without applying them to the engine. Used in cluster mode to propose via Raft.
+func (s *Storage) PrewriteAsyncCommitModifies(mutations []txn.Mutation, primary []byte, startTS txntypes.TimeStamp, lockTTL uint64, secondaries [][]byte, maxCommitTS txntypes.TimeStamp) ([]mvcc.Modify, []error, txntypes.TimeStamp) {
+	keys := make([][]byte, len(mutations))
+	for i, m := range mutations {
+		keys[i] = m.Key
+	}
+
+	cmdID := s.allocCmdID()
+	lock := s.latches.GenLock(keys)
+	for !s.latches.Acquire(lock, cmdID) {
+	}
+	defer s.latches.Release(lock, cmdID)
+
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	mvccTxn := mvcc.NewMvccTxn(startTS)
+
+	errs := make([]error, len(mutations))
+	var minCommitTS txntypes.TimeStamp
+
+	for i, mut := range mutations {
+		props := txn.AsyncCommitPrewriteProps{
+			PrewriteProps: txn.PrewriteProps{
+				StartTS:   startTS,
+				Primary:   primary,
+				LockTTL:   lockTTL,
+				IsPrimary: bytes.Equal(mut.Key, primary),
+			},
+			UseAsyncCommit: true,
+			Secondaries:    secondaries,
+			MaxCommitTS:    maxCommitTS,
+		}
+		errs[i] = txn.PrewriteAsyncCommit(mvccTxn, reader, props, mut)
+	}
+
+	for _, err := range errs {
+		if err != nil {
+			return nil, errs, 0
+		}
+	}
+
+	// Compute minCommitTS = max(startTS+1, maxCommitTS+1)
+	minCommitTS = startTS + 1
+	if maxCommitTS > 0 && maxCommitTS+1 > minCommitTS {
+		minCommitTS = maxCommitTS + 1
+	}
+
+	return mvccTxn.Modifies, errs, minCommitTS
+}
+
+// Prewrite1PC performs prewrite and commit in a single step for 1PC transactions.
+// Returns per-mutation errors and the commit timestamp used.
+func (s *Storage) Prewrite1PC(mutations []txn.Mutation, primary []byte, startTS txntypes.TimeStamp, commitTS txntypes.TimeStamp, lockTTL uint64) ([]error, txntypes.TimeStamp) {
+	keys := make([][]byte, len(mutations))
+	for i, m := range mutations {
+		keys[i] = m.Key
+	}
+
+	cmdID := s.allocCmdID()
+	lock := s.latches.GenLock(keys)
+	for !s.latches.Acquire(lock, cmdID) {
+	}
+	defer s.latches.Release(lock, cmdID)
+
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	mvccTxn := mvcc.NewMvccTxn(startTS)
+
+	props := txn.OnePCProps{
+		StartTS:  startTS,
+		CommitTS: commitTS,
+		Primary:  primary,
+		LockTTL:  lockTTL,
+	}
+	errs := txn.PrewriteAndCommit1PC(mvccTxn, reader, props, mutations)
+
+	hasError := false
+	for _, err := range errs {
+		if err != nil {
+			hasError = true
+			break
+		}
+	}
+
+	if !hasError {
+		if err := s.ApplyModifies(mvccTxn.Modifies); err != nil {
+			for i := range errs {
+				errs[i] = err
+			}
+			return errs, 0
+		}
+		return errs, commitTS
+	}
+
+	return errs, 0
+}
+
+// Prewrite1PCModifies performs 1PC prewrite+commit and returns MVCC modifications
+// without applying them to the engine. Used in cluster mode to propose via Raft.
+func (s *Storage) Prewrite1PCModifies(mutations []txn.Mutation, primary []byte, startTS txntypes.TimeStamp, commitTS txntypes.TimeStamp, lockTTL uint64) ([]mvcc.Modify, []error, txntypes.TimeStamp) {
+	keys := make([][]byte, len(mutations))
+	for i, m := range mutations {
+		keys[i] = m.Key
+	}
+
+	cmdID := s.allocCmdID()
+	lock := s.latches.GenLock(keys)
+	for !s.latches.Acquire(lock, cmdID) {
+	}
+	defer s.latches.Release(lock, cmdID)
+
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	mvccTxn := mvcc.NewMvccTxn(startTS)
+
+	props := txn.OnePCProps{
+		StartTS:  startTS,
+		CommitTS: commitTS,
+		Primary:  primary,
+		LockTTL:  lockTTL,
+	}
+	errs := txn.PrewriteAndCommit1PC(mvccTxn, reader, props, mutations)
+
+	for _, err := range errs {
+		if err != nil {
+			return nil, errs, 0
+		}
+	}
+
+	return mvccTxn.Modifies, errs, commitTS
+}
+
+// CheckSecondaryLocks checks secondary keys for an async commit transaction.
+// Returns the lock info for each key that still has a lock belonging to the transaction,
+// the commit timestamp if any lock has been committed, and any error.
+func (s *Storage) CheckSecondaryLocks(keys [][]byte, startTS txntypes.TimeStamp) ([]*SecondaryLockStatus, txntypes.TimeStamp, error) {
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	var results []*SecondaryLockStatus
+	var commitTS txntypes.TimeStamp
+
+	for _, key := range keys {
+		lock, err := reader.LoadLock(key)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		if lock != nil && lock.StartTS == startTS {
+			// Lock is still present and belongs to our transaction.
+			results = append(results, &SecondaryLockStatus{
+				Key:  key,
+				Lock: lock,
+			})
+			continue
+		}
+
+		// Lock is gone — check if the transaction was committed on this key.
+		write, wCommitTS, err := reader.GetTxnCommitRecord(key, startTS)
+		if err != nil {
+			return nil, 0, err
+		}
+		if write != nil && write.WriteType != txntypes.WriteTypeRollback {
+			commitTS = wCommitTS
+		}
+		// If rolled back or no record, we just don't add a lock entry.
+		results = append(results, &SecondaryLockStatus{
+			Key:  key,
+			Lock: nil,
+		})
+	}
+
+	return results, commitTS, nil
+}
+
+// SecondaryLockStatus holds the lock status for a secondary key.
+type SecondaryLockStatus struct {
+	Key  []byte
+	Lock *txntypes.Lock
+}
+
+// ScanLock scans CF_LOCK for locks with StartTS <= maxVersion in [startKey, endKey).
+func (s *Storage) ScanLock(maxVersion txntypes.TimeStamp, startKey, endKey []byte, limit uint32) ([]*ScanLockResult, error) {
+	snap := s.engine.NewSnapshot()
+	defer snap.Close()
+
+	iterOpts := traits.IterOptions{}
+	if len(startKey) > 0 {
+		iterOpts.LowerBound = mvcc.EncodeLockKey(startKey)
+	}
+	if len(endKey) > 0 {
+		iterOpts.UpperBound = mvcc.EncodeLockKey(endKey)
+	}
+
+	iter := snap.NewIterator(cfnames.CFLock, iterOpts)
+	defer iter.Close()
+
+	var results []*ScanLockResult
+	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+		if limit > 0 && uint32(len(results)) >= limit {
+			break
+		}
+
+		lockData := iter.Value()
+		lock, err := txntypes.UnmarshalLock(lockData)
+		if err != nil {
+			continue
+		}
+
+		if lock.StartTS <= maxVersion {
+			userKey, err := mvcc.DecodeLockKey(iter.Key())
+			if err != nil {
+				continue
+			}
+			results = append(results, &ScanLockResult{
+				Key:  userKey,
+				Lock: lock,
+			})
+		}
+	}
+
+	return results, nil
+}
+
+// ScanLockResult holds a key and its lock from a ScanLock operation.
+type ScanLockResult struct {
+	Key  []byte
+	Lock *txntypes.Lock
+}
+
 // Engine returns the underlying engine for direct access (used in tests).
 func (s *Storage) Engine() traits.KvEngine {
 	return s.engine

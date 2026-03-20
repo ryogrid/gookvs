@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/pingcap/kvproto/pkg/raft_serverpb"
 	"github.com/ryogrid/gookv/internal/engine/rocks"
 	"github.com/ryogrid/gookv/internal/engine/traits"
@@ -361,6 +362,7 @@ func displayKey(key []byte) string {
 func cmdDump(args []string) {
 	fs := flag.NewFlagSet("dump", flag.ExitOnError)
 	dbPath := fs.String("db", "", "Path to data directory")
+	sstPath := fs.String("sst", "", "Path to SST file (direct SST parsing, --db not required)")
 	cf := fs.String("cf", cfnames.CFDefault, "Column family")
 	limit := fs.Int("limit", 50, "Maximum entries")
 	decode := fs.Bool("decode", false, "Decode MVCC keys and record values")
@@ -368,8 +370,13 @@ func cmdDump(args []string) {
 	endHex := fs.String("end", "", "End key in hex (exclusive)")
 	fs.Parse(args)
 
+	if *sstPath != "" {
+		cmdDumpSST(*sstPath, *cf, *limit, *decode)
+		return
+	}
+
 	if *dbPath == "" {
-		fmt.Fprintln(os.Stderr, "Error: --db is required")
+		fmt.Fprintln(os.Stderr, "Error: --db or --sst is required")
 		os.Exit(1)
 	}
 
@@ -412,6 +419,64 @@ func cmdDump(args []string) {
 		}
 		count++
 	}
+}
+
+// cmdDumpSST reads an SST file directly using Pebble's sstable package.
+func cmdDumpSST(path string, cf string, limit int, decode bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening SST file: %v\n", err)
+		os.Exit(1)
+	}
+	readable, err := sstable.NewSimpleReadable(f)
+	if err != nil {
+		f.Close()
+		fmt.Fprintf(os.Stderr, "Error creating readable: %v\n", err)
+		os.Exit(1)
+	}
+	reader, err := sstable.NewReader(readable, sstable.ReaderOptions{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening SST reader: %v\n", err)
+		os.Exit(1)
+	}
+	defer reader.Close()
+
+	// Print SST metadata.
+	props := reader.Properties
+	fmt.Printf("SST File: %s\n", path)
+	fmt.Printf("  Entries:     %d\n", props.NumEntries)
+	fmt.Printf("  Data Size:   %d bytes\n", props.DataSize)
+	fmt.Printf("  Index Size:  %d bytes\n", props.IndexSize)
+	fmt.Printf("  Compression: %s\n", props.CompressionName)
+	fmt.Println("---")
+
+	iter, err := reader.NewIter(nil, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating iterator: %v\n", err)
+		os.Exit(1)
+	}
+	defer iter.Close()
+
+	count := 0
+	ikey, val := iter.First()
+	for ikey != nil && count < limit {
+		key := append([]byte{}, ikey.UserKey...)
+		value, _, err := val.Value(nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading value: %v\n", err)
+			ikey, val = iter.Next()
+			continue
+		}
+		valueCopy := append([]byte{}, value...)
+		if !decode {
+			fmt.Printf("%s\t%s\n", hex.EncodeToString(key), hex.EncodeToString(valueCopy))
+		} else {
+			dumpDecoded(cf, key, valueCopy)
+		}
+		count++
+		ikey, val = iter.Next()
+	}
+	fmt.Printf("--- %d entries dumped\n", count)
 }
 
 func dumpDecoded(cf string, key, value []byte) {
