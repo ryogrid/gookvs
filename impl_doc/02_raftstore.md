@@ -268,6 +268,8 @@ The loop is straightforward: every event (tick, message, or context cancellation
 | `RaftCommand` | Unwrap `*RaftCommand`, call `propose()` |
 | `Tick` | Call `rawNode.Tick()` (additional tick beyond the timer) |
 | `ApplyResult` | Unwrap `*ApplyResult`, call `onApplyResult()` which processes `ExecResultTypeCompactLog` via `onReadyCompactLog()` and invokes pending proposal callbacks |
+| `Significant` | Unwrap `*SignificantMsg`, call `handleSignificantMessage()` — dispatches `Unreachable` (→ `rawNode.ReportUnreachable`), `SnapshotStatus` (→ `rawNode.ReportSnapshot`), and `MergeResult` (→ `stopped = true`) |
+| `Schedule` | Unwrap `*ScheduleMsg`, call `handleScheduleMessage()` — only executes if this peer is the leader; routes `TransferLeader`, `ChangePeer`, `Merge` |
 | `Destroy` | Set `stopped = true`, close the Mailbox channel |
 | Others | Silently ignored |
 
@@ -279,6 +281,7 @@ This is the core Raft integration point. It runs after every event in the loop:
 2. **Get Ready**: `rd := rawNode.Ready()` — a batch of state changes.
 3. **Update leader**: If `rd.SoftState` is non-nil, update `isLeader` based on whether `SoftState.Lead == peerID`. If this peer transitions from non-leader to leader, `sendRegionHeartbeatToPD()` is called to notify PD of the leadership change.
 4. **Persist**: `storage.SaveReady(rd)` — write hard state and new entries to `CF_RAFT` via a `WriteBatch`.
+4b. **Apply snapshot**: If `rd.Snapshot` is non-empty, call `storage.ApplySnapshot(rd.Snapshot)` to apply the received snapshot data to the storage engine (clears existing range, verifies checksums, writes key-value pairs).
 5. **Send messages**: If `sendFunc` is set and `rd.Messages` is non-empty, deliver outbound Raft messages.
 6. **Apply committed entries**:
    - Process `ConfChange` / `ConfChangeV2` entries by calling `rawNode.ApplyConfChange()`.
@@ -401,6 +404,7 @@ Mailboxes are buffered Go channels with a default capacity of 256 (configurable 
 | `PeerMsgTypeStart` | 5 | Peer initialization signal |
 | `PeerMsgTypeDestroy` | 6 | Peer destruction request |
 | `PeerMsgTypeCasual` | 7 | Low-priority, droppable messages |
+| `PeerMsgTypeSchedule` | 8 | Scheduling commands from PD (leader transfer, peer change, merge) |
 
 ### 6.2 PeerTickType (tick classifications)
 
@@ -437,9 +441,11 @@ Mailboxes are buffered Go channels with a default capacity of 256 (configurable 
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `SignificantMsgTypeSnapshotStatus` | 0 | Snapshot send/receive status |
-| `SignificantMsgTypeUnreachable` | 1 | Peer unreachable notification |
-| `SignificantMsgTypeMergeResult` | 2 | Region merge result |
+| `SignificantMsgTypeSnapshotStatus` | 0 | Snapshot send/receive status — `handleSignificantMessage` calls `rawNode.ReportSnapshot(msg.ToPeerID, msg.Status)` |
+| `SignificantMsgTypeUnreachable` | 1 | Peer unreachable notification — `handleSignificantMessage` calls `rawNode.ReportUnreachable(msg.ToPeerID)` |
+| `SignificantMsgTypeMergeResult` | 2 | Region merge result — `handleSignificantMessage` sets `stopped = true` on the peer |
+
+All three `SignificantMsgType` values are fully handled in `Peer.handleSignificantMessage()`.
 
 ### 6.6 Data Structs
 
@@ -452,6 +458,15 @@ Mailboxes are buffered Go channels with a default capacity of 256 (configurable 
 | `SplitRegionResult` | `Derived *metapb.Region`, `Regions []*metapb.Region` | Split operation output |
 | `StoreMsg` | `Type StoreMsgType`, `Data interface{}` | Store-level message envelope |
 | `SignificantMsg` | `Type`, `RegionID`, `ToPeerID`, `Status` | High-priority control message |
+| `ScheduleMsg` | `Type ScheduleMsgType`, `TransferLeader *pdpb.TransferLeader`, `ChangePeer *pdpb.ChangePeer`, `Merge *pdpb.Merge` | PD scheduling command delivered to a peer |
+
+**ScheduleMsgType constants:**
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `ScheduleMsgTypeTransferLeader` | 0 | Transfer Raft leadership to another peer |
+| `ScheduleMsgTypeChangePeer` | 1 | Add or remove a peer (conf change) |
+| `ScheduleMsgTypeMerge` | 2 | Merge this region with a target region |
 
 ---
 
@@ -558,9 +573,48 @@ The snapshot subsystem handles Raft snapshot generation, serialization, transfer
 **Background Worker** — `SnapWorker` runs a goroutine that consumes `GenSnapTask` from its task channel. Each task calls `GenerateSnapshotData` and sends the result (or error) back via `GenSnapTask.ResultCh`.
 
 **PeerStorage Integration:**
+- `SetSnapTaskCh(ch)` — Wires the async snapshot task channel from the coordinator to the peer storage.
+- `SetRegion(region)` — Stores region metadata used when generating snapshot metadata.
+- `Snapshot()` — If `snapTaskCh` is wired, calls `RequestSnapshot()` to trigger async generation via the `SnapWorker`. Otherwise returns metadata-only snapshot.
 - `RequestSnapshot()` — Initiates async snapshot generation. Sets state to `SnapStateGenerating` and submits a `GenSnapTask` to the `SnapWorker`.
 - `ApplySnapshot(snap)` — Validates the incoming snapshot metadata, calls `ApplySnapshotData`, then atomically updates the apply state, hard state, and region state in `CF_RAFT`.
 - `CancelGeneratingSnap()` — Cancels an in-progress generation via the `Canceled` atomic flag.
+
+**End-to-End Snapshot Transfer Pipeline:**
+
+The full snapshot transfer flow is now wired end-to-end:
+
+```mermaid
+sequenceDiagram
+    participant Leader as Leader Peer
+    participant PS as PeerStorage
+    participant SW as SnapWorker
+    participant Send as sendRaftMessage
+    participant TC as RaftClient
+    participant GRPC as Remote gRPC
+    participant Coord as Remote Coordinator
+    participant Follower as Follower Peer
+
+    Leader->>Leader: handleReady() — rd.Messages contains MsgSnap
+    Leader->>Send: sendFunc(messages)
+    Send->>Send: Detect msg.Type == MsgSnap
+    Send->>TC: SendSnapshot(storeID, raftMsg, snapData)
+    TC->>GRPC: Snapshot stream (1MB chunks)
+    GRPC->>Coord: Snapshot() gRPC handler
+    Coord->>Coord: HandleSnapshotMessage(msg, data)
+    Coord->>Coord: Create peer if needed (maybeCreatePeerForMessage)
+    Coord->>Follower: Route message to peer mailbox
+    Follower->>Follower: handleReady() — rd.Snapshot non-empty
+    Follower->>PS: ApplySnapshot(snap)
+    PS->>PS: ApplySnapshotData (clear range, verify checksums, write KVs)
+    Follower->>Coord: reportSnapshotStatus(regionID, peerID, status)
+    Coord->>Leader: SignificantMsg{SnapshotStatus} via router
+    Leader->>Leader: handleSignificantMessage → rawNode.ReportSnapshot
+```
+
+On the leader side, `PeerStorage.Snapshot()` triggers `SnapWorker` to generate `SnapshotData` (scanning all three data CFs). When the snapshot result arrives via `GenSnapTask.ResultCh`, the leader's next `handleReady()` includes the snapshot in `rd.Messages` as a `MsgSnap`. The `sendRaftMessage` function detects `MsgSnap` and uses `RaftClient.SendSnapshot` (streaming 1MB chunks) instead of the normal `Send` path. On send failure, `reportSnapshotStatus` with `SnapshotFailure` is sent back.
+
+On the receiving side, the gRPC `Snapshot` handler reassembles the chunks and calls `HandleSnapshotMessage`, which attaches the snapshot data to the Raft message and creates a peer if one doesn't exist for the region. The follower's `handleReady()` detects a non-empty `rd.Snapshot` and calls `storage.ApplySnapshot()` to apply the data.
 
 ### 8.2 Region Split
 
@@ -713,10 +767,13 @@ This is used after a peer is removed via conf change or region merge.
 - **Apply result processing** — `onApplyResult()` processes `ExecResultTypeCompactLog` via `onReadyCompactLog()` and invokes pending proposal callbacks.
 - **Region data cleanup** — `CleanupRegionData` removes all Raft state for destroyed regions.
 
+- **Store goroutine** — `RunStoreWorker` (in `StoreCoordinator`) is started in `main.go`. It listens on `router.StoreCh()` and handles `CreatePeer`, `DestroyPeer`, and `RaftMessage` (for unknown regions). `HandleRaftMessage` falls back to `storeCh` on `ErrRegionNotFound`, enabling dynamic peer creation.
+- **Significant messages** — All three `SignificantMsgType` values are fully handled in `handleSignificantMessage()`: `Unreachable` → `rawNode.ReportUnreachable`, `SnapshotStatus` → `rawNode.ReportSnapshot`, `MergeResult` → `stopped = true`.
+- **PD scheduling messages** — `PeerMsgTypeSchedule` (value 8) dispatches to `handleScheduleMessage()`. Only the leader executes; routes `TransferLeader`, `ChangePeer`, and `Merge` commands from PD's scheduler.
+- **Snapshot transfer** — Fully wired end-to-end: `PeerStorage.Snapshot()` → `SnapWorker` generation → `handleReady` applies snapshots → `sendRaftMessage` detects `MsgSnap` → `SendSnapshot` streaming → remote `Snapshot` gRPC handler → `HandleSnapshotMessage` → `ApplySnapshot` → `reportSnapshotStatus`.
+- **PD-coordinated split** — Wired end-to-end. Peers call `onSplitCheckTick()` at a configurable interval (`SplitCheckTickInterval`, default 10s) when acting as leader, sending `SplitCheckTask` to the `SplitCheckWorker` via `splitCheckCh`. The `StoreCoordinator.RunSplitResultHandler()` processes results: calls `AskBatchSplit` on PD for new IDs, executes `ExecBatchSplit`, bootstraps child regions via `CreatePeer`, and reports splits to PD via `ReportBatchSplit`.
+
 ### Not Implemented
 
-- **Store goroutine** — `StoreMsg` types are defined and the router carries a `storeCh`, but no store goroutine implementation exists in the raftstore package.
-- **Significant messages** — `PeerMsgTypeSignificant` is defined; only `SnapshotStatus` is partially handled. `Unreachable` and `MergeResult` are not handled.
 - **Casual messages** — `PeerMsgTypeCasual` is defined but not handled in `handleMessage`.
 - **PeerMsgTypeStart** — Defined but not handled.
-- **PD-coordinated split** — Now wired end-to-end. Peers call `onSplitCheckTick()` at a configurable interval (`SplitCheckTickInterval`, default 10s) when acting as leader, sending `SplitCheckTask` to the `SplitCheckWorker` via `splitCheckCh`. The `StoreCoordinator.RunSplitResultHandler()` processes results: calls `AskBatchSplit` on PD for new IDs, executes `ExecBatchSplit`, bootstraps child regions via `CreatePeer`, and reports splits to PD via `ReportBatchSplit`.

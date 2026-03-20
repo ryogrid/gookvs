@@ -54,6 +54,7 @@ The `main()` function proceeds through these steps in order:
    - The coordinator is attached to the server via `srv.SetCoordinator(coord)`.
    - **Region bootstrap**: A single region (ID=1) is created spanning all stores. Each store ID doubles as a peer ID (`Peer{Id: storeID, StoreId: storeID}`). `coord.BootstrapRegion()` initializes the Raft group.
    - If PD client is configured, `go coord.RunSplitResultHandler(ctx)` is started to handle PD-coordinated splits.
+   - `go coord.RunStoreWorker(storeWorkerCtx)` is started to handle dynamic peer creation/destruction via the store-level message channel.
 
 9. **gRPC server start** -- `srv.Start()` begins accepting gRPC connections.
 
@@ -204,7 +205,7 @@ The `pdclient` package is a public Go library for interacting with the Placement
 
 ### 4.1 Client Interface
 
-The `Client` interface defines 13 methods:
+The `Client` interface defines 15 methods:
 
 | Method | Purpose |
 |---|---|
@@ -215,10 +216,12 @@ The `Client` interface defines 13 methods:
 | `Bootstrap` | Bootstrap the cluster with an initial store and region |
 | `IsBootstrapped` | Check if the cluster has been bootstrapped |
 | `PutStore` | Register or update a store in PD |
-| `ReportRegionHeartbeat` | Send region heartbeat; receive scheduling commands |
+| `ReportRegionHeartbeat` | Send region heartbeat; returns `(*pdpb.RegionHeartbeatResponse, error)` with scheduling commands |
 | `StoreHeartbeat` | Send store-level heartbeat |
 | `AskBatchSplit` | Request new region/peer IDs for split operations |
 | `ReportBatchSplit` | Notify PD of completed region splits |
+| `GetGCSafePoint` | Retrieve the current global GC safe point from PD |
+| `UpdateGCSafePoint` | Advance the global GC safe point (forward only) |
 | `AllocID` | Allocate a unique ID from PD |
 | `GetClusterID` | Return the cluster identifier |
 | `Close` | Shut down the client |

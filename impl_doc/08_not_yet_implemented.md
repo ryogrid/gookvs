@@ -4,7 +4,7 @@
 
 This document tracks features in the gookv codebase that are not yet fully implemented or remain partially complete. Items are verified against the Go source code.
 
-As of 2026-03-20, the previous 12 remaining items have been addressed in branch `feat/remaining-items-and-multiregion-e2e`. The following features were implemented:
+As of 2026-03-20, two rounds of feature completion have been performed. The first round (branch `feat/remaining-items-and-multiregion-e2e`) addressed 12 items, and the second round (branch `feature/lack-features-3`, commit `c52b215b7`) implemented 6 additional features. The features implemented in the first round were:
 
 - **Async Commit / 1PC gRPC path** — `KvPrewrite` handler routes to 1PC or async commit paths based on request flags.
 - **KvCheckSecondaryLocks** — Full handler with lock inspection and commit detection.
@@ -26,6 +26,15 @@ Additionally, the **Client Library for Multi-Region Routing** has been implement
 - **RawKVClient** — Full Raw KV API: Get, Put, PutWithTTL, Delete, GetKeyTTL, BatchGet, BatchPut, BatchDelete, Scan (cross-region), DeleteRange, CompareAndSwap, Checksum.
 - **Server-side region validation** — `validateRegionContext()` added to 8 read-only Raw KV handlers for proper `region_error` propagation.
 - **9 E2E tests** validating region routing, batch operations, scan across regions, and CAS.
+
+The second round (`feature/lack-features-3`) implemented the following 6 features:
+
+- **Snapshot transfer (end-to-end)** — `SnapWorker` wired via `SetSnapTaskCh`, `handleReady` applies snapshots via `storage.ApplySnapshot()`, `sendRaftMessage` detects `MsgSnap` and uses `SendSnapshot` streaming, gRPC `Snapshot` handler receives chunks, `HandleSnapshotMessage` attaches data and creates peers, `reportSnapshotStatus` feeds back to Raft.
+- **Store goroutine** — `RunStoreWorker` started in `main.go`, `HandleRaftMessage` falls back to `storeCh` on `ErrRegionNotFound` for dynamic peer creation via the store worker.
+- **Significant messages** — `handleSignificantMessage` now handles all three types: `Unreachable` (calls `rawNode.ReportUnreachable`), `SnapshotStatus` (calls `rawNode.ReportSnapshot`), and `MergeResult` (sets `stopped = true`).
+- **GC safe point PD centralization** — `pdclient.Client` interface extended with `GetGCSafePoint` and `UpdateGCSafePoint` methods (15 methods total), `PDSafePointProvider` wraps the PD client, `KvGC` handler calls `UpdateGCSafePoint` after local GC.
+- **KvDeleteRange** — `ModifyTypeDeleteRange` (value 2) and `EndKey` field added to `Modify` struct, `KvDeleteRange` gRPC handler implemented, `raftcmd` serialization supports delete-range operations.
+- **PD scheduling** — `Scheduler` struct with `scheduleReplicaRepair` and `scheduleLeaderBalance` strategies, `MetadataStore` tracks store liveness (`storeLastHeartbeat`, `IsStoreAlive`, `GetDeadStores`, `GetLeaderCountPerStore`), `RegionHeartbeat` runs scheduler and returns commands, `PDWorker.handleSchedulingCommand` and `sendScheduleMsg` deliver commands to peers, `Peer.handleScheduleMessage` executes TransferLeader/ChangePeer/Merge.
 
 ## 2. Remaining Items
 

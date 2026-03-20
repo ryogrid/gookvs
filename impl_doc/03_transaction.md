@@ -96,13 +96,24 @@ type MvccTxn struct {
 ### Modify
 
 ```go
+type ModifyType int
+
+const (
+    ModifyTypePut         ModifyType = 0
+    ModifyTypeDelete      ModifyType = 1
+    ModifyTypeDeleteRange ModifyType = 2
+)
+
 type Modify struct {
-    Type  ModifyType   // ModifyTypePut or ModifyTypeDelete
-    CF    string       // Column family name
-    Key   []byte       // Encoded key
-    Value []byte       // Value (nil for deletes)
+    Type   ModifyType   // ModifyTypePut, ModifyTypeDelete, or ModifyTypeDeleteRange
+    CF     string       // Column family name
+    Key    []byte       // Encoded key (start key for DeleteRange)
+    Value  []byte       // Value (nil for deletes)
+    EndKey []byte       // End key (exclusive) — only used with ModifyTypeDeleteRange
 }
 ```
+
+`ModifyTypeDeleteRange` is used by `KvDeleteRange` to delete all keys in a range within a column family. The `EndKey` field specifies the exclusive upper bound of the range to delete.
 
 ### ReleasedLock
 
@@ -423,6 +434,23 @@ type SafePointProvider interface {
 ```
 
 Abstracts the retrieval of the GC safe point (typically from PD). A `MockSafePointProvider` is provided for testing, with `SetSafePoint(ts)` and an `atomic.Uint64` backing store.
+
+### PD Safe Point Integration
+
+**File:** `internal/storage/gc/pd_safe_point.go`
+
+`PDSafePointProvider` implements `SafePointProvider` by wrapping a `pdclient.Client`:
+
+```go
+type PDSafePointProvider struct {
+    pdClient pdclient.Client
+}
+```
+
+- `NewPDSafePointProvider(pdClient)` — Creates a provider backed by PD.
+- `GetGCSafePoint(ctx)` — Calls `pdClient.GetGCSafePoint(ctx)` and converts the returned `uint64` to `txntypes.TimeStamp`.
+
+The `KvGC` gRPC handler now integrates with PD: after performing local GC, it calls `pdClient.UpdateGCSafePoint(ctx, safePoint)` to centralize the safe point in PD. This ensures all nodes in the cluster observe a consistent GC safe point.
 
 ---
 

@@ -125,6 +125,10 @@ type StoreCoordinator struct {
     dones            map[uint64]chan struct{}          // regionID -> done signal
     splitCheckWorker *split.SplitCheckWorker           // background split detection
     pdClient         pdclient.Client                   // optional PD client for split coordination
+    snapWorker       *raftstore.SnapWorker             // background snapshot generation
+    snapTaskCh       chan raftstore.GenSnapTask         // snapshot task channel shared with peers
+    snapStopCh       chan struct{}                      // stops the snap worker
+    pdTaskCh         chan<- interface{}                 // channel to PDWorker for heartbeats
 }
 ```
 
@@ -134,7 +138,12 @@ type StoreCoordinator struct {
 |---|---|
 | `BootstrapRegion(region, allPeers)` | Creates and starts a Raft peer for a region |
 | `ProposeModifies(regionID, modifies, timeout)` | Serializes modifies as `RaftCmdRequest` and proposes via Raft; blocks until committed or timeout |
-| `HandleRaftMessage(msg)` | Dispatches incoming `RaftMessage` to the correct peer via the router |
+| `HandleRaftMessage(msg)` | Dispatches incoming `RaftMessage` to the correct peer via the router; falls back to `storeCh` on `ErrRegionNotFound` for dynamic peer creation |
+| `HandleSnapshotMessage(msg, data)` | Attaches snapshot data to Raft message; creates peer if needed via `maybeCreatePeerForMessage`; routes to peer mailbox |
+| `reportSnapshotStatus(regionID, peerID, status)` | Sends `SignificantMsg{SnapshotStatus}` back to the leader peer via the router |
+| `reportUnreachable(regionID, peerID)` | Sends `SignificantMsg{Unreachable}` to the peer via the router |
+| `Router()` | Returns the coordinator's router (used by `PDWorker.sendScheduleMsg`) |
+| `RunStoreWorker(ctx)` | Goroutine that listens on `router.StoreCh()` and handles `CreatePeer`, `DestroyPeer`, and `RaftMessage` for unknown regions |
 | `GetPeer(regionID)` | Returns the peer for a region |
 | `ResolveRegionForKey(key)` | Routes a key to its containing region by checking peer ranges |
 | `CreatePeer(region, peers)` | Creates and starts a new Raft peer (used after split) |
@@ -142,8 +151,18 @@ type StoreCoordinator struct {
 | `Stop()` | Cancels all peers, stops split check worker, and unregisters from the router |
 
 Helper functions in `internal/server/raftcmd.go` provide the serialization bridge:
-- `ModifiesToRequests([]mvcc.Modify) []*raft_cmdpb.Request` -- leader serialization path.
-- `RequestsToModifies([]*raft_cmdpb.Request) []mvcc.Modify` -- follower/apply deserialization path.
+- `ModifiesToRequests([]mvcc.Modify) []*raft_cmdpb.Request` -- leader serialization path. Supports `ModifyTypeDeleteRange` via `CmdType_DeleteRange` with `StartKey`/`EndKey`.
+- `RequestsToModifies([]*raft_cmdpb.Request) []mvcc.Modify` -- follower/apply deserialization path. Handles `CmdType_DeleteRange` to reconstruct `ModifyTypeDeleteRange` modifies.
+
+**`sendRaftMessage` behavior:**
+
+The `sendRaftMessage` function converts `raftpb.Message` to `raft_serverpb.RaftMessage` and dispatches based on message type:
+- **`MsgSnap`** (snapshot): Uses `RaftClient.SendSnapshot(storeID, raftMsg, snapData)` for streaming transfer. On failure, calls `reportSnapshotStatus` with `SnapshotFailure`.
+- **Other messages**: Uses `RaftClient.Send(storeID, raftMsg)`. On failure, calls `reportUnreachable(regionID, peerID)` to notify the leader.
+
+**`HandleRaftMessage` fallback:**
+
+When `HandleRaftMessage` receives a Raft message for an unknown region (router returns `ErrRegionNotFound`), it falls back to sending a `StoreMsgTypeRaftMessage` to `router.StoreCh()`. The `RunStoreWorker` goroutine processes this by calling `maybeCreatePeerForMessage`, which creates a new peer if the message is valid (e.g., a snapshot from a leader for a region this node should join).
 
 ### 2.5 Helper: errToKeyError (`internal/server/server.go`)
 
@@ -181,8 +200,8 @@ The `Tikv` service declares the full TiKV-compatible API. Below is the implement
 | `KvCheckSecondaryLocks` | `CheckSecondaryLocksRequest` / `CheckSecondaryLocksResponse` | Yes (inspects locks on secondary keys for async commit resolution) |
 | `KvScanLock` | `ScanLockRequest` / `ScanLockResponse` | Yes (iterates CF_LOCK with StartTS <= maxVersion filter, respects limit) |
 | `KvResolveLock` | `ResolveLockRequest` / `ResolveLockResponse` | Yes (dual-mode: cluster proposes via Raft, standalone applies locally) |
-| `KvGC` | `GCRequest` / `GCResponse` | No (unimplemented stub) |
-| `KvDeleteRange` | `DeleteRangeRequest` / `DeleteRangeResponse` | No (unimplemented stub) |
+| `KvGC` | `GCRequest` / `GCResponse` | Yes (schedules GC task with safe point; updates PD safe point via `pdClient.UpdateGCSafePoint` if PD is configured) |
+| `KvDeleteRange` | `DeleteRangeRequest` / `DeleteRangeResponse` | Yes (creates `ModifyTypeDeleteRange` modifies for each data CF; proposes via Raft in cluster mode, applies directly in standalone) |
 
 ### 3.2 Raw RPCs
 
@@ -206,7 +225,7 @@ Write operations (`RawPut`, `RawDelete`, `RawBatchPut`, `RawBatchDelete`, `RawDe
 |---|---|---|
 | `Raft` | `stream RaftMessage` -> `Done` | Yes -- receives messages and dispatches to coordinator |
 | `BatchRaft` | `stream BatchRaftMessage` -> `Done` | Yes -- unpacks batch and dispatches each message |
-| `Snapshot` | `stream SnapshotChunk` -> `Done` | No (unimplemented stub) |
+| `Snapshot` | `stream SnapshotChunk` -> `Done` | Yes (receives snapshot chunks, reassembles data, calls `HandleSnapshotMessage` on coordinator) |
 
 ### 3.4 Batch Commands
 
