@@ -145,6 +145,56 @@ Shut down gracefully with `SIGINT` or `SIGTERM`.
 #   - GC safe point management
 ```
 
+## Logging
+
+gookv uses Go's `log/slog` structured logging with file rotation via lumberjack.
+
+### CLI Flags
+
+| Flag | Description |
+|------|-------------|
+| `--log-level` | Log level: `debug`, `info`, `warn`, `error` (overrides config/default) |
+| `--log-file` | Log file path (overrides config/default) |
+
+### Examples
+
+```bash
+# Enable debug logging (includes gRPC call traces)
+./gookv-server --data-dir /tmp/gookv-data --log-level debug
+
+# Write logs to a custom file
+./gookv-server --data-dir /tmp/gookv-data --log-file /var/log/gookv/server.log
+
+# PD server with debug logging
+./gookv-pd --addr 0.0.0.0:2379 --log-level debug
+
+# PD server with custom log file
+./gookv-pd --addr 0.0.0.0:2379 --log-file /var/log/gookv/pd.log
+```
+
+### TOML Configuration (gookv-server)
+
+```toml
+[log]
+level = "info"       # debug, info, warn, error
+format = "text"      # text or json
+
+[log.file]
+filename = "server.log"   # relative to <data-dir>/log/
+max-size = 300            # MB per file before rotation
+max-backups = 5
+max-days = 28
+```
+
+CLI flags (`--log-level`, `--log-file`) override TOML settings.
+
+### Default Log Paths
+
+| Binary | Default log path |
+|--------|-----------------|
+| `gookv-server` | `<data-dir>/log/server.log` |
+| `gookv-pd` | `<data-dir>/log/pd.log` |
+
 ## Running a Cluster
 
 gookv supports running multiple nodes as a Raft cluster on a single machine. Data written to any leader node is replicated to all other nodes via Raft consensus.

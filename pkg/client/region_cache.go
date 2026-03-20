@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"sync"
 
@@ -53,6 +54,7 @@ func (c *RegionCache) LocateKey(ctx context.Context, key []byte) (*RegionInfo, e
 	}
 	c.mu.RUnlock()
 
+	slog.Debug("cache.GetRegion", "key", fmt.Sprintf("%x", key))
 	return c.loadFromPD(ctx, key)
 }
 

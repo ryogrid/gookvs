@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -62,6 +63,7 @@ func (s *RegionRequestSender) SendToRegion(ctx context.Context, key []byte, rpcF
 			continue
 		}
 
+		slog.Debug("tikv.rpc", "region-id", info.Region.GetId(), "store", info.StoreAddr)
 		client := tikvpb.NewTikvClient(conn)
 		regionErr, err := rpcFn(client, info)
 
@@ -152,6 +154,7 @@ func (s *RegionRequestSender) getOrDial(addr string) (*grpc.ClientConn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.dialTimeout)
 	defer cancel()
 
+	slog.Debug("tikv.dial", "addr", addr)
 	conn, err := grpc.DialContext(ctx, addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64<<20)),

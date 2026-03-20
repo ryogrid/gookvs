@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -84,6 +85,7 @@ func (c *RaftClient) Send(storeID uint64, msg *raft_serverpb.RaftMessage) error 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	slog.Debug("raft.Send", "store-id", storeID)
 	stream, err := client.Raft(ctx)
 	if err != nil {
 		return fmt.Errorf("raft stream to store %d failed: %w", storeID, err)
@@ -114,6 +116,7 @@ func (c *RaftClient) BatchSend(storeID uint64, msgs []*raft_serverpb.RaftMessage
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	slog.Debug("raft.BatchSend", "store-id", storeID, "msgs", len(msgs))
 	stream, err := client.BatchRaft(ctx)
 	if err != nil {
 		return fmt.Errorf("batch raft stream to store %d failed: %w", storeID, err)
@@ -155,6 +158,7 @@ func (c *RaftClient) SendSnapshot(storeID uint64, msg *raft_serverpb.RaftMessage
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	slog.Debug("raft.Snapshot", "store-id", storeID)
 	stream, err := client.Snapshot(ctx)
 	if err != nil {
 		return fmt.Errorf("snapshot stream to store %d failed: %w", storeID, err)
@@ -276,6 +280,7 @@ func (p *connPool) get(dialTimeout time.Duration) (*grpc.ClientConn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
+	slog.Debug("raft.dial", "addr", p.addr)
 	conn, err := grpc.DialContext(ctx, p.addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{

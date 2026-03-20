@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -49,6 +50,7 @@ func (r *PDStoreResolver) Resolve(ctx context.Context, storeID uint64) (string, 
 	}
 	r.mu.RUnlock()
 
+	slog.Debug("resolver.GetStore", "store-id", storeID)
 	store, err := r.pdClient.GetStore(ctx, storeID)
 	if err != nil {
 		return "", fmt.Errorf("resolve store %d: %w", storeID, err)

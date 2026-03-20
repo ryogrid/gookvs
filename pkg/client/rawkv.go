@@ -3,6 +3,8 @@ package client
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/pingcap/kvproto/pkg/errorpb"
@@ -29,6 +31,7 @@ func (c *RawKVClient) Get(ctx context.Context, key []byte) ([]byte, bool, error)
 	var value []byte
 	var notFound bool
 	err := c.sender.SendToRegion(ctx, key, func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+		slog.Debug("rawkv.Get", "key", fmt.Sprintf("%x", key))
 		resp, err := client.RawGet(ctx, &kvrpcpb.RawGetRequest{
 			Context: buildContext(info),
 			Key:     key,
@@ -53,6 +56,7 @@ func (c *RawKVClient) Get(ctx context.Context, key []byte) ([]byte, bool, error)
 // Put stores a key-value pair.
 func (c *RawKVClient) Put(ctx context.Context, key, value []byte) error {
 	return c.sender.SendToRegion(ctx, key, func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+		slog.Debug("rawkv.Put", "key", fmt.Sprintf("%x", key))
 		resp, err := client.RawPut(ctx, &kvrpcpb.RawPutRequest{
 			Context: buildContext(info),
 			Key:     key,
@@ -75,6 +79,7 @@ func (c *RawKVClient) Put(ctx context.Context, key, value []byte) error {
 // PutWithTTL stores a key-value pair with a TTL in seconds.
 func (c *RawKVClient) PutWithTTL(ctx context.Context, key, value []byte, ttl uint64) error {
 	return c.sender.SendToRegion(ctx, key, func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+		slog.Debug("rawkv.Put", "key", fmt.Sprintf("%x", key), "ttl", ttl)
 		resp, err := client.RawPut(ctx, &kvrpcpb.RawPutRequest{
 			Context: buildContext(info),
 			Key:     key,
@@ -98,6 +103,7 @@ func (c *RawKVClient) PutWithTTL(ctx context.Context, key, value []byte, ttl uin
 // Delete removes a key.
 func (c *RawKVClient) Delete(ctx context.Context, key []byte) error {
 	return c.sender.SendToRegion(ctx, key, func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+		slog.Debug("rawkv.Delete", "key", fmt.Sprintf("%x", key))
 		resp, err := client.RawDelete(ctx, &kvrpcpb.RawDeleteRequest{
 			Context: buildContext(info),
 			Key:     key,
@@ -120,6 +126,7 @@ func (c *RawKVClient) Delete(ctx context.Context, key []byte) error {
 func (c *RawKVClient) GetKeyTTL(ctx context.Context, key []byte) (uint64, error) {
 	var ttl uint64
 	err := c.sender.SendToRegion(ctx, key, func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+		slog.Debug("rawkv.GetKeyTTL", "key", fmt.Sprintf("%x", key))
 		resp, err := client.RawGetKeyTTL(ctx, &kvrpcpb.RawGetKeyTTLRequest{
 			Context: buildContext(info),
 			Key:     key,
@@ -155,6 +162,7 @@ func (c *RawKVClient) BatchGet(ctx context.Context, keys [][]byte) ([]KvPair, er
 		group := group
 		g.Go(func() error {
 			return c.sender.SendToRegion(gCtx, group.Keys[0], func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+				slog.Debug("rawkv.BatchGet", "keys", len(group.Keys))
 				resp, err := client.RawBatchGet(gCtx, &kvrpcpb.RawBatchGetRequest{
 					Context: buildContext(info),
 					Keys:    group.Keys,
@@ -206,6 +214,7 @@ func (c *RawKVClient) BatchPut(ctx context.Context, pairs []KvPair) error {
 				kvPairs[i] = &kvrpcpb.KvPair{Key: k, Value: pairMap[string(k)]}
 			}
 			return c.sender.SendToRegion(gCtx, group.Keys[0], func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+				slog.Debug("rawkv.BatchPut", "pairs", len(kvPairs))
 				resp, err := client.RawBatchPut(gCtx, &kvrpcpb.RawBatchPutRequest{
 					Context: buildContext(info),
 					Pairs:   kvPairs,
@@ -239,6 +248,7 @@ func (c *RawKVClient) BatchDelete(ctx context.Context, keys [][]byte) error {
 		group := group
 		g.Go(func() error {
 			return c.sender.SendToRegion(gCtx, group.Keys[0], func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+				slog.Debug("rawkv.BatchDelete", "keys", len(group.Keys))
 				resp, err := client.RawBatchDelete(gCtx, &kvrpcpb.RawBatchDeleteRequest{
 					Context: buildContext(info),
 					Keys:    group.Keys,
@@ -283,6 +293,7 @@ func (c *RawKVClient) Scan(ctx context.Context, startKey, endKey []byte, limit i
 		}
 
 		var pairs []KvPair
+		slog.Debug("rawkv.Scan", "start", fmt.Sprintf("%x", currentKey), "limit", remaining)
 		err = c.sender.SendToRegion(ctx, currentKey, func(client tikvpb.TikvClient, rInfo *RegionInfo) (*errorpb.Error, error) {
 			resp, err := client.RawScan(ctx, &kvrpcpb.RawScanRequest{
 				Context:  buildContext(rInfo),
@@ -329,6 +340,7 @@ func (c *RawKVClient) Scan(ctx context.Context, startKey, endKey []byte, limit i
 // DeleteRange deletes all keys in a range.
 func (c *RawKVClient) DeleteRange(ctx context.Context, startKey, endKey []byte) error {
 	return c.sender.SendToRegion(ctx, startKey, func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+		slog.Debug("rawkv.DeleteRange", "start", fmt.Sprintf("%x", startKey), "end", fmt.Sprintf("%x", endKey))
 		resp, err := client.RawDeleteRange(ctx, &kvrpcpb.RawDeleteRangeRequest{
 			Context:  buildContext(info),
 			StartKey: startKey,
@@ -353,6 +365,7 @@ func (c *RawKVClient) CompareAndSwap(ctx context.Context, key, value, prevValue 
 	var succeed bool
 	var previousValue []byte
 	err := c.sender.SendToRegion(ctx, key, func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+		slog.Debug("rawkv.CompareAndSwap", "key", fmt.Sprintf("%x", key))
 		resp, err := client.RawCompareAndSwap(ctx, &kvrpcpb.RawCASRequest{
 			Context:          buildContext(info),
 			Key:              key,
@@ -381,6 +394,7 @@ func (c *RawKVClient) CompareAndSwap(ctx context.Context, key, value, prevValue 
 func (c *RawKVClient) Checksum(ctx context.Context, startKey, endKey []byte) (uint64, uint64, uint64, error) {
 	var checksum, totalKvs, totalBytes uint64
 	err := c.sender.SendToRegion(ctx, startKey, func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+		slog.Debug("rawkv.Checksum", "start", fmt.Sprintf("%x", startKey), "end", fmt.Sprintf("%x", endKey))
 		resp, err := client.RawChecksum(ctx, &kvrpcpb.RawChecksumRequest{
 			Context: buildContext(info),
 			Ranges: []*kvrpcpb.KeyRange{

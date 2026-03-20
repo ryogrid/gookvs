@@ -7,8 +7,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -18,6 +20,7 @@ import (
 	"go.etcd.io/etcd/raft/v3"
 
 	"github.com/ryogrid/gookv/internal/config"
+	goolog "github.com/ryogrid/gookv/internal/log"
 	"github.com/ryogrid/gookv/internal/engine/rocks"
 	"github.com/ryogrid/gookv/internal/raftstore"
 	raftrouter "github.com/ryogrid/gookv/internal/raftstore/router"
@@ -35,6 +38,8 @@ func main() {
 	pdEndpoints := flag.String("pd-endpoints", "", "PD endpoints, comma separated (overrides config)")
 	storeID := flag.Uint64("store-id", 0, "Store ID for this node (enables cluster mode)")
 	initialCluster := flag.String("initial-cluster", "", "Initial cluster topology: storeID=addr,... (e.g. 1=127.0.0.1:20160,2=127.0.0.1:20161)")
+	logLevel := flag.String("log-level", "", "Log level: debug, info, warn, error (overrides config)")
+	logFile := flag.String("log-file", "", "Log file path (overrides config)")
 	flag.Parse()
 
 	// Load configuration.
@@ -62,22 +67,63 @@ func main() {
 	if *pdEndpoints != "" {
 		cfg.PD.Endpoints = splitEndpoints(*pdEndpoints)
 	}
+	if *logLevel != "" {
+		cfg.Log.Level = *logLevel
+	}
+	if *logFile != "" {
+		cfg.Log.File.Filename = *logFile
+	}
 
 	// Validate configuration.
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("Invalid configuration: %v", err)
 	}
 
+	// Resolve log file path.
+	logFilename := cfg.Log.File.Filename
+	if logFilename != "" && !filepath.IsAbs(logFilename) {
+		logDir := filepath.Join(cfg.Storage.DataDir, "log")
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			log.Fatalf("Failed to create log directory %s: %v", logDir, err)
+		}
+		logFilename = filepath.Join(logDir, logFilename)
+	}
+
+	slowLogFile := cfg.SlowLogFile
+	if slowLogFile != "" && !filepath.IsAbs(slowLogFile) {
+		logDir := filepath.Join(cfg.Storage.DataDir, "log")
+		_ = os.MkdirAll(logDir, 0755)
+		slowLogFile = filepath.Join(logDir, slowLogFile)
+	}
+
+	goolog.Setup(goolog.LogConfig{
+		Level:            cfg.Log.Level,
+		Format:           cfg.Log.Format,
+		Filename:         logFilename,
+		MaxSizeMB:        cfg.Log.File.MaxSize,
+		MaxBackups:       cfg.Log.File.MaxBackups,
+		MaxAgeDays:       cfg.Log.File.MaxDays,
+		SlowLogFile:      slowLogFile,
+		SlowLogThreshold: cfg.SlowLogThreshold.Duration,
+	})
+
 	fmt.Printf("gookv-server starting\n")
 	fmt.Printf("  gRPC addr:   %s\n", cfg.Server.Addr)
 	fmt.Printf("  status addr: %s\n", cfg.Server.StatusAddr)
 	fmt.Printf("  data dir:    %s\n", cfg.Storage.DataDir)
 	fmt.Printf("  PD:          %v\n", cfg.PD.Endpoints)
+	slog.Info("gookv-server starting",
+		"addr", cfg.Server.Addr,
+		"status-addr", cfg.Server.StatusAddr,
+		"data-dir", cfg.Storage.DataDir,
+		"pd", cfg.PD.Endpoints,
+	)
 
 	// Open storage engine.
 	engine, err := rocks.Open(cfg.Storage.DataDir)
 	if err != nil {
-		log.Fatalf("Failed to open engine at %s: %v", cfg.Storage.DataDir, err)
+		slog.Error("Failed to open engine", "data-dir", cfg.Storage.DataDir, "error", err)
+		os.Exit(1)
 	}
 	defer engine.Close()
 
@@ -97,11 +143,11 @@ func main() {
 	if *storeID > 0 && *initialCluster != "" {
 		clusterMap := parseInitialCluster(*initialCluster)
 		if len(clusterMap) == 0 {
-			log.Fatalf("Invalid --initial-cluster format")
+			slog.Error("Invalid --initial-cluster format")
+			os.Exit(1)
 		}
 
-		fmt.Printf("  store-id:    %d\n", *storeID)
-		fmt.Printf("  cluster:     %v\n", clusterMap)
+		slog.Info("cluster mode enabled", "store-id", *storeID, "cluster", clusterMap)
 
 		resolver := server.NewStaticStoreResolver(clusterMap)
 		raftClient := transport.NewRaftClient(resolver, transport.DefaultRaftClientConfig())
@@ -122,9 +168,9 @@ func main() {
 			pdCancel()
 			if pdErr != nil {
 				pdClient = nil // ensure nil on failure
-				fmt.Printf("  PD connection failed (continuing without PD): %v\n", pdErr)
+				slog.Warn("PD connection failed, continuing without PD", "error", pdErr)
 			} else {
-				fmt.Printf("  PD connected: %v\n", cfg.PD.Endpoints)
+				slog.Info("PD connected", "endpoints", cfg.PD.Endpoints)
 
 				// Wire PD client into the server for TSO allocation.
 				srv.SetPDClient(pdClient)
@@ -147,7 +193,7 @@ func main() {
 					region := &metapb.Region{Id: 1, Peers: peers}
 					store := &metapb.Store{Id: *storeID, Address: cfg.Server.Addr}
 					_, _ = pdClient.Bootstrap(bsCtx, store, region)
-					fmt.Println("  PD cluster bootstrapped")
+					slog.Info("PD cluster bootstrapped")
 				}
 				bsCancel()
 
@@ -201,15 +247,17 @@ func main() {
 			Peers: peers,
 		}
 		if err := coord.BootstrapRegion(region, raftPeers); err != nil {
-			log.Fatalf("Failed to bootstrap region: %v", err)
+			slog.Error("Failed to bootstrap region", "error", err)
+			os.Exit(1)
 		}
-		fmt.Printf("Raft cluster bootstrapped (region 1, %d peers)\n", len(raftPeers))
+		slog.Info("Raft cluster bootstrapped", "region", 1, "peers", len(raftPeers))
 	}
 
 	if err := srv.Start(); err != nil {
-		log.Fatalf("Failed to start gRPC server: %v", err)
+		slog.Error("Failed to start gRPC server", "error", err)
+		os.Exit(1)
 	}
-	fmt.Printf("gRPC server listening on %s\n", srv.Addr())
+	slog.Info("gRPC server listening", "addr", srv.Addr())
 
 	// Create and start HTTP status server.
 	statusSrv := statusserver.New(statusserver.Config{
@@ -219,15 +267,16 @@ func main() {
 		},
 	})
 	if err := statusSrv.Start(); err != nil {
-		log.Fatalf("Failed to start status server: %v", err)
+		slog.Error("Failed to start status server", "error", err)
+		os.Exit(1)
 	}
-	fmt.Printf("Status server listening on %s\n", statusSrv.Addr())
+	slog.Info("Status server listening", "addr", statusSrv.Addr())
 
 	// Wait for shutdown signal.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
-	fmt.Printf("\nReceived signal %v, shutting down...\n", sig)
+	slog.Info("Received signal, shutting down", "signal", sig)
 
 	// Graceful shutdown.
 	if pdWorker != nil {
@@ -238,7 +287,7 @@ func main() {
 	}
 	_ = statusSrv.Stop()
 	srv.Stop()
-	fmt.Println("gookv-server stopped")
+	slog.Info("gookv-server stopped")
 }
 
 func splitEndpoints(s string) []string {

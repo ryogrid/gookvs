@@ -169,6 +169,7 @@ func DefaultConfig() *Config {
 			Level:  "info",
 			Format: "text",
 			File: LogFileConfig{
+				Filename:   "server.log", // resolved to <data-dir>/log/server.log in main
 				MaxSize:    300,
 				MaxDays:    0,
 				MaxBackups: 0,

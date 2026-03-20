@@ -6,6 +6,7 @@ package pdclient
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -148,6 +149,7 @@ func NewClient(ctx context.Context, cfg Config) (Client, error) {
 	var connIdx int
 	var err error
 	for i, ep := range cfg.Endpoints {
+		slog.Debug("pd.dial", "endpoint", ep)
 		conn, err = grpc.DialContext(ctx, ep,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithBlock(),
@@ -171,6 +173,7 @@ func NewClient(ctx context.Context, cfg Config) (Client, error) {
 	}
 
 	// Discover cluster ID.
+	slog.Debug("pd.GetMembers")
 	resp, err := c.client.GetMembers(ctx, &pdpb.GetMembersRequest{})
 	if err != nil {
 		conn.Close()
@@ -201,6 +204,7 @@ func (c *grpcClient) reconnect() error {
 		nextIdx := (c.currentIdx + 1 + i) % n
 		ep := c.endpoints[nextIdx]
 
+		slog.Debug("pd.reconnect", "endpoint", ep)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		conn, err := grpc.DialContext(ctx, ep,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -263,6 +267,7 @@ func (c *grpcClient) GetTS(ctx context.Context) (TimeStamp, error) {
 		client := c.client
 		c.mu.RUnlock()
 
+		slog.Debug("pd.Tso")
 		stream, err := client.Tso(ctx)
 		if err != nil {
 			return fmt.Errorf("pdclient: tso stream: %w", err)
@@ -303,6 +308,7 @@ func (c *grpcClient) GetRegion(ctx context.Context, key []byte) (*metapb.Region,
 		client := c.client
 		c.mu.RUnlock()
 
+		slog.Debug("pd.GetRegion", "key", fmt.Sprintf("%x", key))
 		resp, err := client.GetRegion(ctx, &pdpb.GetRegionRequest{
 			Header:    c.header(),
 			RegionKey: key,
@@ -328,6 +334,7 @@ func (c *grpcClient) GetRegionByID(ctx context.Context, regionID uint64) (*metap
 		client := c.client
 		c.mu.RUnlock()
 
+		slog.Debug("pd.GetRegionByID", "region-id", regionID)
 		resp, err := client.GetRegionByID(ctx, &pdpb.GetRegionByIDRequest{
 			Header:   c.header(),
 			RegionId: regionID,
@@ -352,6 +359,7 @@ func (c *grpcClient) GetStore(ctx context.Context, storeID uint64) (*metapb.Stor
 		client := c.client
 		c.mu.RUnlock()
 
+		slog.Debug("pd.GetStore", "store-id", storeID)
 		resp, err := client.GetStore(ctx, &pdpb.GetStoreRequest{
 			Header:  c.header(),
 			StoreId: storeID,
@@ -369,6 +377,7 @@ func (c *grpcClient) GetStore(ctx context.Context, storeID uint64) (*metapb.Stor
 }
 
 func (c *grpcClient) Bootstrap(ctx context.Context, store *metapb.Store, region *metapb.Region) (*pdpb.BootstrapResponse, error) {
+	slog.Debug("pd.Bootstrap", "store-id", store.GetId(), "region-id", region.GetId())
 	resp, err := c.client.Bootstrap(ctx, &pdpb.BootstrapRequest{
 		Header: c.header(),
 		Store:  store,
@@ -384,6 +393,7 @@ func (c *grpcClient) Bootstrap(ctx context.Context, store *metapb.Store, region 
 }
 
 func (c *grpcClient) IsBootstrapped(ctx context.Context) (bool, error) {
+	slog.Debug("pd.IsBootstrapped")
 	resp, err := c.client.IsBootstrapped(ctx, &pdpb.IsBootstrappedRequest{
 		Header: c.header(),
 	})
@@ -399,6 +409,7 @@ func (c *grpcClient) PutStore(ctx context.Context, store *metapb.Store) error {
 		client := c.client
 		c.mu.RUnlock()
 
+		slog.Debug("pd.PutStore", "store-id", store.GetId())
 		resp, err := client.PutStore(ctx, &pdpb.PutStoreRequest{
 			Header: c.header(),
 			Store:  store,
@@ -420,6 +431,7 @@ func (c *grpcClient) ReportRegionHeartbeat(ctx context.Context, req *pdpb.Region
 		client := c.client
 		c.mu.RUnlock()
 
+		slog.Debug("pd.RegionHeartbeat", "region-id", req.GetRegion().GetId())
 		req.Header = c.header()
 		stream, err := client.RegionHeartbeat(ctx)
 		if err != nil {
@@ -448,6 +460,7 @@ func (c *grpcClient) StoreHeartbeat(ctx context.Context, stats *pdpb.StoreStats)
 		client := c.client
 		c.mu.RUnlock()
 
+		slog.Debug("pd.StoreHeartbeat", "store-id", stats.GetStoreId())
 		resp, err := client.StoreHeartbeat(ctx, &pdpb.StoreHeartbeatRequest{
 			Header: c.header(),
 			Stats:  stats,
@@ -469,6 +482,7 @@ func (c *grpcClient) AskBatchSplit(ctx context.Context, region *metapb.Region, c
 		client := c.client
 		c.mu.RUnlock()
 
+		slog.Debug("pd.AskBatchSplit", "region-id", region.GetId(), "count", count)
 		resp, err := client.AskBatchSplit(ctx, &pdpb.AskBatchSplitRequest{
 			Header:     c.header(),
 			Region:     region,
@@ -492,6 +506,7 @@ func (c *grpcClient) ReportBatchSplit(ctx context.Context, regions []*metapb.Reg
 		client := c.client
 		c.mu.RUnlock()
 
+		slog.Debug("pd.ReportBatchSplit", "regions", len(regions))
 		resp, err := client.ReportBatchSplit(ctx, &pdpb.ReportBatchSplitRequest{
 			Header:  c.header(),
 			Regions: regions,
@@ -513,6 +528,7 @@ func (c *grpcClient) GetGCSafePoint(ctx context.Context) (uint64, error) {
 		client := c.client
 		c.mu.RUnlock()
 
+		slog.Debug("pd.GetGCSafePoint")
 		resp, err := client.GetGCSafePoint(ctx, &pdpb.GetGCSafePointRequest{
 			Header: c.header(),
 		})
@@ -535,6 +551,7 @@ func (c *grpcClient) UpdateGCSafePoint(ctx context.Context, safePoint uint64) (u
 		client := c.client
 		c.mu.RUnlock()
 
+		slog.Debug("pd.UpdateGCSafePoint", "safe-point", safePoint)
 		resp, err := client.UpdateGCSafePoint(ctx, &pdpb.UpdateGCSafePointRequest{
 			Header:    c.header(),
 			SafePoint: safePoint,
@@ -558,6 +575,7 @@ func (c *grpcClient) AllocID(ctx context.Context) (uint64, error) {
 		client := c.client
 		c.mu.RUnlock()
 
+		slog.Debug("pd.AllocID")
 		resp, err := client.AllocID(ctx, &pdpb.AllocIDRequest{
 			Header: c.header(),
 		})
