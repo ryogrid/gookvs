@@ -146,6 +146,7 @@ type RaftStoreConfig struct {
 	RegionSplitSize          ReadableSize `toml:"region-split-size"`
 	RaftLogGCThreshold       uint64   `toml:"raft-log-gc-threshold"`
 	RaftLogGCCountLimit      uint64   `toml:"raft-log-gc-count-limit"`
+	SplitCheckTickInterval   Duration `toml:"split-check-tick-interval"`
 }
 
 // CoprocessorConfig controls the coprocessor.
@@ -200,6 +201,7 @@ func DefaultConfig() *Config {
 			RegionSplitSize:          96 * MB,
 			RaftLogGCThreshold:       50,
 			RaftLogGCCountLimit:      72000,
+			SplitCheckTickInterval:   Duration{10 * time.Second},
 		},
 		Coprocessor: CoprocessorConfig{
 			RegionMaxKeys:      1440000,

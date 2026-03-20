@@ -356,6 +356,8 @@ func (sc *StoreCoordinator) handleStoreMsg(msg raftstore.StoreMsg) {
 }
 
 // CreatePeer creates and starts a new peer for the given region.
+// If the peer has no persisted Raft state, it is bootstrapped with the region's
+// full peer list so the Raft node knows the correct cluster configuration.
 func (sc *StoreCoordinator) CreatePeer(req *raftstore.CreatePeerRequest) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -365,10 +367,20 @@ func (sc *StoreCoordinator) CreatePeer(req *raftstore.CreatePeerRequest) error {
 		return fmt.Errorf("raftstore: peer for region %d already exists", regionID)
 	}
 
+	// Check if persisted Raft state exists for this region.
+	// If not, bootstrap with the region's peers so the Raft node
+	// has the correct cluster configuration from the start.
+	var raftPeers []raft.Peer
+	if !raftstore.HasPersistedRaftState(sc.engine, regionID) {
+		for _, p := range req.Region.GetPeers() {
+			raftPeers = append(raftPeers, raft.Peer{ID: p.GetId()})
+		}
+	}
+
 	peer, err := raftstore.NewPeer(
 		regionID, req.PeerID, sc.storeID,
 		req.Region, sc.engine, sc.cfg,
-		nil, // nil peers = non-bootstrap, recover from engine or start empty
+		raftPeers,
 	)
 	if err != nil {
 		return err
@@ -447,6 +459,8 @@ func (sc *StoreCoordinator) DestroyPeer(req *raftstore.DestroyPeerRequest) error
 }
 
 // maybeCreatePeerForMessage creates a peer if a RaftMessage arrives for an unknown region.
+// When PD is available, it queries PD for full region metadata so the child peer
+// is bootstrapped with the correct cluster configuration (all peers).
 func (sc *StoreCoordinator) maybeCreatePeerForMessage(msg *raft_serverpb.RaftMessage) {
 	regionID := msg.GetRegionId()
 	if sc.router.HasRegion(regionID) {
@@ -458,12 +472,26 @@ func (sc *StoreCoordinator) maybeCreatePeerForMessage(msg *raft_serverpb.RaftMes
 		"from_store", msg.GetFromPeer().GetStoreId(),
 		"to_peer", msg.GetToPeer().GetId())
 
-	region := &metapb.Region{
-		Id: regionID,
-		Peers: []*metapb.Peer{
-			msg.GetFromPeer(),
-			msg.GetToPeer(),
-		},
+	// Try to get full region metadata from PD for correct peer list.
+	var region *metapb.Region
+	if sc.pdClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		resp, _, err := sc.pdClient.GetRegionByID(ctx, regionID)
+		cancel()
+		if err == nil && resp != nil {
+			region = resp
+		}
+	}
+
+	// Fallback: construct minimal region from the message.
+	if region == nil {
+		region = &metapb.Region{
+			Id: regionID,
+			Peers: []*metapb.Peer{
+				msg.GetFromPeer(),
+				msg.GetToPeer(),
+			},
+		}
 	}
 
 	req := &raftstore.CreatePeerRequest{

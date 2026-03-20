@@ -24,6 +24,7 @@ import (
 	"github.com/ryogrid/gookv/internal/engine/rocks"
 	"github.com/ryogrid/gookv/internal/raftstore"
 	raftrouter "github.com/ryogrid/gookv/internal/raftstore/router"
+	"github.com/ryogrid/gookv/internal/raftstore/split"
 	"github.com/ryogrid/gookv/internal/server"
 	"github.com/ryogrid/gookv/internal/server/transport"
 	statusserver "github.com/ryogrid/gookv/internal/server/status"
@@ -157,6 +158,9 @@ func main() {
 		if cfg.RaftStore.RaftBaseTickInterval.Duration > 0 {
 			peerCfg.RaftBaseTickInterval = cfg.RaftStore.RaftBaseTickInterval.Duration
 		}
+		if cfg.RaftStore.SplitCheckTickInterval.Duration > 0 {
+			peerCfg.SplitCheckTickInterval = cfg.RaftStore.SplitCheckTickInterval.Duration
+		}
 
 		// Connect to PD if endpoints are configured.
 		var pdTaskCh chan<- interface{}
@@ -215,6 +219,12 @@ func main() {
 			PeerCfg:  peerCfg,
 			PDTaskCh: pdTaskCh,
 			PDClient: pdClient,
+			SplitCheckCfg: split.SplitCheckWorkerConfig{
+				SplitSize: uint64(cfg.RaftStore.RegionSplitSize),
+				MaxSize:   uint64(cfg.RaftStore.RegionMaxSize),
+				SplitKeys: uint64(cfg.Coprocessor.RegionSplitKeys),
+				MaxKeys:   uint64(cfg.Coprocessor.RegionMaxKeys),
+			},
 		})
 		srv.SetCoordinator(coord)
 

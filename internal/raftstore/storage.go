@@ -284,6 +284,13 @@ func (s *PeerStorage) SetDummyEntry() {
 	s.entries = []raftpb.Entry{{Index: 0, Term: 0}}
 }
 
+// HasPersistedRaftState checks whether the engine has persisted Raft state
+// for the given region. Returns true if a hard state key exists.
+func HasPersistedRaftState(engine traits.KvEngine, regionID uint64) bool {
+	_, err := engine.Get(cfnames.CFRaft, keys.RaftStateKey(regionID))
+	return err == nil
+}
+
 // RecoverFromEngine restores PeerStorage state from the engine.
 // This should be called when restarting a peer that already has persisted Raft state.
 func (s *PeerStorage) RecoverFromEngine() error {

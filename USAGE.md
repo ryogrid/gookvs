@@ -195,6 +195,45 @@ rm -rf /tmp/gookv-pd-cluster
 | `--initial-cluster` | Cluster topology: `storeID=addr,...` |
 | `--pd-endpoints` | Comma-separated PD addresses (e.g., `127.0.0.1:2379`) |
 
+## Cross-Region Transaction Demo
+
+Demonstrates cross-region 2PC transactions: single-region txn, region split, then cross-region atomic commit.
+
+### Prerequisites
+
+- Go installed
+- Ports 2389, 20170-20172, 20190-20192 available
+
+### Running
+
+```bash
+# Build and start PD + 3-node cluster with small split thresholds
+make txn-demo-start
+
+# Run the demo (3 scenarios: baseline txn, split, cross-region 2PC)
+make txn-demo-verify
+
+# Stop and clean up
+make txn-demo-stop
+```
+
+### Ports
+
+| Component | Address |
+|-----------|---------|
+| PD | 127.0.0.1:2389 |
+| Node 1 | 127.0.0.1:20170 (gRPC), :20190 (status) |
+| Node 2 | 127.0.0.1:20171 (gRPC), :20191 (status) |
+| Node 3 | 127.0.0.1:20172 (gRPC), :20192 (status) |
+
+### What Each Scenario Demonstrates
+
+1. **Single-Region Transaction**: Verifies `TxnKVClient` works for basic 2PC within one Raft group.
+2. **Region Split**: Writes enough data to exceed the 1KB split threshold, triggering PD-coordinated region split. Shows before/after region layout.
+3. **Cross-Region 2PC**: Commits a transaction whose keys span different regions (different Raft groups, potentially different leaders), demonstrating atomic cross-region transactions.
+
+The cluster uses 3 KVS nodes with 3-node Raft groups. After split, both regions have 3 peers on the same 3 stores but run as separate Raft groups with potentially different leaders.
+
 ## Using the Admin CLI
 
 ```bash
