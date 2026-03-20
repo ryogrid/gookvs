@@ -33,7 +33,11 @@ func tryPrewrite(t *testing.T, mc *multiRegionCluster, req *kvrpcpb.PrewriteRequ
 		_, client := dialTikvClient(t, n.addr)
 		resp, err := client.KvPrewrite(ctx, req)
 		if err != nil {
-			continue // gRPC-level error (e.g. Unavailable), try next node
+			continue // gRPC-level error (e.g. Internal), try next node
+		}
+		// Check for region routing errors (not leader, region not found).
+		if resp.GetRegionError() != nil {
+			continue
 		}
 		// Check for retryable errors (not leader).
 		hasRetryable := false
@@ -59,6 +63,9 @@ func tryCommit(t *testing.T, mc *multiRegionCluster, req *kvrpcpb.CommitRequest)
 		_, client := dialTikvClient(t, n.addr)
 		resp, err := client.KvCommit(ctx, req)
 		if err != nil {
+			continue
+		}
+		if resp.GetRegionError() != nil {
 			continue
 		}
 		if resp.GetError() != nil && resp.GetError().GetRetryable() != "" {
@@ -127,7 +134,7 @@ func rawPutOnLeaderMC(t *testing.T, mc *multiRegionCluster, key, value []byte) {
 	for _, n := range mc.nodes {
 		_, client := dialTikvClient(t, n.addr)
 		resp, err := client.RawPut(ctx, &kvrpcpb.RawPutRequest{Key: key, Value: value})
-		if err == nil && resp.GetError() == "" {
+		if err == nil && resp.GetRegionError() == nil && resp.GetError() == "" {
 			return
 		}
 	}
@@ -501,7 +508,7 @@ func TestMultiRegionPDCoordinatedSplit(t *testing.T) {
 			for _, n := range nodes {
 				_, client := dialTikvClient(t, n.addr)
 				resp, err := client.RawPut(ctx, &kvrpcpb.RawPutRequest{Key: key, Value: value})
-				if err == nil && resp.GetError() == "" {
+				if err == nil && resp.GetRegionError() == nil && resp.GetError() == "" {
 					putOk = true
 					break
 				}

@@ -1,15 +1,18 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/pingcap/kvproto/pkg/coprocessor"
+	"github.com/pingcap/kvproto/pkg/errorpb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/raft_serverpb"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
@@ -283,7 +286,11 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 			}
 			regionID := svc.resolveRegionID(primary)
 			if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
-				return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+				if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
+					resp.RegionError = regErr
+					return resp, nil
+				}
+				return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
 			}
 			resp.OnePcCommitTs = uint64(onePCCommitTS)
 		} else {
@@ -324,7 +331,11 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 			}
 			regionID := svc.resolveRegionID(primary)
 			if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
-				return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+				if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
+					resp.RegionError = regErr
+					return resp, nil
+				}
+				return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
 			}
 			resp.MinCommitTs = uint64(minCommitTS)
 		} else {
@@ -357,7 +368,11 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 		// Propose modifications via Raft for replication to all nodes.
 		regionID := svc.resolveRegionID(primary)
 		if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
-			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
+				resp.RegionError = regErr
+				return resp, nil
+			}
+			return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
 		}
 		return resp, nil
 	}
@@ -392,7 +407,11 @@ func (svc *tikvService) KvCommit(ctx context.Context, req *kvrpcpb.CommitRequest
 		if len(modifies) > 0 {
 			regionID := svc.resolveRegionID(keys[0])
 			if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
-				return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+				if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
+					resp.RegionError = regErr
+					return resp, nil
+				}
+				return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
 			}
 		}
 		return resp, nil
@@ -527,7 +546,11 @@ func (svc *tikvService) KvPessimisticLock(ctx context.Context, req *kvrpcpb.Pess
 		}
 		regionID := svc.resolveRegionID(primary)
 		if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
-			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
+				resp.RegionError = regErr
+				return resp, nil
+			}
+			return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
 		}
 	} else {
 		errs := svc.server.storage.PessimisticLock(keys, primary, startTS, forUpdateTS, lockTTL)
@@ -587,7 +610,11 @@ func (svc *tikvService) KvResolveLock(ctx context.Context, req *kvrpcpb.ResolveL
 				regionID = svc.resolveRegionID(reqKeys[0])
 			}
 			if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
-				return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+				if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
+					resp.RegionError = regErr
+					return resp, nil
+				}
+				return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
 			}
 		}
 	} else {
@@ -676,11 +703,70 @@ func lockToLockInfo(key []byte, lock *txntypes.Lock) *kvrpcpb.LockInfo {
 	return info
 }
 
+// validateRegionContext checks that the request context refers to a valid region
+// on this node. Returns a structured region error if validation fails, or nil if OK.
+// If reqCtx is nil or RegionId is 0, validation is skipped (backward compat).
+func (svc *tikvService) validateRegionContext(reqCtx *kvrpcpb.Context, key []byte) *errorpb.Error {
+	if reqCtx == nil || reqCtx.GetRegionId() == 0 {
+		return nil
+	}
+	coord := svc.server.coordinator
+	if coord == nil {
+		return nil
+	}
+	regionID := reqCtx.GetRegionId()
+	peer := coord.GetPeer(regionID)
+	if peer == nil {
+		return &errorpb.Error{
+			Message:        fmt.Sprintf("region %d not found", regionID),
+			RegionNotFound: &errorpb.RegionNotFound{RegionId: regionID},
+		}
+	}
+	if !peer.IsLeader() {
+		return &errorpb.Error{
+			Message:   fmt.Sprintf("not leader for region %d", regionID),
+			NotLeader: &errorpb.NotLeader{RegionId: regionID},
+		}
+	}
+	if key != nil {
+		region := peer.Region()
+		startKey := region.GetStartKey()
+		endKey := region.GetEndKey()
+		if len(startKey) > 0 && bytes.Compare(key, startKey) < 0 {
+			return &errorpb.Error{
+				Message: fmt.Sprintf("key %q not in region %d [%q, %q)", key, regionID, startKey, endKey),
+				KeyNotInRegion: &errorpb.KeyNotInRegion{
+					Key:       key,
+					RegionId:  regionID,
+					StartKey:  startKey,
+					EndKey:    endKey,
+				},
+			}
+		}
+		if len(endKey) > 0 && bytes.Compare(key, endKey) >= 0 {
+			return &errorpb.Error{
+				Message: fmt.Sprintf("key %q not in region %d [%q, %q)", key, regionID, startKey, endKey),
+				KeyNotInRegion: &errorpb.KeyNotInRegion{
+					Key:       key,
+					RegionId:  regionID,
+					StartKey:  startKey,
+					EndKey:    endKey,
+				},
+			}
+		}
+	}
+	return nil
+}
+
 // --- Raw KV handlers ---
 
 // RawGet implements the RawGet RPC.
 func (svc *tikvService) RawGet(ctx context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
 	resp := &kvrpcpb.RawGetResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), req.GetKey()); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 	value, err := svc.server.rawStorage.Get(req.GetCf(), req.GetKey())
 	if err != nil {
 		resp.Error = err.Error()
@@ -728,6 +814,40 @@ func (svc *tikvService) proposeModifiesToRegions(coord *StoreCoordinator, modifi
 	return nil
 }
 
+// proposeModifiesToRegionsWithRegionError is like proposeModifiesToRegions but returns
+// a structured region error instead of a plain error when the failure is a routing error.
+func (svc *tikvService) proposeModifiesToRegionsWithRegionError(coord *StoreCoordinator, modifies []mvcc.Modify, timeout time.Duration) (*errorpb.Error, error) {
+	groups := svc.groupModifiesByRegion(modifies)
+	for regionID, regionModifies := range groups {
+		if err := coord.ProposeModifies(regionID, regionModifies, timeout); err != nil {
+			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
+				return regErr, nil
+			}
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+// proposeErrorToRegionError converts a ProposeModifies error string into a structured region error.
+// Returns nil if the error is not a region-routing error.
+func proposeErrorToRegionError(err error, regionID uint64) *errorpb.Error {
+	msg := err.Error()
+	if strings.Contains(msg, "not found") {
+		return &errorpb.Error{
+			Message:        msg,
+			RegionNotFound: &errorpb.RegionNotFound{RegionId: regionID},
+		}
+	}
+	if strings.Contains(msg, "not leader") {
+		return &errorpb.Error{
+			Message:   msg,
+			NotLeader: &errorpb.NotLeader{RegionId: regionID},
+		}
+	}
+	return nil
+}
+
 // RawPut implements the RawPut RPC.
 func (svc *tikvService) RawPut(ctx context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
 	resp := &kvrpcpb.RawPutResponse{}
@@ -736,7 +856,11 @@ func (svc *tikvService) RawPut(ctx context.Context, req *kvrpcpb.RawPutRequest) 
 		modify := svc.server.rawStorage.PutModify(req.GetCf(), req.GetKey(), req.GetValue(), ttl)
 		regionID := svc.resolveRegionID(req.GetKey())
 		if err := coord.ProposeModifies(regionID, []mvcc.Modify{modify}, 10*time.Second); err != nil {
-			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
+				resp.RegionError = regErr
+				return resp, nil
+			}
+			return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
 		}
 	} else {
 		if err := svc.server.rawStorage.Put(req.GetCf(), req.GetKey(), req.GetValue(), ttl); err != nil {
@@ -753,7 +877,11 @@ func (svc *tikvService) RawDelete(ctx context.Context, req *kvrpcpb.RawDeleteReq
 		modify := svc.server.rawStorage.DeleteModify(req.GetCf(), req.GetKey())
 		regionID := svc.resolveRegionID(req.GetKey())
 		if err := coord.ProposeModifies(regionID, []mvcc.Modify{modify}, 10*time.Second); err != nil {
-			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
+				resp.RegionError = regErr
+				return resp, nil
+			}
+			return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
 		}
 	} else {
 		if err := svc.server.rawStorage.Delete(req.GetCf(), req.GetKey()); err != nil {
@@ -766,6 +894,10 @@ func (svc *tikvService) RawDelete(ctx context.Context, req *kvrpcpb.RawDeleteReq
 // RawScan implements the RawScan RPC.
 func (svc *tikvService) RawScan(ctx context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
 	resp := &kvrpcpb.RawScanResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), req.GetStartKey()); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 	pairs, err := svc.server.rawStorage.Scan(
 		req.GetCf(), req.GetStartKey(), req.GetEndKey(),
 		req.GetLimit(), req.GetKeyOnly(), req.GetReverse(),
@@ -782,6 +914,10 @@ func (svc *tikvService) RawScan(ctx context.Context, req *kvrpcpb.RawScanRequest
 // RawBatchGet implements the RawBatchGet RPC.
 func (svc *tikvService) RawBatchGet(ctx context.Context, req *kvrpcpb.RawBatchGetRequest) (*kvrpcpb.RawBatchGetResponse, error) {
 	resp := &kvrpcpb.RawBatchGetResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), nil); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 	pairs, err := svc.server.rawStorage.BatchGet(req.GetCf(), req.GetKeys())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "raw batch get failed: %v", err)
@@ -812,8 +948,11 @@ func (svc *tikvService) RawBatchPut(ctx context.Context, req *kvrpcpb.RawBatchPu
 			}
 			modifies[i] = svc.server.rawStorage.PutModify(req.GetCf(), p.Key, p.Value, t)
 		}
-		if err := svc.proposeModifiesToRegions(coord, modifies, 10*time.Second); err != nil {
-			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+		if regErr, err := svc.proposeModifiesToRegionsWithRegionError(coord, modifies, 10*time.Second); regErr != nil {
+			resp.RegionError = regErr
+			return resp, nil
+		} else if err != nil {
+			return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
 		}
 	} else {
 		if err := svc.server.rawStorage.BatchPutWithTTL(req.GetCf(), pairs, ttls); err != nil {
@@ -856,8 +995,11 @@ func (svc *tikvService) RawBatchDelete(ctx context.Context, req *kvrpcpb.RawBatc
 		for i, key := range req.GetKeys() {
 			modifies[i] = svc.server.rawStorage.DeleteModify(req.GetCf(), key)
 		}
-		if err := svc.proposeModifiesToRegions(coord, modifies, 10*time.Second); err != nil {
-			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
+		if regErr, err := svc.proposeModifiesToRegionsWithRegionError(coord, modifies, 10*time.Second); regErr != nil {
+			resp.RegionError = regErr
+			return resp, nil
+		} else if err != nil {
+			return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
 		}
 	} else {
 		if err := svc.server.rawStorage.BatchDelete(req.GetCf(), req.GetKeys()); err != nil {
@@ -870,6 +1012,10 @@ func (svc *tikvService) RawBatchDelete(ctx context.Context, req *kvrpcpb.RawBatc
 // RawDeleteRange implements the RawDeleteRange RPC.
 func (svc *tikvService) RawDeleteRange(ctx context.Context, req *kvrpcpb.RawDeleteRangeRequest) (*kvrpcpb.RawDeleteRangeResponse, error) {
 	resp := &kvrpcpb.RawDeleteRangeResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), req.GetStartKey()); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 	if err := svc.server.rawStorage.DeleteRange(req.GetCf(), req.GetStartKey(), req.GetEndKey()); err != nil {
 		resp.Error = err.Error()
 	}
@@ -879,6 +1025,10 @@ func (svc *tikvService) RawDeleteRange(ctx context.Context, req *kvrpcpb.RawDele
 // RawBatchScan implements the RawBatchScan RPC.
 func (svc *tikvService) RawBatchScan(ctx context.Context, req *kvrpcpb.RawBatchScanRequest) (*kvrpcpb.RawBatchScanResponse, error) {
 	resp := &kvrpcpb.RawBatchScanResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), nil); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 
 	ranges := make([]KeyRange, len(req.GetRanges()))
 	for i, r := range req.GetRanges() {
@@ -900,6 +1050,10 @@ func (svc *tikvService) RawBatchScan(ctx context.Context, req *kvrpcpb.RawBatchS
 // RawGetKeyTTL implements the RawGetKeyTTL RPC.
 func (svc *tikvService) RawGetKeyTTL(ctx context.Context, req *kvrpcpb.RawGetKeyTTLRequest) (*kvrpcpb.RawGetKeyTTLResponse, error) {
 	resp := &kvrpcpb.RawGetKeyTTLResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), req.GetKey()); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 
 	ttl, notFound, err := svc.server.rawStorage.GetKeyTTL(req.GetCf(), req.GetKey())
 	if err != nil {
@@ -917,6 +1071,10 @@ func (svc *tikvService) RawGetKeyTTL(ctx context.Context, req *kvrpcpb.RawGetKey
 // RawCompareAndSwap implements the RawCompareAndSwap RPC.
 func (svc *tikvService) RawCompareAndSwap(ctx context.Context, req *kvrpcpb.RawCASRequest) (*kvrpcpb.RawCASResponse, error) {
 	resp := &kvrpcpb.RawCASResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), req.GetKey()); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 
 	succeed, prevNotExist, prevValue, err := svc.server.rawStorage.CompareAndSwap(
 		req.GetCf(),
@@ -941,6 +1099,10 @@ func (svc *tikvService) RawCompareAndSwap(ctx context.Context, req *kvrpcpb.RawC
 // RawChecksum implements the RawChecksum RPC.
 func (svc *tikvService) RawChecksum(ctx context.Context, req *kvrpcpb.RawChecksumRequest) (*kvrpcpb.RawChecksumResponse, error) {
 	resp := &kvrpcpb.RawChecksumResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), nil); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 
 	ranges := make([]KeyRange, len(req.GetRanges()))
 	for i, r := range req.GetRanges() {

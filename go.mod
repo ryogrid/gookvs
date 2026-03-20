@@ -1,6 +1,6 @@
 module github.com/ryogrid/gookv
 
-go 1.22.2
+go 1.25.0
 
 require (
 	github.com/BurntSushi/toml v1.6.0
@@ -9,6 +9,7 @@ require (
 	github.com/prometheus/client_golang v1.15.0
 	github.com/stretchr/testify v1.11.1
 	go.etcd.io/etcd/raft/v3 v3.5.17
+	golang.org/x/sync v0.20.0
 	google.golang.org/grpc v1.59.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )

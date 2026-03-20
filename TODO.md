@@ -46,8 +46,66 @@
 - [x] TestMultiRegionAsyncCommit (async commit across regions)
 - [x] TestMultiRegionScanLock (ScanLock respects boundaries)
 
-## Phase 6: Final Verification
+## Phase 6: Final Verification (prev items)
 - [x] TODO.md audit — all items checked
 - [x] Stale comment scan — 1 unrelated TODO in coordinator.go (flow control)
 - [x] Full test suite passes (internal, pkg, e2e all green: 22.9s)
 - [x] Update impl_doc/08_not_yet_implemented.md
+
+---
+
+## Phase 7: Client Library for Multi-Region Routing (`pkg/client/`)
+
+Design docs: `design_docs/multi_client_lib/`
+
+### 7.1 Server-Side Region Error Propagation (prerequisite)
+- [x] Add `validateRegionContext()` helper in server.go
+- [x] Modify Raw KV handlers to return `region_error` in response (not gRPC error) on routing failures
+- [x] All 8 read-only handlers updated: RawGet, RawScan, RawBatchGet, RawBatchScan, RawGetKeyTTL, RawCompareAndSwap, RawChecksum, RawDeleteRange
+
+### 7.2 PDStoreResolver (`pkg/client/store_resolver.go`)
+- [x] Implement `PDStoreResolver` — dynamic storeID→address via PD `GetStore`
+- [x] TTL-based caching (default 30s) with `nowFunc` for testability
+- [x] `InvalidateStore(storeID)` method
+- [x] Unit tests (5 tests: cache miss, hit, expiry, invalidation, not found)
+
+### 7.3 RegionCache (`pkg/client/region_cache.go`)
+- [x] Implement `RegionInfo` struct (Region + Leader + StoreAddr)
+- [x] Implement `RegionCache` — sorted slice + binary search for O(log n) lookup
+- [x] `LocateKey(ctx, key)` — cache lookup with PD fallback
+- [x] `InvalidateRegion(regionID)` — eviction on EpochNotMatch/RegionNotFound
+- [x] `UpdateLeader(regionID, leader, storeAddr)` — in-place leader update on NotLeader
+- [x] `GroupKeysByRegion(ctx, keys)` — batch key grouping
+- [x] Unit tests with mock PD (6 tests: cold/warm cache, multi-region, invalidation, leader update, key grouping)
+
+### 7.4 RegionRequestSender (`pkg/client/request_sender.go`)
+- [x] Implement `RegionRequestSender` with gRPC connection pool
+- [x] `SendToRegion(ctx, key, rpcFn)` — locate, send, retry on region errors
+- [x] Error-driven cache invalidation (NotLeader, EpochNotMatch, StoreNotMatch, KeyNotInRegion, RegionNotFound)
+- [x] Configurable max retries (default 3)
+- [x] `isRetryableRegionError()` helper
+
+### 7.5 RawKVClient (`pkg/client/rawkv.go`)
+- [x] Implement `Client` factory (PD connection, cache/resolver init) in `client.go`
+- [x] Single-key: Get, Put, PutWithTTL, Delete, GetKeyTTL
+- [x] Batch: BatchGet, BatchPut, BatchDelete (parallel per-region dispatch via errgroup)
+- [x] Range: Scan (cross-region continuation), DeleteRange
+- [x] Advanced: CompareAndSwap, Checksum
+- [x] `Client.Close()` — cleanup all resources
+
+### 7.6 E2E Tests (`e2e/client_lib_test.go`)
+- [x] `newClientTestCluster` helper
+- [x] TestClientRegionCacheMiss
+- [x] TestClientRegionCacheHit
+- [x] TestClientStoreResolution
+- [x] TestClientBatchGetAcrossRegions
+- [x] TestClientBatchPutAcrossRegions
+- [x] TestClientScanAcrossRegions
+- [x] TestClientScanWithLimit
+- [x] TestClientCompareAndSwap
+- [x] TestClientBatchDeleteAcrossRegions
+
+### 7.7 Final Verification
+- [x] TODO comment audit — only 1 pre-existing unrelated TODO in coordinator.go (flow control)
+- [x] All unit tests pass (11 in pkg/client, all internal/pkg tests green)
+- [x] All e2e tests pass (9 client lib tests green)

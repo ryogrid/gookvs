@@ -369,7 +369,7 @@ func TestMultiRegionRawKV(t *testing.T) {
 		for _, n := range mc.nodes {
 			_, client := dialTikvClient(t, n.addr)
 			resp, err := client.RawPut(ctx, &kvrpcpb.RawPutRequest{Key: key, Value: value})
-			if err == nil && resp.GetError() == "" {
+			if err == nil && resp.GetRegionError() == nil && resp.GetError() == "" {
 				return
 			}
 		}
