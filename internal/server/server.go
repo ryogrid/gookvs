@@ -184,12 +184,10 @@ func (svc *tikvService) KvGet(ctx context.Context, req *kvrpcpb.GetRequest) (*kv
 
 	value, err := svc.server.storage.Get(req.GetKey(), txntypes.TimeStamp(req.GetVersion()))
 	if err != nil {
-		if errors.Is(err, mvcc.ErrKeyIsLocked) {
+		var lockErr *mvcc.LockError
+		if errors.As(err, &lockErr) {
 			resp.Error = &kvrpcpb.KeyError{
-				Locked: &kvrpcpb.LockInfo{
-					Key:         req.GetKey(),
-					LockVersion: req.GetVersion(),
-				},
+				Locked: lockToLockInfo(lockErr.Key, lockErr.Lock),
 			}
 			return resp, nil
 		}
@@ -217,9 +215,10 @@ func (svc *tikvService) KvScan(ctx context.Context, req *kvrpcpb.ScanRequest) (*
 		req.GetKeyOnly(),
 	)
 	if err != nil {
-		if errors.Is(err, mvcc.ErrKeyIsLocked) {
+		var lockErr *mvcc.LockError
+		if errors.As(err, &lockErr) {
 			resp.Error = &kvrpcpb.KeyError{
-				Locked: &kvrpcpb.LockInfo{},
+				Locked: lockToLockInfo(lockErr.Key, lockErr.Lock),
 			}
 			return resp, nil
 		}
@@ -330,12 +329,10 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 			if len(resp.Errors) > 0 || len(modifies) == 0 {
 				return resp, nil
 			}
-			regionID := svc.resolveRegionID(primary)
-			if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
-				if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
-					resp.RegionError = regErr
-					return resp, nil
-				}
+			if regErr, err := svc.proposeModifiesToRegionsWithRegionError(coord, modifies, 10*time.Second); regErr != nil {
+				resp.RegionError = regErr
+				return resp, nil
+			} else if err != nil {
 				return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
 			}
 			resp.MinCommitTs = uint64(minCommitTS)
@@ -366,13 +363,10 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 		if len(resp.Errors) > 0 || len(modifies) == 0 {
 			return resp, nil
 		}
-		// Propose modifications via Raft for replication to all nodes.
-		regionID := svc.resolveRegionID(primary)
-		if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
-			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
-				resp.RegionError = regErr
-				return resp, nil
-			}
+		if regErr, err := svc.proposeModifiesToRegionsWithRegionError(coord, modifies, 10*time.Second); regErr != nil {
+			resp.RegionError = regErr
+			return resp, nil
+		} else if err != nil {
 			return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
 		}
 		return resp, nil
@@ -406,13 +400,11 @@ func (svc *tikvService) KvCommit(ctx context.Context, req *kvrpcpb.CommitRequest
 			return resp, nil
 		}
 		if len(modifies) > 0 {
-			regionID := svc.resolveRegionID(keys[0])
-			if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
-				if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
-					resp.RegionError = regErr
-					return resp, nil
-				}
-				return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
+			if regErr, propErr := svc.proposeModifiesToRegionsWithRegionError(coord, modifies, 10*time.Second); regErr != nil {
+				resp.RegionError = regErr
+				return resp, nil
+			} else if propErr != nil {
+				return nil, status.Errorf(codes.Internal, "raft propose failed: %v", propErr)
 			}
 		}
 		return resp, nil
@@ -441,11 +433,10 @@ func (svc *tikvService) KvBatchGet(ctx context.Context, req *kvrpcpb.BatchGetReq
 
 	for _, p := range pairs {
 		if p.Err != nil {
-			if errors.Is(p.Err, mvcc.ErrKeyIsLocked) {
+			var lockErr *mvcc.LockError
+			if errors.As(p.Err, &lockErr) {
 				resp.Error = &kvrpcpb.KeyError{
-					Locked: &kvrpcpb.LockInfo{
-						Key: p.Key,
-					},
+					Locked: lockToLockInfo(lockErr.Key, lockErr.Lock),
 				}
 				return resp, nil
 			}
@@ -464,10 +455,27 @@ func (svc *tikvService) KvBatchGet(ctx context.Context, req *kvrpcpb.BatchGetReq
 func (svc *tikvService) KvBatchRollback(ctx context.Context, req *kvrpcpb.BatchRollbackRequest) (*kvrpcpb.BatchRollbackResponse, error) {
 	resp := &kvrpcpb.BatchRollbackResponse{}
 
-	err := svc.server.storage.BatchRollback(
-		req.GetKeys(),
-		txntypes.TimeStamp(req.GetStartVersion()),
-	)
+	keys := req.GetKeys()
+	startTS := txntypes.TimeStamp(req.GetStartVersion())
+
+	if coord := svc.server.coordinator; coord != nil {
+		modifies, err := svc.server.storage.BatchRollbackModifies(keys, startTS)
+		if err != nil {
+			resp.Error = errToKeyError(err)
+			return resp, nil
+		}
+		if len(modifies) > 0 {
+			if regErr, propErr := svc.proposeModifiesToRegionsWithRegionError(coord, modifies, 10*time.Second); regErr != nil {
+				resp.RegionError = regErr
+				return resp, nil
+			} else if propErr != nil {
+				return nil, status.Errorf(codes.Internal, "raft propose failed: %v", propErr)
+			}
+		}
+		return resp, nil
+	}
+
+	err := svc.server.storage.BatchRollback(keys, startTS)
 	if err != nil {
 		resp.Error = errToKeyError(err)
 	}
@@ -545,13 +553,11 @@ func (svc *tikvService) KvPessimisticLock(ctx context.Context, req *kvrpcpb.Pess
 		if len(resp.Errors) > 0 || len(modifies) == 0 {
 			return resp, nil
 		}
-		regionID := svc.resolveRegionID(primary)
-		if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
-			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
-				resp.RegionError = regErr
-				return resp, nil
-			}
-			return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
+		if regErr, propErr := svc.proposeModifiesToRegionsWithRegionError(coord, modifies, 10*time.Second); regErr != nil {
+			resp.RegionError = regErr
+			return resp, nil
+		} else if propErr != nil {
+			return nil, status.Errorf(codes.Internal, "raft propose failed: %v", propErr)
 		}
 	} else {
 		errs := svc.server.storage.PessimisticLock(keys, primary, startTS, forUpdateTS, lockTTL)
@@ -606,16 +612,11 @@ func (svc *tikvService) KvResolveLock(ctx context.Context, req *kvrpcpb.ResolveL
 			return resp, nil
 		}
 		if len(modifies) > 0 {
-			regionID := uint64(1)
-			if reqKeys := req.GetKeys(); len(reqKeys) > 0 {
-				regionID = svc.resolveRegionID(reqKeys[0])
-			}
-			if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
-				if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
-					resp.RegionError = regErr
-					return resp, nil
-				}
-				return nil, status.Errorf(codes.Internal, "raft propose failed: %v", err)
+			if regErr, propErr := svc.proposeModifiesToRegionsWithRegionError(coord, modifies, 10*time.Second); regErr != nil {
+				resp.RegionError = regErr
+				return resp, nil
+			} else if propErr != nil {
+				return nil, status.Errorf(codes.Internal, "raft propose failed: %v", propErr)
 			}
 		}
 	} else {

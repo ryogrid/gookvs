@@ -1,6 +1,7 @@
 package mvcc
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -485,4 +486,45 @@ func TestPointGetterDeletedKey(t *testing.T) {
 	val, err := pg.Get([]byte("key1"))
 	require.NoError(t, err)
 	assert.Nil(t, val)
+}
+
+func TestPointGetterLockErrorStructured(t *testing.T) {
+	engine := newTestEngine(t)
+
+	startTS := txntypes.ComposeTS(10, 0)
+	lockedKey := []byte("locked-key")
+
+	// Write a lock for the key.
+	txn := NewMvccTxn(startTS)
+	lock := &txntypes.Lock{
+		LockType: txntypes.LockTypePut,
+		Primary:  []byte("primary-key"),
+		StartTS:  startTS,
+		TTL:      5000,
+	}
+	txn.PutLock(lockedKey, lock)
+	applyModifies(t, engine, txn.Modifies)
+
+	snap := engine.NewSnapshot()
+	defer snap.Close()
+	reader := NewMvccReader(snap)
+	pg := NewPointGetter(reader, txntypes.ComposeTS(20, 0), IsolationLevelSI)
+
+	_, err := pg.Get(lockedKey)
+	require.Error(t, err)
+
+	// 1. The error should be a *LockError.
+	var lockErr *LockError
+	require.True(t, errors.As(err, &lockErr), "error should be a *LockError")
+
+	// 2. errors.Is should still match ErrKeyIsLocked (via LockError.Is).
+	assert.ErrorIs(t, err, ErrKeyIsLocked)
+
+	// 3. The LockError should carry the correct Key and Lock fields.
+	assert.Equal(t, Key(lockedKey), lockErr.Key)
+	require.NotNil(t, lockErr.Lock)
+	assert.Equal(t, txntypes.LockTypePut, lockErr.Lock.LockType)
+	assert.Equal(t, []byte("primary-key"), lockErr.Lock.Primary)
+	assert.Equal(t, startTS, lockErr.Lock.StartTS)
+	assert.Equal(t, uint64(5000), lockErr.Lock.TTL)
 }

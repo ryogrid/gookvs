@@ -21,6 +21,21 @@ var (
 	ErrKeyIsLocked = errors.New("mvcc: key is locked")
 )
 
+// LockError is a structured error that carries the conflicting lock details.
+// It wraps ErrKeyIsLocked so errors.Is(err, ErrKeyIsLocked) still works.
+type LockError struct {
+	Key  Key
+	Lock *txntypes.Lock
+}
+
+func (e *LockError) Error() string {
+	return ErrKeyIsLocked.Error()
+}
+
+func (e *LockError) Is(target error) bool {
+	return target == ErrKeyIsLocked
+}
+
 // LockInfo contains information about a conflicting lock.
 type LockInfo struct {
 	Key      Key
@@ -65,7 +80,7 @@ func (pg *PointGetter) Get(key Key) ([]byte, error) {
 		}
 		if lock != nil && lock.StartTS <= pg.ts {
 			if !pg.bypassLocks[lock.StartTS] {
-				return nil, ErrKeyIsLocked
+				return nil, &LockError{Key: key, Lock: lock}
 			}
 		}
 	}

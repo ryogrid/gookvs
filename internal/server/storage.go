@@ -328,6 +328,30 @@ func (s *Storage) BatchRollback(keys [][]byte, startTS txntypes.TimeStamp) error
 	return s.ApplyModifies(mvccTxn.Modifies)
 }
 
+// BatchRollbackModifies rolls back a transaction's locks and returns MVCC modifications
+// without applying them to the engine. Used in cluster mode to propose via Raft.
+func (s *Storage) BatchRollbackModifies(keys [][]byte, startTS txntypes.TimeStamp) ([]mvcc.Modify, error) {
+	cmdID := s.allocCmdID()
+	lock := s.latches.GenLock(keys)
+	for !s.latches.Acquire(lock, cmdID) {
+	}
+	defer s.latches.Release(lock, cmdID)
+
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	mvccTxn := mvcc.NewMvccTxn(startTS)
+
+	for _, key := range keys {
+		if err := txn.Rollback(mvccTxn, reader, key, startTS); err != nil {
+			return nil, err
+		}
+	}
+
+	return mvccTxn.Modifies, nil
+}
+
 // Cleanup cleans up a transaction lock on a key (same as rollback for a single key).
 func (s *Storage) Cleanup(key []byte, startTS txntypes.TimeStamp) (txntypes.TimeStamp, error) {
 	keys := [][]byte{key}

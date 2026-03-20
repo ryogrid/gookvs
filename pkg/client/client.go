@@ -59,6 +59,11 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	}, nil
 }
 
+// TxnKV returns a TxnKVClient for performing transactional KV operations.
+func (c *Client) TxnKV() *TxnKVClient {
+	return NewTxnKVClient(c.sender, c.cache, c.pdClient)
+}
+
 // RawKV returns a RawKVClient for performing Raw KV operations.
 func (c *Client) RawKV() *RawKVClient {
 	return &RawKVClient{

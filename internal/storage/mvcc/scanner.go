@@ -271,7 +271,7 @@ func (s *Scanner) handleLock(userKey Key) error {
 		if s.cfg.BypassLocks != nil && s.cfg.BypassLocks[lock.StartTS] {
 			return nil
 		}
-		return ErrKeyIsLocked
+		return &LockError{Key: userKey, Lock: lock}
 	}
 
 	return nil
