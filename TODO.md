@@ -19,30 +19,35 @@
 - [x] Item 7b: RawGetKeyTTL + TTL encoding in RawStorage
 - [x] Item 7c: RawCompareAndSwap (TTL-aware)
 - [x] Item 7d: RawChecksum
-- [ ] E2E tests for Items 1-3 (async_commit_test.go)
-- [ ] E2E tests for Item 7 (raw_kv_extended_test.go)
+- [x] E2E tests for Items 1-3 (async_commit_test.go)
+- [x] E2E tests for Item 7 (raw_kv_extended_test.go)
 
 ## Phase 3: PD Resilience (Items 8, 9)
-- [ ] Item 9: PD leader failover / retry in pdclient
-- [ ] Item 8: TSO integration in server
-- [ ] E2E tests for PD failover and TSO
+- [x] Item 9: PD leader failover / retry in pdclient
+- [x] Item 8: TSO integration in server
+- [x] E2E tests for PD failover and TSO
 
 ## Phase 4: PD-Coordinated Split (Item 10)
-- [ ] Item 10: Wire SplitCheckWorker into peer event loop + coordinator
-- [ ] E2E tests for automatic PD-coordinated split
+- [x] Item 10: Wire SplitCheckWorker into peer event loop + coordinator
+- [x] E2E tests for automatic PD-coordinated split
 
-## Phase 5: Multi-Region E2E Tests
-- [ ] Multi-region cluster test helpers
-- [ ] TestMultiRegionKeyRouting
-- [ ] TestMultiRegionTransactions
-- [ ] TestMultiRegionRawKVBatchScan
-- [ ] TestMultiRegionSplitWithLiveTraffic
-- [ ] TestMultiRegionPDCoordinatedSplit
-- [ ] TestMultiRegionAsyncCommit
-- [ ] TestMultiRegionScanLock
+## Phase 5: Multi-Region Routing + E2E Tests
+- [x] Multi-region cluster test helpers
+- [x] TestMultiRegionKeyRouting
+- [x] TestMultiRegionIndependentLeaders
+- [x] TestMultiRegionRawKV
+- [x] Fix server.go ProposeModifies(1,...) hardcoded region routing (8 places)
+- [x] Add groupModifiesByRegion helper for batch operations
+- [x] Design doc: design_docs/additional2/07_multi_region_routing.md
+- [x] TestMultiRegionTransactions (2PC spanning 2 regions)
+- [x] TestMultiRegionRawKVBatchScan (BatchScan across region boundaries)
+- [x] TestMultiRegionSplitWithLiveTraffic (writes during split)
+- [x] TestMultiRegionPDCoordinatedSplit (automatic split via PD, single-node)
+- [x] TestMultiRegionAsyncCommit (async commit across regions)
+- [x] TestMultiRegionScanLock (ScanLock respects boundaries)
 
 ## Phase 6: Final Verification
-- [ ] TODO.md audit — all items checked
-- [ ] Stale comment scan (TODO/FIXME/HACK/XXX/UNIMPLEMENTED)
-- [ ] Full test suite passes
-- [ ] Update impl_doc/08_not_yet_implemented.md
+- [x] TODO.md audit — all items checked
+- [x] Stale comment scan — 1 unrelated TODO in coordinator.go (flow control)
+- [x] Full test suite passes (internal, pkg, e2e all green: 22.9s)
+- [x] Update impl_doc/08_not_yet_implemented.md

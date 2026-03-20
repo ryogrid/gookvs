@@ -11,6 +11,7 @@ import (
 	"go.etcd.io/etcd/raft/v3/raftpb"
 
 	"github.com/ryogrid/gookv/internal/engine/traits"
+	"github.com/ryogrid/gookv/internal/raftstore/split"
 )
 
 // PeerConfig holds configuration for a Peer goroutine.
@@ -38,6 +39,10 @@ type PeerConfig struct {
 	RaftLogGCSizeLimit uint64
 	// RaftLogGCThreshold is the minimum number of entries to keep.
 	RaftLogGCThreshold uint64
+
+	// SplitCheckTickInterval is how often the split check tick fires.
+	// If zero, split checking is disabled.
+	SplitCheckTickInterval time.Duration
 }
 
 // DefaultPeerConfig returns a PeerConfig with sensible defaults.
@@ -54,6 +59,7 @@ func DefaultPeerConfig() PeerConfig {
 		RaftLogGCCountLimit:      72000,
 		RaftLogGCSizeLimit:       72 * 1024 * 1024, // 72 MiB
 		RaftLogGCThreshold:       50,
+		SplitCheckTickInterval:   10 * time.Second,
 	}
 }
 
@@ -97,6 +103,10 @@ type Peer struct {
 	// pdTaskCh sends PD tasks (e.g., region heartbeats) to the PDWorker.
 	// May be nil if PD integration is not configured.
 	pdTaskCh chan<- interface{}
+
+	// splitCheckCh sends split check tasks to the SplitCheckWorker.
+	// May be nil if split checking is not configured.
+	splitCheckCh chan<- split.SplitCheckTask
 
 	// State flags.
 	stopped     atomic.Bool
@@ -197,54 +207,55 @@ func (p *Peer) SetApplyFunc(f func(uint64, []raftpb.Entry)) { p.applyFunc = f }
 // SetPDTaskCh sets the channel for sending PD tasks (region heartbeats).
 func (p *Peer) SetPDTaskCh(ch chan<- interface{}) { p.pdTaskCh = ch }
 
+// SetSplitCheckCh sets the channel for sending split check tasks.
+func (p *Peer) SetSplitCheckCh(ch chan<- split.SplitCheckTask) { p.splitCheckCh = ch }
+
+// UpdateRegion replaces the peer's region metadata (e.g., after a split).
+func (p *Peer) UpdateRegion(r *metapb.Region) { p.region = r }
+
 // Run starts the peer's main event loop. Blocks until the context is cancelled
 // or the peer is destroyed.
 func (p *Peer) Run(ctx context.Context) {
 	ticker := time.NewTicker(p.cfg.RaftBaseTickInterval)
 	defer ticker.Stop()
 
-	var gcTicker *time.Ticker
+	// Optional GC ticker.
+	var gcTickerCh <-chan time.Time
 	if p.cfg.RaftLogGCTickInterval > 0 {
-		gcTicker = time.NewTicker(p.cfg.RaftLogGCTickInterval)
+		gcTicker := time.NewTicker(p.cfg.RaftLogGCTickInterval)
 		defer gcTicker.Stop()
+		gcTickerCh = gcTicker.C
+	}
+
+	// Optional split check ticker.
+	var splitCheckTickerCh <-chan time.Time
+	if p.cfg.SplitCheckTickInterval > 0 {
+		splitCheckTicker := time.NewTicker(p.cfg.SplitCheckTickInterval)
+		defer splitCheckTicker.Stop()
+		splitCheckTickerCh = splitCheckTicker.C
 	}
 
 	for {
-		if gcTicker != nil {
-			select {
-			case <-ctx.Done():
+		select {
+		case <-ctx.Done():
+			p.stopped.Store(true)
+			return
+
+		case <-ticker.C:
+			p.rawNode.Tick()
+
+		case <-gcTickerCh:
+			p.onRaftLogGCTick()
+
+		case <-splitCheckTickerCh:
+			p.onSplitCheckTick()
+
+		case msg, ok := <-p.Mailbox:
+			if !ok {
 				p.stopped.Store(true)
 				return
-
-			case <-ticker.C:
-				p.rawNode.Tick()
-
-			case <-gcTicker.C:
-				p.onRaftLogGCTick()
-
-			case msg, ok := <-p.Mailbox:
-				if !ok {
-					p.stopped.Store(true)
-					return
-				}
-				p.handleMessage(msg)
 			}
-		} else {
-			select {
-			case <-ctx.Done():
-				p.stopped.Store(true)
-				return
-
-			case <-ticker.C:
-				p.rawNode.Tick()
-
-			case msg, ok := <-p.Mailbox:
-				if !ok {
-					p.stopped.Store(true)
-					return
-				}
-				p.handleMessage(msg)
-			}
+			p.handleMessage(msg)
 		}
 
 		p.handleReady()
@@ -459,6 +470,28 @@ func (p *Peer) onRaftLogGCTick() {
 	}
 	data := marshalCompactLogRequest(req)
 	_ = p.rawNode.Propose(data)
+}
+
+// onSplitCheckTick sends a split check task to the SplitCheckWorker if this
+// peer is the leader and the split check channel is configured.
+func (p *Peer) onSplitCheckTick() {
+	if !p.isLeader.Load() || p.splitCheckCh == nil {
+		return
+	}
+
+	task := split.SplitCheckTask{
+		RegionID: p.regionID,
+		Region:   p.region,
+		StartKey: p.region.GetStartKey(),
+		EndKey:   p.region.GetEndKey(),
+		Policy:   split.CheckPolicyScan,
+	}
+
+	// Non-blocking send; if the channel is full, skip this round.
+	select {
+	case p.splitCheckCh <- task:
+	default:
+	}
 }
 
 // onReadyCompactLog handles the apply result of a CompactLog command.

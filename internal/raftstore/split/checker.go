@@ -101,6 +101,11 @@ func (w *SplitCheckWorker) Schedule(task SplitCheckTask) {
 	}
 }
 
+// TaskCh returns the send-side of the task channel for external producers (e.g., Peer).
+func (w *SplitCheckWorker) TaskCh() chan<- SplitCheckTask {
+	return w.taskCh
+}
+
 // ResultCh returns the channel for receiving split check results.
 func (w *SplitCheckWorker) ResultCh() <-chan SplitCheckResult {
 	return w.resultCh

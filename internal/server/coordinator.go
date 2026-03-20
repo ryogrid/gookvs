@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -15,8 +17,10 @@ import (
 	"github.com/ryogrid/gookv/internal/engine/traits"
 	"github.com/ryogrid/gookv/internal/raftstore"
 	"github.com/ryogrid/gookv/internal/raftstore/router"
+	"github.com/ryogrid/gookv/internal/raftstore/split"
 	"github.com/ryogrid/gookv/internal/server/transport"
 	"github.com/ryogrid/gookv/internal/storage/mvcc"
+	"github.com/ryogrid/gookv/pkg/pdclient"
 )
 
 // StoreCoordinator manages the lifecycle of Raft peers for a single store.
@@ -32,6 +36,10 @@ type StoreCoordinator struct {
 
 	pdTaskCh chan<- interface{}
 
+	// Split check support.
+	splitCheckWorker *split.SplitCheckWorker
+	pdClient         pdclient.Client
+
 	peers   map[uint64]*raftstore.Peer
 	cancels map[uint64]context.CancelFunc
 	dones   map[uint64]chan struct{}
@@ -39,18 +47,20 @@ type StoreCoordinator struct {
 
 // StoreCoordinatorConfig holds the configuration for creating a StoreCoordinator.
 type StoreCoordinatorConfig struct {
-	StoreID  uint64
-	Engine   traits.KvEngine
-	Storage  *Storage
-	Router   *router.Router
-	Client   *transport.RaftClient
-	PeerCfg  raftstore.PeerConfig
-	PDTaskCh chan<- interface{} // Optional: channel for PD heartbeat tasks
+	StoreID       uint64
+	Engine        traits.KvEngine
+	Storage       *Storage
+	Router        *router.Router
+	Client        *transport.RaftClient
+	PeerCfg       raftstore.PeerConfig
+	PDTaskCh      chan<- interface{}       // Optional: channel for PD heartbeat tasks
+	PDClient      pdclient.Client          // Optional: PD client for split coordination
+	SplitCheckCfg split.SplitCheckWorkerConfig // Split check worker configuration
 }
 
 // NewStoreCoordinator creates a new StoreCoordinator.
 func NewStoreCoordinator(cfg StoreCoordinatorConfig) *StoreCoordinator {
-	return &StoreCoordinator{
+	sc := &StoreCoordinator{
 		storeID:  cfg.StoreID,
 		engine:   cfg.Engine,
 		storage:  cfg.Storage,
@@ -58,10 +68,23 @@ func NewStoreCoordinator(cfg StoreCoordinatorConfig) *StoreCoordinator {
 		client:   cfg.Client,
 		cfg:      cfg.PeerCfg,
 		pdTaskCh: cfg.PDTaskCh,
+		pdClient: cfg.PDClient,
 		peers:    make(map[uint64]*raftstore.Peer),
 		cancels:  make(map[uint64]context.CancelFunc),
 		dones:    make(map[uint64]chan struct{}),
 	}
+
+	// Create and start the split check worker if PD client is available.
+	if cfg.PDClient != nil {
+		splitCfg := cfg.SplitCheckCfg
+		if splitCfg.SplitSize == 0 {
+			splitCfg = split.DefaultSplitCheckWorkerConfig()
+		}
+		sc.splitCheckWorker = split.NewSplitCheckWorker(cfg.Engine, splitCfg)
+		go sc.splitCheckWorker.Run()
+	}
+
+	return sc
 }
 
 // BootstrapRegion creates and starts a Raft peer for a region.
@@ -108,6 +131,11 @@ func (sc *StoreCoordinator) BootstrapRegion(region *metapb.Region, allPeers []ra
 	// Wire PD task channel for region heartbeats.
 	if sc.pdTaskCh != nil {
 		peer.SetPDTaskCh(sc.pdTaskCh)
+	}
+
+	// Wire split check channel for PD-coordinated splits.
+	if sc.splitCheckWorker != nil {
+		peer.SetSplitCheckCh(sc.splitCheckWorker.TaskCh())
 	}
 
 	// Register with router.
@@ -230,6 +258,11 @@ func (sc *StoreCoordinator) GetPeer(regionID uint64) *raftstore.Peer {
 
 // Stop stops all peers and cleans up.
 func (sc *StoreCoordinator) Stop() {
+	// Stop the split check worker first.
+	if sc.splitCheckWorker != nil {
+		sc.splitCheckWorker.Stop()
+	}
+
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
@@ -314,6 +347,11 @@ func (sc *StoreCoordinator) CreatePeer(req *raftstore.CreatePeerRequest) error {
 		peer.SetPDTaskCh(sc.pdTaskCh)
 	}
 
+	// Wire split check channel for PD-coordinated splits.
+	if sc.splitCheckWorker != nil {
+		peer.SetSplitCheckCh(sc.splitCheckWorker.TaskCh())
+	}
+
 	if err := sc.router.Register(regionID, peer.Mailbox); err != nil {
 		return err
 	}
@@ -383,6 +421,125 @@ func (sc *StoreCoordinator) maybeCreatePeerForMessage(msg *raft_serverpb.RaftMes
 		PeerID: msg.GetToPeer().GetId(),
 	}
 	_ = sc.CreatePeer(req)
+}
+
+// RunSplitResultHandler processes split check results from the SplitCheckWorker
+// and coordinates the full split flow: ask PD for IDs, execute the split,
+// bootstrap new child regions, and report to PD.
+// Should be started as a goroutine.
+func (sc *StoreCoordinator) RunSplitResultHandler(ctx context.Context) {
+	if sc.splitCheckWorker == nil {
+		return
+	}
+	resultCh := sc.splitCheckWorker.ResultCh()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case result := <-resultCh:
+			sc.handleSplitCheckResult(result)
+		}
+	}
+}
+
+func (sc *StoreCoordinator) handleSplitCheckResult(result split.SplitCheckResult) {
+	if result.SplitKey == nil {
+		return // no split needed
+	}
+
+	peer := sc.GetPeer(result.RegionID)
+	if peer == nil {
+		slog.Warn("split: peer not found for region", "region", result.RegionID)
+		return
+	}
+	if !peer.IsLeader() {
+		return // only leaders execute splits
+	}
+
+	region := peer.Region()
+
+	// 1. Ask PD for new region/peer IDs.
+	resp, err := sc.pdClient.AskBatchSplit(context.Background(), region, 1)
+	if err != nil {
+		slog.Warn("split: AskBatchSplit failed", "region", result.RegionID, "err", err)
+		return
+	}
+
+	ids := resp.GetIds()
+	if len(ids) == 0 {
+		slog.Warn("split: AskBatchSplit returned no IDs", "region", result.RegionID)
+		return
+	}
+
+	// 2. Extract new region IDs and peer ID sets.
+	newRegionIDs := make([]uint64, len(ids))
+	newPeerIDSets := make([][]uint64, len(ids))
+	for i, splitID := range ids {
+		newRegionIDs[i] = splitID.GetNewRegionId()
+		newPeerIDSets[i] = splitID.GetNewPeerIds()
+	}
+
+	// 3. Execute the split to produce new region metadata.
+	splitResult, err := split.ExecBatchSplit(region, [][]byte{result.SplitKey}, newRegionIDs, newPeerIDSets)
+	if err != nil {
+		slog.Warn("split: ExecBatchSplit failed", "region", result.RegionID, "err", err)
+		return
+	}
+
+	slog.Info("split: region split executed",
+		"parent", result.RegionID,
+		"splitKey", fmt.Sprintf("%x", result.SplitKey),
+		"newRegions", len(splitResult.Regions),
+	)
+
+	// 4. Update the parent region's metadata.
+	peer.UpdateRegion(splitResult.Derived)
+
+	// 5. Bootstrap new child regions as peers on this store.
+	for _, newRegion := range splitResult.Regions {
+		// Build raft.Peer list for bootstrap.
+		raftPeers := make([]raft.Peer, 0, len(newRegion.GetPeers()))
+		for _, p := range newRegion.GetPeers() {
+			raftPeers = append(raftPeers, raft.Peer{ID: p.GetId()})
+		}
+
+		if err := sc.BootstrapRegion(newRegion, raftPeers); err != nil {
+			slog.Warn("split: failed to bootstrap child region",
+				"region", newRegion.GetId(), "err", err)
+		}
+	}
+
+	// 6. Report all regions (parent + children) to PD.
+	allRegions := make([]*metapb.Region, 0, 1+len(splitResult.Regions))
+	allRegions = append(allRegions, splitResult.Derived)
+	allRegions = append(allRegions, splitResult.Regions...)
+	if err := sc.pdClient.ReportBatchSplit(context.Background(), allRegions); err != nil {
+		slog.Warn("split: ReportBatchSplit failed", "err", err)
+	}
+}
+
+// ResolveRegionForKey returns the region ID whose key range contains the given key.
+// Returns 0 if no matching region is found.
+func (sc *StoreCoordinator) ResolveRegionForKey(key []byte) uint64 {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+
+	for regionID, peer := range sc.peers {
+		region := peer.Region()
+		startKey := region.GetStartKey()
+		endKey := region.GetEndKey()
+
+		// Check if key >= startKey.
+		if len(startKey) > 0 && bytes.Compare(key, startKey) < 0 {
+			continue
+		}
+		// Check if key < endKey (empty endKey means unbounded).
+		if len(endKey) > 0 && bytes.Compare(key, endKey) >= 0 {
+			continue
+		}
+		return regionID
+	}
+	return 0
 }
 
 // sendRaftMessage converts and sends a single raftpb.Message via gRPC transport.

@@ -54,6 +54,12 @@ func (s *Server) SetCoordinator(coord *StoreCoordinator) {
 	s.coordinator = coord
 }
 
+// SetPDClient sets the PD client for TSO allocation.
+// If set, the server uses PD-allocated timestamps for 1PC and async commit paths.
+func (s *Server) SetPDClient(client pdclient.Client) {
+	s.pdClient = client
+}
+
 // NewServer creates a Server with all dependencies.
 func NewServer(cfg ServerConfig, storage *Storage) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -257,6 +263,14 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 	// --- 1PC path ---
 	if req.GetTryOnePc() && txn.Is1PCEligible(mutations, 0) {
 		commitTS := startTS + 1
+		// If PD client is available, allocate commitTS from PD's TSO.
+		if svc.server.pdClient != nil {
+			pdTS, err := svc.server.pdClient.GetTS(ctx)
+			if err == nil {
+				commitTS = txntypes.TimeStamp(pdTS.ToUint64())
+			}
+			// On PD error, fall back to startTS+1.
+		}
 		if coord := svc.server.coordinator; coord != nil {
 			modifies, errs, onePCCommitTS := svc.server.storage.Prewrite1PCModifies(mutations, primary, startTS, commitTS, lockTTL)
 			for _, err := range errs {
@@ -267,7 +281,8 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 			if len(resp.Errors) > 0 || len(modifies) == 0 {
 				return resp, nil
 			}
-			if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
+			regionID := svc.resolveRegionID(primary)
+			if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
 				return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
 			}
 			resp.OnePcCommitTs = uint64(onePCCommitTS)
@@ -289,6 +304,14 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 	if req.GetUseAsyncCommit() && txn.IsAsyncCommitEligible(mutations, 0) {
 		secondaries := req.GetSecondaries()
 		maxCommitTS := txntypes.TimeStamp(req.GetMaxCommitTs())
+		// If maxCommitTS is 0 and PD client is available, get a timestamp from PD.
+		if maxCommitTS == 0 && svc.server.pdClient != nil {
+			pdTS, err := svc.server.pdClient.GetTS(ctx)
+			if err == nil {
+				maxCommitTS = txntypes.TimeStamp(pdTS.ToUint64())
+			}
+			// On PD error, proceed with maxCommitTS=0 (fallback behavior).
+		}
 		if coord := svc.server.coordinator; coord != nil {
 			modifies, errs, minCommitTS := svc.server.storage.PrewriteAsyncCommitModifies(mutations, primary, startTS, lockTTL, secondaries, maxCommitTS)
 			for _, err := range errs {
@@ -299,7 +322,8 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 			if len(resp.Errors) > 0 || len(modifies) == 0 {
 				return resp, nil
 			}
-			if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
+			regionID := svc.resolveRegionID(primary)
+			if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
 				return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
 			}
 			resp.MinCommitTs = uint64(minCommitTS)
@@ -331,7 +355,8 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 			return resp, nil
 		}
 		// Propose modifications via Raft for replication to all nodes.
-		if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
+		regionID := svc.resolveRegionID(primary)
+		if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
 		}
 		return resp, nil
@@ -365,7 +390,8 @@ func (svc *tikvService) KvCommit(ctx context.Context, req *kvrpcpb.CommitRequest
 			return resp, nil
 		}
 		if len(modifies) > 0 {
-			if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
+			regionID := svc.resolveRegionID(keys[0])
+			if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
 				return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
 			}
 		}
@@ -499,7 +525,8 @@ func (svc *tikvService) KvPessimisticLock(ctx context.Context, req *kvrpcpb.Pess
 		if len(resp.Errors) > 0 || len(modifies) == 0 {
 			return resp, nil
 		}
-		if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
+		regionID := svc.resolveRegionID(primary)
+		if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
 		}
 	} else {
@@ -555,7 +582,11 @@ func (svc *tikvService) KvResolveLock(ctx context.Context, req *kvrpcpb.ResolveL
 			return resp, nil
 		}
 		if len(modifies) > 0 {
-			if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
+			regionID := uint64(1)
+			if reqKeys := req.GetKeys(); len(reqKeys) > 0 {
+				regionID = svc.resolveRegionID(reqKeys[0])
+			}
+			if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
 				return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
 			}
 		}
@@ -663,13 +694,48 @@ func (svc *tikvService) RawGet(ctx context.Context, req *kvrpcpb.RawGetRequest) 
 	return resp, nil
 }
 
+// resolveRegionID returns the region ID for the given key using the coordinator's
+// region routing. Falls back to region ID 1 if the coordinator has no ResolveRegionForKey
+// or if the key doesn't match any region.
+func (svc *tikvService) resolveRegionID(key []byte) uint64 {
+	if coord := svc.server.coordinator; coord != nil {
+		if rid := coord.ResolveRegionForKey(key); rid != 0 {
+			return rid
+		}
+	}
+	return 1
+}
+
+// groupModifiesByRegion groups modifies by their target region.
+// This is used for batch Raw KV operations where keys may span multiple regions.
+func (svc *tikvService) groupModifiesByRegion(modifies []mvcc.Modify) map[uint64][]mvcc.Modify {
+	groups := make(map[uint64][]mvcc.Modify)
+	for _, m := range modifies {
+		regionID := svc.resolveRegionID(m.Key)
+		groups[regionID] = append(groups[regionID], m)
+	}
+	return groups
+}
+
+// proposeModifiesToRegions proposes modifies grouped by region, each to its own region leader.
+func (svc *tikvService) proposeModifiesToRegions(coord *StoreCoordinator, modifies []mvcc.Modify, timeout time.Duration) error {
+	groups := svc.groupModifiesByRegion(modifies)
+	for regionID, regionModifies := range groups {
+		if err := coord.ProposeModifies(regionID, regionModifies, timeout); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RawPut implements the RawPut RPC.
 func (svc *tikvService) RawPut(ctx context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
 	resp := &kvrpcpb.RawPutResponse{}
 	ttl := req.GetTtl()
 	if coord := svc.server.coordinator; coord != nil {
 		modify := svc.server.rawStorage.PutModify(req.GetCf(), req.GetKey(), req.GetValue(), ttl)
-		if err := coord.ProposeModifies(1, []mvcc.Modify{modify}, 10*time.Second); err != nil {
+		regionID := svc.resolveRegionID(req.GetKey())
+		if err := coord.ProposeModifies(regionID, []mvcc.Modify{modify}, 10*time.Second); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
 		}
 	} else {
@@ -685,7 +751,8 @@ func (svc *tikvService) RawDelete(ctx context.Context, req *kvrpcpb.RawDeleteReq
 	resp := &kvrpcpb.RawDeleteResponse{}
 	if coord := svc.server.coordinator; coord != nil {
 		modify := svc.server.rawStorage.DeleteModify(req.GetCf(), req.GetKey())
-		if err := coord.ProposeModifies(1, []mvcc.Modify{modify}, 10*time.Second); err != nil {
+		regionID := svc.resolveRegionID(req.GetKey())
+		if err := coord.ProposeModifies(regionID, []mvcc.Modify{modify}, 10*time.Second); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
 		}
 	} else {
@@ -745,7 +812,7 @@ func (svc *tikvService) RawBatchPut(ctx context.Context, req *kvrpcpb.RawBatchPu
 			}
 			modifies[i] = svc.server.rawStorage.PutModify(req.GetCf(), p.Key, p.Value, t)
 		}
-		if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
+		if err := svc.proposeModifiesToRegions(coord, modifies, 10*time.Second); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
 		}
 	} else {
@@ -789,7 +856,7 @@ func (svc *tikvService) RawBatchDelete(ctx context.Context, req *kvrpcpb.RawBatc
 		for i, key := range req.GetKeys() {
 			modifies[i] = svc.server.rawStorage.DeleteModify(req.GetCf(), key)
 		}
-		if err := coord.ProposeModifies(1, modifies, 10*time.Second); err != nil {
+		if err := svc.proposeModifiesToRegions(coord, modifies, 10*time.Second); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "raft propose failed: %v", err)
 		}
 	} else {

@@ -114,14 +114,20 @@ func main() {
 
 		// Connect to PD if endpoints are configured.
 		var pdTaskCh chan<- interface{}
+		var pdClient pdclient.Client
 		if len(cfg.PD.Endpoints) > 0 && cfg.PD.Endpoints[0] != "" {
 			pdCtx, pdCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			pdClient, err := pdclient.NewClient(pdCtx, pdclient.Config{Endpoints: cfg.PD.Endpoints})
+			var pdErr error
+			pdClient, pdErr = pdclient.NewClient(pdCtx, pdclient.Config{Endpoints: cfg.PD.Endpoints})
 			pdCancel()
-			if err != nil {
-				fmt.Printf("  PD connection failed (continuing without PD): %v\n", err)
+			if pdErr != nil {
+				pdClient = nil // ensure nil on failure
+				fmt.Printf("  PD connection failed (continuing without PD): %v\n", pdErr)
 			} else {
 				fmt.Printf("  PD connected: %v\n", cfg.PD.Endpoints)
+
+				// Wire PD client into the server for TSO allocation.
+				srv.SetPDClient(pdClient)
 
 				regCtx, regCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				// Register all stores with PD so it knows their addresses.
@@ -162,12 +168,20 @@ func main() {
 			Client:   raftClient,
 			PeerCfg:  peerCfg,
 			PDTaskCh: pdTaskCh,
+			PDClient: pdClient,
 		})
 		srv.SetCoordinator(coord)
 
 		if pdWorker != nil {
 			pdWorker.SetCoordinator(coord)
 			pdWorker.Run()
+		}
+
+		// Start split result handler if PD-coordinated splits are enabled.
+		if pdClient != nil {
+			splitCtx, splitCancel := context.WithCancel(context.Background())
+			go coord.RunSplitResultHandler(splitCtx)
+			defer splitCancel()
 		}
 
 		// Bootstrap a single region (region 1) spanning all stores.
