@@ -81,6 +81,7 @@ type PeerConfig struct {
     RaftLogGCSizeLimit       uint64         // default: 72 MiB
     RaftLogGCThreshold       uint64         // default: 50
     SplitCheckTickInterval   time.Duration  // default: 10s (0 = disabled)
+    PdHeartbeatTickInterval  time.Duration  // default: 60s (0 = disabled)
 }
 ```
 
@@ -245,12 +246,23 @@ The `raft.Config` is created with:
 ```go
 func (p *Peer) Run(ctx context.Context) {
     ticker := time.NewTicker(p.cfg.RaftBaseTickInterval)  // 100ms default
+    // Optional periodic PD region heartbeat.
+    var pdHeartbeatTickerCh <-chan time.Time
+    if p.cfg.PdHeartbeatTickInterval > 0 {
+        pdHeartbeatTicker := time.NewTicker(p.cfg.PdHeartbeatTickInterval)
+        defer pdHeartbeatTicker.Stop()
+        pdHeartbeatTickerCh = pdHeartbeatTicker.C
+    }
     for {
         select {
-        case <-ctx.Done():       // shutdown
-        case <-ticker.C:         // Raft tick
+        case <-ctx.Done():           // shutdown
+        case <-ticker.C:             // Raft tick
             p.rawNode.Tick()
-        case msg := <-p.Mailbox: // incoming message
+        case <-pdHeartbeatTickerCh:  // periodic PD region heartbeat
+            if p.isLeader.Load() && p.pdTaskCh != nil {
+                p.sendRegionHeartbeatToPD()
+            }
+        case msg := <-p.Mailbox:     // incoming message
             p.handleMessage(msg)
         }
         p.handleReady()  // process Raft Ready after every event
@@ -258,7 +270,7 @@ func (p *Peer) Run(ctx context.Context) {
 }
 ```
 
-The loop is straightforward: every event (tick, message, or context cancellation) is followed by a `handleReady()` call to drain any pending Raft state changes.
+The loop processes Raft ticks, incoming messages, and an optional periodic PD heartbeat. Every event is followed by a `handleReady()` call to drain any pending Raft state changes. The `pdHeartbeatTickerCh` case sends periodic region heartbeats to PD when `PdHeartbeatTickInterval > 0` (default 60s). This ensures PD's scheduler can run continuously (region balance, move tracking), not just on leadership changes.
 
 ### 3.3 Message Handling (`handleMessage`)
 

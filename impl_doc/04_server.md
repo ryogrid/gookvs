@@ -159,7 +159,7 @@ Helper functions in `internal/server/raftcmd.go` provide the serialization bridg
 
 The `sendRaftMessage` function converts `raftpb.Message` to `raft_serverpb.RaftMessage` and dispatches based on message type:
 - **`MsgSnap`** (snapshot): Acquires the `snapSemaphore` before sending, then uses `RaftClient.SendSnapshot(storeID, raftMsg, snapData)` for streaming transfer. The semaphore is released after the send completes (whether successful or not). This limits concurrent outbound snapshots to 3, preventing snapshot storms when many regions are scheduled to a new store simultaneously. On failure, calls `reportSnapshotStatus` with `SnapshotFailure`.
-- **Other messages**: Uses `RaftClient.Send(storeID, raftMsg)`. On failure, calls `reportUnreachable(regionID, peerID)` to notify the leader.
+- **Other messages**: Sends asynchronously via a goroutine to avoid blocking the peer loop on slow or dead stores. On failure, logs at Debug level and calls `reportUnreachable(regionID, peerID)` to notify the leader.
 
 **`HandleRaftMessage` fallback:**
 
@@ -576,7 +576,7 @@ type StoreResolver interface {
 
 Each store gets a `connPool` with lazily-established gRPC connections. Connection options:
 - `insecure.NewCredentials()` (no TLS)
-- Keepalive: `Time=10s`, `Timeout=3s`, `PermitWithoutStream=true`
+- Keepalive: `Time=60s`, `Timeout=10s`, `PermitWithoutStream=false`
 - Max message sizes: 64 MB send/recv
 
 `HashRegionForConn(regionID, poolSize)` provides FNV-based consistent hashing for selecting a connection index within a pool (currently unused since pool size defaults to 1).

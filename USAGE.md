@@ -255,6 +255,7 @@ raft-election-timeout-ticks = 10
 region-max-size = "2KB"             # Low threshold to trigger split quickly
 region-split-size = "1KB"
 split-check-tick-interval = "2s"    # Check for oversized regions every 2s
+pd-heartbeat-tick-interval = "5s"   # Frequent heartbeats for demo responsiveness
 ```
 
 ### What Each Scenario Demonstrates
@@ -278,7 +279,7 @@ Demonstrates dynamic horizontal scaling: new KVS nodes join a running cluster vi
 ### Prerequisites
 
 - Go installed
-- Ports 2399, 20270-20275, 20290-20295 available
+- Ports 2399, 20270-20273, 20290-20293 available
 
 ### Running
 
@@ -286,7 +287,7 @@ Demonstrates dynamic horizontal scaling: new KVS nodes join a running cluster vi
 # Build and start PD + 3-node bootstrap cluster
 make scale-demo-start
 
-# Run the demo (2 scenarios: initial state, add nodes + split)
+# Run the demo (2 scenarios: initial state, add node + split)
 make scale-demo-verify
 
 # Stop and clean up
