@@ -1,4 +1,4 @@
-.PHONY: test build vet proto test-e2e cluster-start cluster-stop cluster-verify pd-cluster-start pd-cluster-stop pd-cluster-verify txn-demo-start txn-demo-stop txn-demo-verify
+.PHONY: test build vet proto test-e2e cluster-start cluster-stop cluster-verify pd-cluster-start pd-cluster-stop pd-cluster-verify txn-demo-start txn-demo-stop txn-demo-verify scale-demo-start scale-demo-stop scale-demo-verify
 
 CLUSTER_DIR = /tmp/gookv-cluster
 CLUSTER_NODES = 5
@@ -166,3 +166,84 @@ txn-demo-stop:
 	fi
 	@rm -rf $(TXN_DEMO_DIR)
 	@echo "Txn demo cluster stopped and data cleaned up."
+
+# --- Dynamic Node Addition Demo ---
+SCALE_DEMO_DIR = /tmp/gookv-scale-demo
+SCALE_DEMO_NODES = 3
+SCALE_DEMO_MAX_NODES = 6
+SCALE_DEMO_TOPOLOGY = 1=127.0.0.1:20270,2=127.0.0.1:20271,3=127.0.0.1:20272
+SCALE_DEMO_PD_ADDR = 127.0.0.1:2399
+
+scale-demo-start: build
+	@echo "Starting PD + $(SCALE_DEMO_NODES)-node gookv cluster for scale demo..."
+	@# Ensure no stale processes from a previous run.
+	@for PID_FILE in $(SCALE_DEMO_DIR)/*.pid; do \
+		if [ -f "$$PID_FILE" ]; then \
+			PID=$$(cat "$$PID_FILE"); \
+			kill -9 $$PID 2>/dev/null || true; \
+		fi; \
+	done
+	@sleep 1
+	@rm -rf $(SCALE_DEMO_DIR)
+	@mkdir -p $(SCALE_DEMO_DIR)/pd
+	@./gookv-pd \
+		--addr $(SCALE_DEMO_PD_ADDR) \
+		--cluster-id 1 \
+		--data-dir $(SCALE_DEMO_DIR)/pd \
+		> $(SCALE_DEMO_DIR)/pd.log 2>&1 & \
+	echo $$! > $(SCALE_DEMO_DIR)/pd.pid; \
+	echo "  PD: addr=$(SCALE_DEMO_PD_ADDR) pid=$$(cat $(SCALE_DEMO_DIR)/pd.pid)"
+	@sleep 1
+	@for i in $$(seq 1 $(SCALE_DEMO_NODES)); do \
+		GRPC_PORT=$$((20269 + $$i)); \
+		STATUS_PORT=$$((20289 + $$i)); \
+		DATA_DIR=$(SCALE_DEMO_DIR)/node$$i; \
+		PID_FILE=$(SCALE_DEMO_DIR)/node$$i.pid; \
+		LOG_FILE=$(SCALE_DEMO_DIR)/node$$i.log; \
+		mkdir -p $$DATA_DIR; \
+		./gookv-server \
+			--config scripts/txn-demo/config.toml \
+			--store-id $$i \
+			--addr 127.0.0.1:$$GRPC_PORT \
+			--status-addr 127.0.0.1:$$STATUS_PORT \
+			--data-dir $$DATA_DIR \
+			--pd-endpoints $(SCALE_DEMO_PD_ADDR) \
+			--initial-cluster $(SCALE_DEMO_TOPOLOGY) \
+			> $$LOG_FILE 2>&1 & \
+		echo $$! > $$PID_FILE; \
+		echo "  Node $$i: gRPC=127.0.0.1:$$GRPC_PORT status=127.0.0.1:$$STATUS_PORT pid=$$(cat $$PID_FILE)"; \
+	done
+	@echo "Scale demo cluster started. Use 'make scale-demo-verify' to run the demo."
+
+scale-demo-verify:
+	@echo "Running dynamic node addition demo..."
+	@go run scripts/scale-demo-verify/main.go --pd $(SCALE_DEMO_PD_ADDR) --data-dir $(SCALE_DEMO_DIR) --config scripts/txn-demo/config.toml
+
+scale-demo-stop:
+	@echo "Stopping scale demo cluster..."
+	@for i in $$(seq 1 $(SCALE_DEMO_MAX_NODES)); do \
+		PID_FILE=$(SCALE_DEMO_DIR)/node$$i.pid; \
+		if [ -f $$PID_FILE ]; then \
+			PID=$$(cat $$PID_FILE); \
+			if kill -0 $$PID 2>/dev/null; then \
+				kill $$PID; \
+				echo "  Node $$i (pid $$PID): stopped"; \
+			else \
+				echo "  Node $$i (pid $$PID): already stopped"; \
+			fi; \
+			rm -f $$PID_FILE; \
+		fi; \
+	done
+	@PID_FILE=$(SCALE_DEMO_DIR)/pd.pid; \
+	if [ -f $$PID_FILE ]; then \
+		PID=$$(cat $$PID_FILE); \
+		if kill -0 $$PID 2>/dev/null; then \
+			kill $$PID; \
+			echo "  PD (pid $$PID): stopped"; \
+		else \
+			echo "  PD (pid $$PID): already stopped"; \
+		fi; \
+		rm -f $$PID_FILE; \
+	fi
+	@rm -rf $(SCALE_DEMO_DIR)
+	@echo "Scale demo cluster stopped and data cleaned up."

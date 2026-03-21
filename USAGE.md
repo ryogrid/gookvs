@@ -271,6 +271,52 @@ The cluster uses 3 KVS nodes with 3-node Raft groups. After split, both regions 
 
 The demo prints structured output with scenario banners (`--- Scenario 1/3: ...`), numbered steps, region layout tables, and explicit PASS/FAIL per scenario. A final summary reports how many scenarios passed (e.g., `All 3 scenarios passed.`). The program exits with code 0 on full success, 1 if any scenario fails.
 
+## Dynamic Node Addition Demo
+
+Demonstrates dynamic horizontal scaling: new KVS nodes join a running cluster via PD, and regions split across the expanded cluster.
+
+### Prerequisites
+
+- Go installed
+- Ports 2399, 20270-20275, 20290-20295 available
+
+### Running
+
+```bash
+# Build and start PD + 3-node bootstrap cluster
+make scale-demo-start
+
+# Run the demo (2 scenarios: initial state, add nodes + split)
+make scale-demo-verify
+
+# Stop and clean up
+make scale-demo-stop
+```
+
+### Ports
+
+| Component | Address |
+|-----------|---------|
+| PD | 127.0.0.1:2399 |
+| Node 1 (bootstrap) | 127.0.0.1:20270 (gRPC), :20290 (status) |
+| Node 2 (bootstrap) | 127.0.0.1:20271 (gRPC), :20291 (status) |
+| Node 3 (bootstrap) | 127.0.0.1:20272 (gRPC), :20292 (status) |
+| Node 4 (join) | 127.0.0.1:20273 (gRPC), :20293 (status) |
+| Node 5 (join) | 127.0.0.1:20274 (gRPC), :20294 (status) |
+| Node 6 (join) | 127.0.0.1:20275 (gRPC), :20295 (status) |
+
+### What Each Scenario Demonstrates
+
+1. **Initial Cluster State**: Verifies the cluster starts with a single region `["", "")` spanning all keys, hosted on 3 bootstrap nodes. Prints store and region topology.
+
+2. **Add Nodes + Region Split**: Starts 3 new KVS nodes in **join mode** (`--pd-endpoints` only, no `--initial-cluster`). Each node automatically receives a store ID from PD and registers itself. After confirming 6 stores are registered, the demo writes data via `RawKVClient` to exceed the 1KB split threshold. It then polls PD until a region split is detected, and prints the resulting layout showing two regions with different key ranges and (typically) different leaders.
+
+Join mode works because `gookv-server` detects that `--pd-endpoints` is provided without `--initial-cluster`, connects to PD, allocates a store ID via `AllocID()`, and starts with an empty region set — PD then schedules region replicas onto the new node via heartbeat responses.
+
+### Expected Output
+
+The demo prints structured output with scenario banners (`--- Scenario 1/2: ...`), numbered steps, store/region topology tables, and explicit PASS/FAIL per scenario. The program exits with code 0 on full success, 1 if any scenario fails.
+
 ## Using the Admin CLI
 
 gookv-ctl commands fall into two categories: **offline commands** (`scan`, `get`, `mvcc`, `dump`, `size`, `compact`, `region`) that read directly from a data directory via `--db` and work without a running cluster, and **online commands** (`store list`, `store status`) that communicate with a running PD server via `--pd`.
