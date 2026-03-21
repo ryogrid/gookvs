@@ -302,14 +302,12 @@ make scale-demo-stop
 | Node 2 (bootstrap) | 127.0.0.1:20271 (gRPC), :20291 (status) |
 | Node 3 (bootstrap) | 127.0.0.1:20272 (gRPC), :20292 (status) |
 | Node 4 (join) | 127.0.0.1:20273 (gRPC), :20293 (status) |
-| Node 5 (join) | 127.0.0.1:20274 (gRPC), :20294 (status) |
-| Node 6 (join) | 127.0.0.1:20275 (gRPC), :20295 (status) |
 
 ### What Each Scenario Demonstrates
 
 1. **Initial Cluster State**: Verifies the cluster starts with a single region `["", "")` spanning all keys, hosted on 3 bootstrap nodes. Prints store and region topology.
 
-2. **Add Nodes + Region Split + Leader Failover**: Starts 3 new KVS nodes in **join mode** (`--pd-endpoints` only, no `--initial-cluster`). Each node automatically receives a store ID from PD and registers itself. After confirming 6 stores are registered, the demo writes data via `RawKVClient` to exceed the 1KB split threshold, polls PD until a region split is detected, then writes a test value into each region. Finally, it kills the leader store of one region and verifies that the data remains readable through the surviving peers via Raft leader re-election — demonstrating fault tolerance after horizontal scaling.
+2. **Add Node + Region Split + Data Verification**: Starts 1 new KVS node in **join mode** (`--pd-endpoints` only, no `--initial-cluster`). The node automatically receives a store ID from PD and registers itself. After confirming 4 stores are registered, the demo writes data via `RawKVClient` to exceed the 1KB split threshold, polls PD until a region split is detected, then writes and reads back a test value in each region to verify data correctness. Prints the final region layout showing key ranges, peer members, and leaders.
 
 Join mode works because `gookv-server` detects that `--pd-endpoints` is provided without `--initial-cluster`, connects to PD, allocates a store ID via `AllocID()`, and starts with an empty region set — PD then schedules region replicas onto the new node via heartbeat responses.
 

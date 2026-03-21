@@ -284,9 +284,9 @@ func (p *connPool) get(dialTimeout time.Duration) (*grpc.ClientConn, error) {
 	conn, err := grpc.DialContext(ctx, p.addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second,
-			Timeout:             3 * time.Second,
-			PermitWithoutStream: true,
+			Time:                60 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: false,
 		}),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(64*1024*1024),

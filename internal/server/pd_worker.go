@@ -294,10 +294,13 @@ func (w *PDWorker) peerTaskProcessorLoop() {
 			return
 		case task := <-w.peerTaskCh:
 			if info, ok := task.(*raftstore.RegionHeartbeatInfo); ok {
-				w.sendRegionHeartbeat(&RegionHeartbeatData{
+				// Send heartbeat asynchronously to avoid blocking
+				// the task channel when PD is slow or unreachable.
+				data := &RegionHeartbeatData{
 					Region: info.Region,
 					Peer:   info.Peer,
-				})
+				}
+				go w.sendRegionHeartbeat(data)
 			}
 		}
 	}

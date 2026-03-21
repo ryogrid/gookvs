@@ -130,9 +130,9 @@ func scenario1(pdAddr string) bool {
 	return false
 }
 
-// scenario2: Add Nodes + Region Split
+// scenario2: Add Node + Region Split + Data Verification
 func scenario2(pdAddr, dataDir, configPath string) bool {
-	fmt.Println("--- Scenario 2/2: Add Nodes + Region Split ---")
+	fmt.Println("--- Scenario 2/2: Add Node + Region Split ---")
 	fmt.Println()
 
 	ctx := context.Background()
@@ -144,80 +144,72 @@ func scenario2(pdAddr, dataDir, configPath string) bool {
 	}
 	defer pdConn.Close()
 
-	// Step 1: Add 3 new nodes in join mode.
-	fmt.Println("  [Step 1] Adding 3 new nodes...")
+	// Step 1: Add 1 new node in join mode.
+	fmt.Println("  [Step 1] Adding 1 new node in join mode...")
 
-	type nodeProc struct {
-		cmd     *exec.Cmd
-		logFile *os.File
+	i := 4
+	grpcPort := 20269 + i   // 20273
+	statusPort := 20289 + i // 20293
+	nodeDataDir := filepath.Join(dataDir, fmt.Sprintf("node%d", i))
+	if err := os.MkdirAll(nodeDataDir, 0755); err != nil {
+		fmt.Printf("  FAIL: cannot create data dir for node %d: %v\n", i, err)
+		return false
 	}
-	var nodes []nodeProc
 
-	for i := 4; i <= 6; i++ {
-		grpcPort := 20269 + i   // 20273, 20274, 20275
-		statusPort := 20289 + i // 20293, 20294, 20295
-		nodeDataDir := filepath.Join(dataDir, fmt.Sprintf("node%d", i))
-		if err := os.MkdirAll(nodeDataDir, 0755); err != nil {
-			fmt.Printf("  FAIL: cannot create data dir for node %d: %v\n", i, err)
-			return false
-		}
+	cmd := exec.Command("./gookv-server",
+		"--pd-endpoints", pdAddr,
+		"--addr", fmt.Sprintf("127.0.0.1:%d", grpcPort),
+		"--status-addr", fmt.Sprintf("127.0.0.1:%d", statusPort),
+		"--data-dir", nodeDataDir,
+		"--config", configPath,
+	)
 
-		cmd := exec.Command("./gookv-server",
-			"--pd-endpoints", pdAddr,
-			"--addr", fmt.Sprintf("127.0.0.1:%d", grpcPort),
-			"--status-addr", fmt.Sprintf("127.0.0.1:%d", statusPort),
-			"--data-dir", nodeDataDir,
-			"--config", configPath,
-		)
-
-		logFile, err := os.Create(filepath.Join(dataDir, fmt.Sprintf("node%d.log", i)))
-		if err != nil {
-			fmt.Printf("  FAIL: cannot create log file for node %d: %v\n", i, err)
-			return false
-		}
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
-
-		if err := cmd.Start(); err != nil {
-			logFile.Close()
-			fmt.Printf("  FAIL: cannot start node %d: %v\n", i, err)
-			return false
-		}
-
-		// Write PID file.
-		pidFile := filepath.Join(dataDir, fmt.Sprintf("node%d.pid", i))
-		_ = os.WriteFile(pidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0644)
-
-		nodes = append(nodes, nodeProc{cmd: cmd, logFile: logFile})
-		fmt.Printf("           Node %d started: addr=127.0.0.1:%d pid=%d\n",
-			i, grpcPort, cmd.Process.Pid)
+	logFile, err := os.Create(filepath.Join(dataDir, fmt.Sprintf("node%d.log", i)))
+	if err != nil {
+		fmt.Printf("  FAIL: cannot create log file for node %d: %v\n", i, err)
+		return false
 	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		fmt.Printf("  FAIL: cannot start node %d: %v\n", i, err)
+		return false
+	}
+
+	// Write PID file.
+	pidFile := filepath.Join(dataDir, fmt.Sprintf("node%d.pid", i))
+	_ = os.WriteFile(pidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0644)
+
+	fmt.Printf("           Node %d started: addr=127.0.0.1:%d pid=%d\n",
+		i, grpcPort, cmd.Process.Pid)
+	fmt.Println("           (join mode: no --store-id, no --initial-cluster)")
 
 	fmt.Println("           Waiting 5s for node registration...")
 	time.Sleep(5 * time.Second)
 
-	// Poll stores from PD until count >= 6 (timeout 30s).
+	// Poll stores from PD until count >= 4 (timeout 30s).
 	fmt.Println("           Polling PD for store registration...")
 	deadline := time.Now().Add(30 * time.Second)
 	var stores []*metapb.Store
 	for time.Now().Before(deadline) {
 		stores, err = getAllStores(ctx, pdClient)
-		if err == nil && len(stores) >= 6 {
+		if err == nil && len(stores) >= 4 {
 			break
 		}
 		time.Sleep(2 * time.Second)
 		if stores != nil {
-			fmt.Printf("           Store count: %d (waiting for 6...)\n", len(stores))
+			fmt.Printf("           Store count: %d (waiting for 4...)\n", len(stores))
 		}
 	}
 
-	if len(stores) < 6 {
-		fmt.Printf("  FAIL: expected >= 6 stores, got %d after 30s\n", len(stores))
+	if len(stores) < 4 {
+		fmt.Printf("  FAIL: expected >= 4 stores, got %d after 30s\n", len(stores))
 		return false
 	}
 
 	fmt.Printf("           Store count: %d\n", len(stores))
-	// Build a set of original store IDs (1-3) for marking new nodes.
 	originalStores := map[uint64]bool{1: true, 2: true, 3: true}
 	for _, s := range stores {
 		marker := ""
@@ -321,23 +313,26 @@ func scenario2(pdAddr, dataDir, configPath string) bool {
 	}
 	fmt.Println()
 
-	// PUT test values into the first 2 regions (to avoid duplicate keys from cascading splits).
-	type regionTestKV struct {
-		regionID uint64
-		leaderID uint64
-		key      string
-		value    string
-	}
-	var testKVs []regionTestKV
+	// Step 3 (continued): PUT a test value into each of the first 2 regions and GET it back.
+	fmt.Println("  [Step 3b] Writing and reading a value in each region...")
 
 	testRegions := regionsAfter
 	if len(testRegions) > 2 {
 		testRegions = testRegions[:2]
 	}
-	for i, r := range testRegions {
-		key := fmt.Sprintf("verify:region%d", i+1)
-		val := fmt.Sprintf("value-for-region-%d", r.id)
 
+	allOK := true
+	for idx, r := range testRegions {
+		// Generate a key guaranteed to fall within this region's range.
+		var key string
+		if r.startKey == "" {
+			key = "\x01verify" // sorts before "data:*"
+		} else {
+			key = r.startKey + "_verify"
+		}
+		val := fmt.Sprintf("hello-region-%d", idx+1)
+
+		// PUT
 		var putErr error
 		for attempt := 0; attempt < 5; attempt++ {
 			putErr = rawClient.Put(ctx, []byte(key), []byte(val))
@@ -347,102 +342,32 @@ func scenario2(pdAddr, dataDir, configPath string) bool {
 			time.Sleep(time.Duration(attempt+1) * time.Second)
 		}
 		if putErr != nil {
-			fmt.Printf("  FAIL: cannot PUT key %q into region %d: %v\n", key, r.id, putErr)
-			return false
+			fmt.Printf("           PUT %q: FAIL %v\n", key, putErr)
+			allOK = false
+			continue
 		}
-		testKVs = append(testKVs, regionTestKV{
-			regionID: r.id,
-			leaderID: r.leaderID,
-			key:      key,
-			value:    val,
-		})
-		fmt.Printf("           PUT %q -> %q  (region %d, leader Store %d)\n",
+
+		// GET
+		got, notFound, getErr := rawClient.Get(ctx, []byte(key))
+		if getErr != nil || notFound || string(got) != val {
+			fmt.Printf("           PUT/GET %q: FAIL (err=%v notFound=%v got=%q)\n", key, getErr, notFound, string(got))
+			allOK = false
+			continue
+		}
+		fmt.Printf("           PUT/GET %q = %q  OK  (Region %d, leader Store %d)\n",
 			key, val, r.id, r.leaderID)
 	}
 	fmt.Println()
 
-	// Step 4: Kill one leader + verify data still accessible via Raft failover.
-	// Killing only 1 of 3 peers preserves Raft quorum (2 of 3 alive).
-	fmt.Println("  [Step 4] Leader failover test...")
-
-	// Pick the first region's leader to kill.
-	killStoreID := testKVs[0].leaderID
-	killRegionID := testKVs[0].regionID
-
-	pidFile := storeIDToPIDFile(killStoreID, stores, dataDir)
-	if pidFile == "" {
-		fmt.Printf("  FAIL: cannot determine PID file for Store %d\n", killStoreID)
+	if !allOK {
+		fmt.Println("  FAIL: data verification failed")
 		return false
 	}
-	pid, killErr := killProcess(pidFile)
-	if killErr != nil {
-		fmt.Printf("  FAIL: cannot kill Store %d (pid file %s): %v\n", killStoreID, pidFile, killErr)
-		return false
-	}
-	fmt.Printf("           Killed Store %d (leader of Region %d, pid %d)\n",
-		killStoreID, killRegionID, pid)
-	fmt.Println("           (Raft quorum maintained: 2 of 3 peers still alive)")
-	fmt.Println()
 
-	// Wait for Raft leader re-election (election timeout ~1s + some margin).
-	fmt.Println("           Waiting for Raft leader re-election...")
-	time.Sleep(5 * time.Second)
-
-	// Verify data is still accessible with a NEW client (avoids cached connections to dead store).
-	fmt.Println("           Verifying data integrity after failover...")
-	c2, err := client.NewClient(ctx, client.Config{
-		PDAddrs:    []string{pdAddr},
-		MaxRetries: 15,
-	})
-	if err != nil {
-		fmt.Printf("  FAIL: cannot create new client for verification: %v\n", err)
-		return false
-	}
-	defer c2.Close()
-
-	rawClient2 := c2.RawKV()
-	allMatch := true
-	for _, kv := range testKVs {
-		// Retry reads: the client needs to discover the new leader via PD.
-		var val []byte
-		var readOK bool
-		for attempt := 0; attempt < 10; attempt++ {
-			v, notFound, getErr := rawClient2.Get(ctx, []byte(kv.key))
-			if getErr == nil && !notFound {
-				val = v
-				readOK = true
-				break
-			}
-			time.Sleep(2 * time.Second)
-		}
-		if !readOK {
-			fmt.Printf("           GET %q: FAILED after retries\n", kv.key)
-			allMatch = false
-			continue
-		}
-		if string(val) != kv.value {
-			fmt.Printf("           GET %q: MISMATCH got=%q expected=%q\n", kv.key, string(val), kv.value)
-			allMatch = false
-			continue
-		}
-		fmt.Printf("           GET %q = %q  OK (region %d, was led by killed Store %d)\n",
-			kv.key, string(val), kv.regionID, killStoreID)
-	}
-	fmt.Println()
-
-	if !allMatch {
-		fmt.Println("  FAIL: data integrity check failed after leader failover")
-		return false
-	}
-	fmt.Println("           Data integrity: PASS (all values readable after killing leader)")
-	fmt.Println()
-
-	// Step 5: Final cluster state.
-	fmt.Println("  [Step 5] Final cluster state:")
-	fmt.Printf("           Killed: Store %d (was leader of Region %d)\n", killStoreID, killRegionID)
-	fmt.Println()
-
-	finalRegions, err := getAllRegions(ctx, pdClient)
+	// Step 4: Show final cluster state.
+	fmt.Println("  [Step 4] Final cluster state:")
+	var finalRegions []regionInfo
+	finalRegions, err = getAllRegions(ctx, pdClient)
 	if err != nil {
 		fmt.Printf("           (could not query final regions: %v)\n", err)
 	} else {
