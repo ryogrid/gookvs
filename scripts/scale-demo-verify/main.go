@@ -437,12 +437,21 @@ func scenario2(pdAddr, dataDir, configPath string) bool {
 	fmt.Println("           Data integrity: PASS (all values readable after killing leader)")
 	fmt.Println()
 
-	// Step 5: Summary.
-	fmt.Println("  [Step 5] Summary:")
-	fmt.Printf("           Before: 6 stores, %d regions\n", len(regionsAfter))
-	fmt.Printf("           Killed: Store %d (leader of Region %d)\n", killStoreID, killRegionID)
-	fmt.Println("           After:  data still readable via surviving peers (Raft failover)")
-	fmt.Println("           Raft quorum maintained: 2 of 3 peers alive per region")
+	// Step 5: Final cluster state.
+	fmt.Println("  [Step 5] Final cluster state:")
+	fmt.Printf("           Killed: Store %d (was leader of Region %d)\n", killStoreID, killRegionID)
+	fmt.Println()
+
+	finalRegions, err := getAllRegions(ctx, pdClient)
+	if err != nil {
+		fmt.Printf("           (could not query final regions: %v)\n", err)
+	} else {
+		fmt.Println("           Region layout:")
+		for _, r := range finalRegions {
+			fmt.Printf("             Region %d: [%s .. %s)  peers=%v  leader=Store %d\n",
+				r.id, fmtKey(r.startKey), fmtKey(r.endKey), r.peerIDs, r.leaderID)
+		}
+	}
 	fmt.Println()
 
 	fmt.Println("  Result: PASS")
