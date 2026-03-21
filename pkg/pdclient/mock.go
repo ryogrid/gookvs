@@ -115,6 +115,17 @@ func (c *MockClient) GetStore(_ context.Context, storeID uint64) (*metapb.Store,
 	return s, nil
 }
 
+func (c *MockClient) GetAllStores(_ context.Context) ([]*metapb.Store, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	stores := make([]*metapb.Store, 0, len(c.stores))
+	for _, s := range c.stores {
+		stores = append(stores, s)
+	}
+	return stores, nil
+}
+
 func (c *MockClient) Bootstrap(_ context.Context, store *metapb.Store, region *metapb.Region) (*pdpb.BootstrapResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

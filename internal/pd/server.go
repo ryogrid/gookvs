@@ -16,6 +16,16 @@ import (
 	"google.golang.org/grpc"
 )
 
+// StoreState represents the lifecycle state of a TiKV store.
+type StoreState int
+
+const (
+	StoreStateUp           StoreState = iota // Heartbeat within disconnect threshold
+	StoreStateDisconnected                   // Heartbeat missed > DisconnectDuration
+	StoreStateDown                           // Disconnected > DownDuration — replicas should be repaired
+	StoreStateTombstone                      // Permanently removed
+)
+
 // PDServerConfig holds configuration for the PD server.
 type PDServerConfig struct {
 	ListenAddr string
@@ -26,6 +36,12 @@ type PDServerConfig struct {
 	TSOUpdatePhysicalInterval time.Duration
 
 	MaxPeerCount int
+
+	StoreDisconnectDuration time.Duration
+	StoreDownDuration       time.Duration
+
+	RegionBalanceThreshold float64
+	RegionBalanceRateLimit int
 }
 
 // DefaultPDServerConfig returns default PD server configuration.
@@ -37,6 +53,10 @@ func DefaultPDServerConfig() PDServerConfig {
 		TSOSaveInterval:           3 * time.Second,
 		TSOUpdatePhysicalInterval: 50 * time.Millisecond,
 		MaxPeerCount:              3,
+		StoreDisconnectDuration:   30 * time.Second,
+		StoreDownDuration:         30 * time.Minute,
+		RegionBalanceThreshold:    0.05,
+		RegionBalanceRateLimit:    4,
 	}
 }
 
@@ -47,11 +67,12 @@ type PDServer struct {
 	cfg       PDServerConfig
 	clusterID uint64
 
-	tso       *TSOAllocator
-	meta      *MetadataStore
-	idAlloc   *IDAllocator
-	gcMgr     *GCSafePointManager
-	scheduler *Scheduler
+	tso         *TSOAllocator
+	meta        *MetadataStore
+	idAlloc     *IDAllocator
+	gcMgr       *GCSafePointManager
+	scheduler   *Scheduler
+	moveTracker *MoveTracker
 
 	grpcServer *grpc.Server
 	listener   net.Listener
@@ -65,26 +86,29 @@ type PDServer struct {
 func NewPDServer(cfg PDServerConfig) (*PDServer, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	meta := NewMetadataStore(cfg.ClusterID)
+	meta := NewMetadataStore(cfg.ClusterID, cfg.StoreDisconnectDuration, cfg.StoreDownDuration)
 	tso := NewTSOAllocator(cfg.TSOSaveInterval)
 	idAlloc := NewIDAllocator()
 	gcMgr := NewGCSafePointManager()
 
 	grpcSrv := grpc.NewServer()
 
-	scheduler := NewScheduler(meta, idAlloc, cfg.MaxPeerCount)
+	moveTracker := NewMoveTracker()
+	scheduler := NewScheduler(meta, idAlloc, cfg.MaxPeerCount,
+		cfg.RegionBalanceThreshold, cfg.RegionBalanceRateLimit, moveTracker)
 
 	s := &PDServer{
-		cfg:        cfg,
-		clusterID:  cfg.ClusterID,
-		tso:        tso,
-		meta:       meta,
-		idAlloc:    idAlloc,
-		gcMgr:      gcMgr,
-		scheduler:  scheduler,
-		grpcServer: grpcSrv,
-		ctx:        ctx,
-		cancel:     cancel,
+		cfg:         cfg,
+		clusterID:   cfg.ClusterID,
+		tso:         tso,
+		meta:        meta,
+		idAlloc:     idAlloc,
+		gcMgr:       gcMgr,
+		scheduler:   scheduler,
+		moveTracker: moveTracker,
+		grpcServer:  grpcSrv,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 
 	pdpb.RegisterPDServer(grpcSrv, s)
@@ -112,7 +136,31 @@ func (s *PDServer) Start() error {
 		}
 	}()
 
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.runStoreStateWorker(s.ctx)
+	}()
+
 	return nil
+}
+
+// runStoreStateWorker periodically updates store states based on heartbeat timestamps
+// and cleans up stale pending moves.
+func (s *PDServer) runStoreStateWorker(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.meta.updateStoreStates()
+			if s.moveTracker != nil {
+				s.moveTracker.CleanupStale(10 * time.Minute)
+			}
+		}
+	}
 }
 
 // Addr returns the listen address.
@@ -375,12 +423,23 @@ type MetadataStore struct {
 
 	// Store liveness tracking.
 	storeLastHeartbeat map[uint64]time.Time
+
+	// Store state machine.
+	storeStates        map[uint64]StoreState
+	disconnectDuration time.Duration
+	downDuration       time.Duration
+
+	// nowFunc allows injecting a custom clock for testing.
+	nowFunc func() time.Time
 }
 
-// StoreDownDuration is how long without a heartbeat before a store is considered dead.
-const StoreDownDuration = 30 * time.Second
-
-func NewMetadataStore(clusterID uint64) *MetadataStore {
+func NewMetadataStore(clusterID uint64, disconnectDuration, downDuration time.Duration) *MetadataStore {
+	if disconnectDuration == 0 {
+		disconnectDuration = 30 * time.Second
+	}
+	if downDuration == 0 {
+		downDuration = 30 * time.Minute
+	}
 	return &MetadataStore{
 		clusterID:          clusterID,
 		stores:             make(map[uint64]*metapb.Store),
@@ -388,7 +447,16 @@ func NewMetadataStore(clusterID uint64) *MetadataStore {
 		leaders:            make(map[uint64]*metapb.Peer),
 		storeStats:         make(map[uint64]*pdpb.StoreStats),
 		storeLastHeartbeat: make(map[uint64]time.Time),
+		storeStates:        make(map[uint64]StoreState),
+		disconnectDuration: disconnectDuration,
+		downDuration:       downDuration,
+		nowFunc:            time.Now,
 	}
+}
+
+// now returns the current time, using nowFunc for testability.
+func (m *MetadataStore) now() time.Time {
+	return m.nowFunc()
 }
 
 func (m *MetadataStore) IsBootstrapped() bool {
@@ -432,31 +500,109 @@ func (m *MetadataStore) UpdateStoreStats(storeID uint64, stats *pdpb.StoreStats)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.storeStats[storeID] = stats
-	m.storeLastHeartbeat[storeID] = time.Now()
+	m.storeLastHeartbeat[storeID] = m.now()
+
+	// Heartbeat received: transition back to Up unless Tombstone.
+	if state, ok := m.storeStates[storeID]; !ok || state != StoreStateTombstone {
+		m.storeStates[storeID] = StoreStateUp
+	}
 }
 
-// IsStoreAlive returns whether a store has sent a heartbeat within StoreDownDuration.
+// IsStoreAlive returns whether a store is considered alive (Up or Disconnected).
+// Kept for backward compatibility; prefer GetStoreState or IsStoreSchedulable.
 func (m *MetadataStore) IsStoreAlive(storeID uint64) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	t, ok := m.storeLastHeartbeat[storeID]
+	state, ok := m.storeStates[storeID]
 	if !ok {
-		return false
+		// No state recorded yet — check heartbeat directly for backward compat.
+		t, hbOK := m.storeLastHeartbeat[storeID]
+		if !hbOK {
+			return false
+		}
+		return m.now().Sub(t) < m.disconnectDuration
 	}
-	return time.Since(t) < StoreDownDuration
+	return state == StoreStateUp || state == StoreStateDisconnected
 }
 
-// GetDeadStores returns store IDs that have not heartbeated within StoreDownDuration.
+// GetDeadStores returns store IDs that are in the Down state.
 func (m *MetadataStore) GetDeadStores() []uint64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var dead []uint64
-	for id, t := range m.storeLastHeartbeat {
-		if time.Since(t) >= StoreDownDuration {
+	for id, state := range m.storeStates {
+		if state == StoreStateDown {
 			dead = append(dead, id)
 		}
 	}
 	return dead
+}
+
+// GetStoreState returns the current state of a store.
+func (m *MetadataStore) GetStoreState(storeID uint64) StoreState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.storeStates[storeID]
+}
+
+// SetStoreState sets the state for a store (e.g. Tombstone).
+func (m *MetadataStore) SetStoreState(storeID uint64, state StoreState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.storeStates[storeID] = state
+}
+
+// IsStoreSchedulable returns true only if the store is in the Up state.
+func (m *MetadataStore) IsStoreSchedulable(storeID uint64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.storeStates[storeID] == StoreStateUp
+}
+
+// updateStoreStates transitions store states based on heartbeat timestamps.
+// Called periodically by the store state worker.
+func (m *MetadataStore) updateStoreStates() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now()
+	for storeID := range m.stores {
+		currentState := m.storeStates[storeID]
+
+		// Tombstone is permanent — never change it.
+		if currentState == StoreStateTombstone {
+			continue
+		}
+
+		t, ok := m.storeLastHeartbeat[storeID]
+		if !ok {
+			// No heartbeat ever received — treat as Down.
+			m.storeStates[storeID] = StoreStateDown
+			continue
+		}
+
+		elapsed := now.Sub(t)
+		switch {
+		case elapsed >= m.downDuration:
+			m.storeStates[storeID] = StoreStateDown
+		case elapsed >= m.disconnectDuration:
+			m.storeStates[storeID] = StoreStateDisconnected
+		default:
+			m.storeStates[storeID] = StoreStateUp
+		}
+	}
+}
+
+// GetRegionCountPerStore returns the number of region peers per store.
+func (m *MetadataStore) GetRegionCountPerStore() map[uint64]int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	counts := make(map[uint64]int)
+	for _, region := range m.regions {
+		for _, peer := range region.GetPeers() {
+			counts[peer.GetStoreId()]++
+		}
+	}
+	return counts
 }
 
 // GetLeaderCountPerStore returns the number of region leaders per store.

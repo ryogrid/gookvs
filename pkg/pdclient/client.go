@@ -52,6 +52,9 @@ type Client interface {
 	// GetStore returns store metadata by store ID.
 	GetStore(ctx context.Context, storeID uint64) (*metapb.Store, error)
 
+	// GetAllStores returns metadata for all stores in the cluster.
+	GetAllStores(ctx context.Context) ([]*metapb.Store, error)
+
 	// Bootstrap bootstraps the cluster with the given store and region.
 	Bootstrap(ctx context.Context, store *metapb.Store, region *metapb.Region) (*pdpb.BootstrapResponse, error)
 
@@ -374,6 +377,29 @@ func (c *grpcClient) GetStore(ctx context.Context, storeID uint64) (*metapb.Stor
 		return nil
 	})
 	return store, err
+}
+
+func (c *grpcClient) GetAllStores(ctx context.Context) ([]*metapb.Store, error) {
+	var stores []*metapb.Store
+	err := c.withRetry(func() error {
+		c.mu.RLock()
+		client := c.client
+		c.mu.RUnlock()
+
+		slog.Debug("pd.GetAllStores")
+		resp, err := client.GetAllStores(ctx, &pdpb.GetAllStoresRequest{
+			Header: c.header(),
+		})
+		if err != nil {
+			return fmt.Errorf("pdclient: get all stores: %w", err)
+		}
+		if resp.GetHeader().GetError() != nil {
+			return fmt.Errorf("pdclient: get all stores error: %s", resp.GetHeader().GetError().GetMessage())
+		}
+		stores = resp.GetStores()
+		return nil
+	})
+	return stores, err
 }
 
 func (c *grpcClient) Bootstrap(ctx context.Context, store *metapb.Store, region *metapb.Region) (*pdpb.BootstrapResponse, error) {

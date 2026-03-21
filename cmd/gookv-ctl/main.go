@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/pingcap/kvproto/pkg/raft_serverpb"
@@ -18,6 +20,7 @@ import (
 	"github.com/ryogrid/gookv/internal/storage/mvcc"
 	"github.com/ryogrid/gookv/pkg/cfnames"
 	"github.com/ryogrid/gookv/pkg/keys"
+	"github.com/ryogrid/gookv/pkg/pdclient"
 	"github.com/ryogrid/gookv/pkg/txntypes"
 )
 
@@ -34,9 +37,10 @@ Commands:
   compact     Trigger manual compaction
   dump        Dump key-value pairs (with optional MVCC decoding)
   size        Show approximate data size
+  store       Inspect store metadata via PD
 
 Global Options:
-  --db <path>   Path to the data directory (required)
+  --db <path>   Path to the data directory (required for local commands)
   --cf <name>   Column family (default, lock, write, raft)
 `
 
@@ -64,6 +68,8 @@ func main() {
 		cmdSize(args)
 	case "compact":
 		cmdCompact(args)
+	case "store":
+		cmdStore(args)
 	case "help", "--help", "-h":
 		fmt.Print(usage)
 	default:
@@ -744,12 +750,124 @@ func RunCommand(args []string) int {
 		cmdSize(cmdArgs)
 	case "compact":
 		cmdCompact(cmdArgs)
+	case "store":
+		cmdStore(cmdArgs)
 	case "help":
 		fmt.Print(usage)
 	default:
 		return 1
 	}
 	return 0
+}
+
+// --- store command ---
+
+const storeUsage = `gookv-ctl store - Inspect store metadata via PD
+
+Usage:
+  gookv-ctl store list   --pd <addr>
+  gookv-ctl store status --pd <addr> --store-id <id>
+
+Subcommands:
+  list     List all stores in the cluster
+  status   Show details for a specific store
+`
+
+func cmdStore(args []string) {
+	if len(args) < 1 {
+		fmt.Print(storeUsage)
+		os.Exit(1)
+	}
+
+	sub := args[0]
+	subArgs := args[1:]
+
+	switch sub {
+	case "list":
+		cmdStoreList(subArgs)
+	case "status":
+		cmdStoreStatus(subArgs)
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown store subcommand: %s\n", sub)
+		fmt.Print(storeUsage)
+		os.Exit(1)
+	}
+}
+
+func connectPD(addr string) pdclient.Client {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := pdclient.NewClient(ctx, pdclient.Config{
+		Endpoints:     []string{addr},
+		RetryInterval: 500 * time.Millisecond,
+		RetryMaxCount: 3,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error connecting to PD at %s: %v\n", addr, err)
+		os.Exit(1)
+	}
+	return client
+}
+
+func cmdStoreList(args []string) {
+	fs := flag.NewFlagSet("store list", flag.ExitOnError)
+	pdAddr := fs.String("pd", "127.0.0.1:2379", "PD server address")
+	fs.Parse(args)
+
+	client := connectPD(*pdAddr)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stores, err := client.GetAllStores(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting stores: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(stores) == 0 {
+		fmt.Println("No stores found.")
+		return
+	}
+
+	fmt.Printf("%-10s %-25s %-10s\n", "StoreID", "Address", "State")
+	for _, s := range stores {
+		fmt.Printf("%-10d %-25s %-10s\n", s.GetId(), s.GetAddress(), "Up")
+	}
+}
+
+func cmdStoreStatus(args []string) {
+	fs := flag.NewFlagSet("store status", flag.ExitOnError)
+	pdAddr := fs.String("pd", "127.0.0.1:2379", "PD server address")
+	storeID := fs.Uint64("store-id", 0, "Store ID to inspect")
+	fs.Parse(args)
+
+	if *storeID == 0 {
+		fmt.Fprintln(os.Stderr, "Error: --store-id is required")
+		os.Exit(1)
+	}
+
+	client := connectPD(*pdAddr)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	store, err := client.GetStore(ctx, *storeID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting store %d: %v\n", *storeID, err)
+		os.Exit(1)
+	}
+
+	if store == nil {
+		fmt.Printf("Store %d not found.\n", *storeID)
+		return
+	}
+
+	fmt.Printf("Store ID:  %d\n", store.GetId())
+	fmt.Printf("Address:   %s\n", store.GetAddress())
 }
 
 // ParseCommand parses a command string into a command name for testing.

@@ -3,6 +3,7 @@ package pd
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
@@ -257,7 +258,7 @@ func TestIDAllocator(t *testing.T) {
 }
 
 func TestMetadataStore(t *testing.T) {
-	meta := NewMetadataStore(1)
+	meta := NewMetadataStore(1, 30*time.Second, 30*time.Minute)
 
 	assert.False(t, meta.IsBootstrapped())
 	meta.SetBootstrapped(true)

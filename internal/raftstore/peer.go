@@ -518,7 +518,7 @@ func (p *Peer) onRaftLogGCTick() {
 
 	// Ensure we keep at least RaftLogGCThreshold entries.
 	if compactIdx > firstIdx+p.cfg.RaftLogGCThreshold {
-		compactIdx = compactIdx // keep as is
+		// compactIdx is already valid — keep as is.
 	} else if excessCount >= p.cfg.RaftLogGCCountLimit*3 {
 		// Force compact when way over limit, even if followers are slow.
 		compactIdx = appliedIdx - 1

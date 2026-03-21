@@ -138,10 +138,14 @@ func main() {
 	}
 	srv := server.NewServer(srvCfg, storage)
 
-	// Cluster mode: set up Raft coordination if --store-id is specified.
+	// Cluster mode: bootstrap (with --initial-cluster) or join (with PD only).
 	var coord *server.StoreCoordinator
 	var pdWorker *server.PDWorker
-	if *storeID > 0 && *initialCluster != "" {
+	hasPD := len(cfg.PD.Endpoints) > 0 && cfg.PD.Endpoints[0] != ""
+	hasInitialCluster := *initialCluster != ""
+
+	if hasInitialCluster {
+		// Bootstrap mode: static initial cluster topology.
 		clusterMap := parseInitialCluster(*initialCluster)
 		if len(clusterMap) == 0 {
 			slog.Error("Invalid --initial-cluster format")
@@ -150,8 +154,6 @@ func main() {
 
 		slog.Info("cluster mode enabled", "store-id", *storeID, "cluster", clusterMap)
 
-		resolver := server.NewStaticStoreResolver(clusterMap)
-		raftClient := transport.NewRaftClient(resolver, transport.DefaultRaftClientConfig())
 		rtr := raftrouter.New(256)
 
 		peerCfg := raftstore.DefaultPeerConfig()
@@ -165,7 +167,7 @@ func main() {
 		// Connect to PD if endpoints are configured.
 		var pdTaskCh chan<- interface{}
 		var pdClient pdclient.Client
-		if len(cfg.PD.Endpoints) > 0 && cfg.PD.Endpoints[0] != "" {
+		if hasPD {
 			pdCtx, pdCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			var pdErr error
 			pdClient, pdErr = pdclient.NewClient(pdCtx, pdclient.Config{Endpoints: cfg.PD.Endpoints})
@@ -181,8 +183,8 @@ func main() {
 
 				regCtx, regCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				// Register all stores with PD so it knows their addresses.
-				for sid, addr := range clusterMap {
-					_ = pdClient.PutStore(regCtx, &metapb.Store{Id: sid, Address: addr})
+				for sid, saddr := range clusterMap {
+					_ = pdClient.PutStore(regCtx, &metapb.Store{Id: sid, Address: saddr})
 				}
 				regCancel()
 
@@ -209,6 +211,16 @@ func main() {
 				pdTaskCh = pdWorker.PeerTaskCh()
 			}
 		}
+
+		// Create store resolver: use PD-based resolver if PD is available
+		// (enables discovering dynamically added stores), otherwise use static map.
+		var resolver transport.StoreResolver
+		if pdClient != nil {
+			resolver = server.NewPDStoreResolver(pdClient, 30*time.Second)
+		} else {
+			resolver = server.NewStaticStoreResolver(clusterMap)
+		}
+		raftClient := transport.NewRaftClient(resolver, transport.DefaultRaftClientConfig())
 
 		coord = server.NewStoreCoordinator(server.StoreCoordinatorConfig{
 			StoreID:  *storeID,
@@ -261,6 +273,112 @@ func main() {
 			os.Exit(1)
 		}
 		slog.Info("Raft cluster bootstrapped", "region", 1, "peers", len(raftPeers))
+	} else if hasPD {
+		// Join mode: connect to PD, obtain store ID, register, start empty.
+		pdCtx, pdCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		pdClient, pdErr := pdclient.NewClient(pdCtx, pdclient.Config{Endpoints: cfg.PD.Endpoints})
+		pdCancel()
+		if pdErr != nil {
+			slog.Error("join mode requires PD connection", "error", pdErr)
+			os.Exit(1)
+		}
+		slog.Info("PD connected (join mode)", "endpoints", cfg.PD.Endpoints)
+
+		// Determine store ID: flag > persisted > allocate from PD.
+		joinStoreID := *storeID
+		if joinStoreID == 0 {
+			loaded, loadErr := server.LoadStoreIdent(cfg.Storage.DataDir)
+			if loadErr == nil && loaded > 0 {
+				joinStoreID = loaded
+				slog.Info("join mode: loaded persisted store ID", "store-id", joinStoreID)
+			} else {
+				allocCtx, allocCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				allocated, allocErr := pdClient.AllocID(allocCtx)
+				allocCancel()
+				if allocErr != nil {
+					slog.Error("join mode: failed to allocate store ID from PD", "error", allocErr)
+					os.Exit(1)
+				}
+				joinStoreID = allocated
+				slog.Info("join mode: allocated store ID from PD", "store-id", joinStoreID)
+			}
+		}
+
+		// Persist store ID for future restarts.
+		if err := server.SaveStoreIdent(cfg.Storage.DataDir, joinStoreID); err != nil {
+			slog.Error("join mode: failed to save store ident", "error", err)
+			os.Exit(1)
+		}
+
+		slog.Info("join mode: registering with PD", "store-id", joinStoreID, "addr", cfg.Server.Addr)
+
+		// Register this store with PD.
+		regCtx, regCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := pdClient.PutStore(regCtx, &metapb.Store{Id: joinStoreID, Address: cfg.Server.Addr}); err != nil {
+			slog.Error("join mode: failed to register store with PD", "error", err)
+			os.Exit(1)
+		}
+		regCancel()
+
+		// Wire PD client into the server for TSO allocation.
+		srv.SetPDClient(pdClient)
+
+		// Build peer config.
+		peerCfg := raftstore.DefaultPeerConfig()
+		if cfg.RaftStore.RaftBaseTickInterval.Duration > 0 {
+			peerCfg.RaftBaseTickInterval = cfg.RaftStore.RaftBaseTickInterval.Duration
+		}
+		if cfg.RaftStore.SplitCheckTickInterval.Duration > 0 {
+			peerCfg.SplitCheckTickInterval = cfg.RaftStore.SplitCheckTickInterval.Duration
+		}
+
+		// PD-based resolver for dynamic peer discovery.
+		resolver := server.NewPDStoreResolver(pdClient, 30*time.Second)
+		raftClient := transport.NewRaftClient(resolver, transport.DefaultRaftClientConfig())
+
+		rtr := raftrouter.New(256)
+
+		// Create PDWorker and get its task channel.
+		pdWorker = server.NewPDWorker(server.PDWorkerConfig{
+			StoreID:  joinStoreID,
+			PDClient: pdClient,
+		})
+		pdTaskCh := pdWorker.PeerTaskCh()
+
+		coord = server.NewStoreCoordinator(server.StoreCoordinatorConfig{
+			StoreID:  joinStoreID,
+			Engine:   engine,
+			Storage:  storage,
+			Router:   rtr,
+			Client:   raftClient,
+			PeerCfg:  peerCfg,
+			PDTaskCh: pdTaskCh,
+			PDClient: pdClient,
+			SplitCheckCfg: split.SplitCheckWorkerConfig{
+				SplitSize: uint64(cfg.RaftStore.RegionSplitSize),
+				MaxSize:   uint64(cfg.RaftStore.RegionMaxSize),
+				SplitKeys: uint64(cfg.Coprocessor.RegionSplitKeys),
+				MaxKeys:   uint64(cfg.Coprocessor.RegionMaxKeys),
+			},
+		})
+		srv.SetCoordinator(coord)
+
+		pdWorker.SetCoordinator(coord)
+		pdWorker.Run()
+
+		// Start store worker for dynamic peer creation.
+		storeWorkerCtx, storeWorkerCancel := context.WithCancel(context.Background())
+		go coord.RunStoreWorker(storeWorkerCtx)
+		defer storeWorkerCancel()
+
+		// Start split result handler.
+		splitCtx, splitCancel := context.WithCancel(context.Background())
+		go coord.RunSplitResultHandler(splitCtx)
+		defer splitCancel()
+
+		// NOTE: No BootstrapRegion — join mode starts empty; PD will assign regions.
+		slog.Info("join mode: store started (empty, waiting for PD region assignment)",
+			"store-id", joinStoreID)
 	}
 
 	if err := srv.Start(); err != nil {
