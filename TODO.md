@@ -8,36 +8,36 @@
 - [x] Run unit tests and verify pass
 
 ## Phase 2: Join Mode Startup
-- [ ] Create `internal/server/store_ident.go` — SaveStoreIdent/LoadStoreIdent for store ID persistence
-- [ ] Create `internal/server/store_ident_test.go` — Unit tests (save/load/missing file)
-- [ ] Modify `cmd/gookv-server/main.go` — Add join mode detection and joinCluster() function
-- [ ] Run `go vet` and fix any issues
-- [ ] Run unit tests and verify pass
-- [ ] Verify build succeeds
+- [x] Create `internal/server/store_ident.go` — SaveStoreIdent/LoadStoreIdent for store ID persistence
+- [x] Create `internal/server/store_ident_test.go` — Unit tests (save/load/missing file)
+- [x] Modify `cmd/gookv-server/main.go` — Add join mode detection and joinCluster() function
+- [x] Run `go vet` and fix any issues
+- [x] Run unit tests and verify pass
+- [x] Verify build succeeds
 
 ## Phase 3: Store State Machine in PD
-- [ ] Modify `internal/pd/server.go` — Add StoreState enum, storeStates map, state methods, config fields, runStoreStateWorker()
-- [ ] Modify `internal/pd/scheduler.go` — Use GetStoreState/IsStoreSchedulable instead of IsStoreAlive
-- [ ] Create `internal/pd/store_state_test.go` — State transition tests
-- [ ] Modify `internal/pd/scheduler_test.go` — Update for state-aware scheduling
-- [ ] Run `go vet` and fix any issues
-- [ ] Run unit tests and verify pass
+- [x] Modify `internal/pd/server.go` — Add StoreState enum, storeStates map, state methods, config fields, runStoreStateWorker()
+- [x] Modify `internal/pd/scheduler.go` — Use GetStoreState/IsStoreSchedulable instead of IsStoreAlive
+- [x] Create `internal/pd/store_state_test.go` — State transition tests
+- [x] Modify `internal/pd/scheduler_test.go` — Update for state-aware scheduling
+- [x] Run `go vet` and fix any issues
+- [x] Run unit tests and verify pass
 
 ## Phase 4: Region Balance + Excess Shedding Schedulers
-- [ ] Modify `internal/pd/scheduler.go` — Add scheduleExcessReplicaShedding(), scheduleRegionBalance(), update Schedule() priority chain, extend Scheduler struct
-- [ ] Modify `internal/pd/server.go` — Add GetRegionCountPerStore(), config fields, update constructor
-- [ ] Modify `internal/pd/scheduler_test.go` — Tests for new schedulers
-- [ ] Run `go vet` and fix any issues
-- [ ] Run unit tests and verify pass
+- [x] Modify `internal/pd/scheduler.go` — Add scheduleExcessReplicaShedding(), scheduleRegionBalance(), update Schedule() priority chain, extend Scheduler struct
+- [x] Modify `internal/pd/server.go` — Add GetRegionCountPerStore(), config fields, update constructor
+- [x] Modify `internal/pd/scheduler_test.go` — Tests for new schedulers
+- [x] Run `go vet` and fix any issues
+- [x] Run unit tests and verify pass
 
 ## Phase 5: Multi-Step Move Tracking (MoveTracker)
-- [ ] Create `internal/pd/move_tracker.go` — MoveTracker, PendingMove, MoveState, Advance() logic
-- [ ] Create `internal/pd/move_tracker_test.go` — Full cycle, skip transfer, stale cleanup, rate limit
-- [ ] Modify `internal/pd/scheduler.go` — Wire moveTracker, call Advance() in Schedule()
-- [ ] Modify `internal/pd/server.go` — Create MoveTracker, wire into Scheduler, cleanup goroutine
-- [ ] Modify `internal/server/coordinator.go` — Add snapSemaphore for concurrent snapshot limit
-- [ ] Run `go vet` and fix any issues
-- [ ] Run unit tests and verify pass
+- [x] Create `internal/pd/move_tracker.go` — MoveTracker, PendingMove, MoveState, Advance() logic
+- [x] Create `internal/pd/move_tracker_test.go` — Full cycle, skip transfer, stale cleanup, rate limit
+- [x] Modify `internal/pd/scheduler.go` — Wire moveTracker, call Advance() in Schedule()
+- [x] Modify `internal/pd/server.go` — Create MoveTracker, wire into Scheduler, cleanup goroutine
+- [x] Modify `internal/server/coordinator.go` — Add snapSemaphore for concurrent snapshot limit
+- [x] Run `go vet` and fix any issues
+- [x] Run unit tests and verify pass
 
 ## Phase 6: E2E Testing
 - [ ] Create `e2e/add_node_test.go` — E2E tests for node join, region convergence, snapshot transfer

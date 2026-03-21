@@ -41,9 +41,10 @@ type StoreCoordinator struct {
 	pdClient         pdclient.Client
 
 	// Snapshot generation worker.
-	snapWorker  *raftstore.SnapWorker
-	snapTaskCh  chan raftstore.GenSnapTask
-	snapStopCh  chan struct{}
+	snapWorker    *raftstore.SnapWorker
+	snapTaskCh    chan raftstore.GenSnapTask
+	snapStopCh    chan struct{}
+	snapSemaphore chan struct{} // limits concurrent snapshot sends
 
 	peers   map[uint64]*raftstore.Peer
 	cancels map[uint64]context.CancelFunc
@@ -72,20 +73,21 @@ func NewStoreCoordinator(cfg StoreCoordinatorConfig) *StoreCoordinator {
 	go snapWorker.Run()
 
 	sc := &StoreCoordinator{
-		storeID:    cfg.StoreID,
-		engine:     cfg.Engine,
-		storage:    cfg.Storage,
-		router:     cfg.Router,
-		client:     cfg.Client,
-		cfg:        cfg.PeerCfg,
-		pdTaskCh:   cfg.PDTaskCh,
-		pdClient:   cfg.PDClient,
-		snapWorker: snapWorker,
-		snapTaskCh: snapTaskCh,
-		snapStopCh: snapStopCh,
-		peers:      make(map[uint64]*raftstore.Peer),
-		cancels:    make(map[uint64]context.CancelFunc),
-		dones:      make(map[uint64]chan struct{}),
+		storeID:       cfg.StoreID,
+		engine:        cfg.Engine,
+		storage:       cfg.Storage,
+		router:        cfg.Router,
+		client:        cfg.Client,
+		cfg:           cfg.PeerCfg,
+		pdTaskCh:      cfg.PDTaskCh,
+		pdClient:      cfg.PDClient,
+		snapWorker:    snapWorker,
+		snapTaskCh:    snapTaskCh,
+		snapStopCh:    snapStopCh,
+		snapSemaphore: make(chan struct{}, 3),
+		peers:         make(map[uint64]*raftstore.Peer),
+		cancels:       make(map[uint64]context.CancelFunc),
+		dones:         make(map[uint64]chan struct{}),
 	}
 
 	// Create and start the split check worker if PD client is available.
@@ -663,6 +665,9 @@ func (sc *StoreCoordinator) sendRaftMessage(regionID uint64, region *metapb.Regi
 	if msg.Type == raftpb.MsgSnap {
 		snapData := msg.Snapshot.Data
 		go func() {
+			sc.snapSemaphore <- struct{}{} // acquire
+			defer func() { <-sc.snapSemaphore }() // release
+
 			if err := sc.client.SendSnapshot(toStoreID, raftMessage, snapData); err != nil {
 				slog.Warn("snapshot send failed", "to_store", toStoreID, "region", regionID, "err", err)
 				sc.reportSnapshotStatus(regionID, msg.To, raft.SnapshotFailure)
