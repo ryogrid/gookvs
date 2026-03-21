@@ -95,6 +95,15 @@ TXN_DEMO_PD_ADDR = 127.0.0.1:2389
 
 txn-demo-start: build
 	@echo "Starting PD + $(TXN_DEMO_NODES)-node gookv cluster for txn demo..."
+	@# Ensure no stale processes from a previous run.
+	@for PID_FILE in $(TXN_DEMO_DIR)/*.pid; do \
+		if [ -f "$$PID_FILE" ]; then \
+			PID=$$(cat "$$PID_FILE"); \
+			kill -9 $$PID 2>/dev/null || true; \
+		fi; \
+	done
+	@sleep 1
+	@rm -rf $(TXN_DEMO_DIR)
 	@mkdir -p $(TXN_DEMO_DIR)/pd
 	@./gookv-pd \
 		--addr $(TXN_DEMO_PD_ADDR) \
