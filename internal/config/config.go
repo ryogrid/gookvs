@@ -147,6 +147,7 @@ type RaftStoreConfig struct {
 	RaftLogGCThreshold       uint64   `toml:"raft-log-gc-threshold"`
 	RaftLogGCCountLimit      uint64   `toml:"raft-log-gc-count-limit"`
 	SplitCheckTickInterval   Duration `toml:"split-check-tick-interval"`
+	PdHeartbeatTickInterval  Duration `toml:"pd-heartbeat-tick-interval"`
 }
 
 // CoprocessorConfig controls the coprocessor.

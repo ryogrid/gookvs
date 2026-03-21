@@ -163,6 +163,9 @@ func main() {
 		if cfg.RaftStore.SplitCheckTickInterval.Duration > 0 {
 			peerCfg.SplitCheckTickInterval = cfg.RaftStore.SplitCheckTickInterval.Duration
 		}
+		if cfg.RaftStore.PdHeartbeatTickInterval.Duration > 0 {
+			peerCfg.PdHeartbeatTickInterval = cfg.RaftStore.PdHeartbeatTickInterval.Duration
+		}
 
 		// Connect to PD if endpoints are configured.
 		var pdTaskCh chan<- interface{}
@@ -330,6 +333,9 @@ func main() {
 		}
 		if cfg.RaftStore.SplitCheckTickInterval.Duration > 0 {
 			peerCfg.SplitCheckTickInterval = cfg.RaftStore.SplitCheckTickInterval.Duration
+		}
+		if cfg.RaftStore.PdHeartbeatTickInterval.Duration > 0 {
+			peerCfg.PdHeartbeatTickInterval = cfg.RaftStore.PdHeartbeatTickInterval.Duration
 		}
 
 		// PD-based resolver for dynamic peer discovery.

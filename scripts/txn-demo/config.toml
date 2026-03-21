@@ -5,3 +5,4 @@ raft-election-timeout-ticks = 10
 region-max-size = "2KB"
 region-split-size = "1KB"
 split-check-tick-interval = "2s"
+pd-heartbeat-tick-interval = "5s"

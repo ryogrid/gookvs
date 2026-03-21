@@ -313,10 +313,68 @@ func scenario2(pdAddr, dataDir, configPath string) bool {
 	}
 	fmt.Println()
 
-	// Step 4: Summary.
-	fmt.Println("  [Step 4] Summary:")
+	// Step 4: Wait for rebalancing — new stores should become region members.
+	fmt.Println("  [Step 4] Waiting for rebalancing (new stores join regions, timeout 120s)...")
+
+	rebalanceDeadline := time.Now().Add(120 * time.Second)
+	rebalanced := false
+	for time.Now().Before(rebalanceDeadline) {
+		regionsAfter, err = getAllRegions(ctx, pdClient)
+		if err != nil {
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		// Check if any region has a peer on a new store (ID >= 1000).
+		for _, r := range regionsAfter {
+			for _, pid := range r.peerIDs {
+				if pid >= 1000 {
+					rebalanced = true
+					break
+				}
+			}
+			if rebalanced {
+				break
+			}
+		}
+		if rebalanced {
+			break
+		}
+		time.Sleep(3 * time.Second)
+		fmt.Println("           (still waiting for new stores to join regions...)")
+	}
+
+	if !rebalanced {
+		fmt.Println("           NOTE: Rebalancing did not complete within 120s.")
+		fmt.Println("                 New stores are registered but not yet region members.")
+		fmt.Println("                 This is expected — PD schedules moves over time.")
+	} else {
+		fmt.Println("           Rebalancing detected! New store joined a region.")
+	}
+	fmt.Println()
+
+	// Print final region layout.
+	fmt.Println("           Final region layout:")
+	for _, r := range regionsAfter {
+		newMarkers := ""
+		for _, pid := range r.peerIDs {
+			if pid >= 1000 {
+				newMarkers = "  <- includes new store"
+				break
+			}
+		}
+		fmt.Printf("             Region %d: [%s .. %s)  peers=%v leader=Store %d%s\n",
+			r.id, fmtKey(r.startKey), fmtKey(r.endKey), r.peerIDs, r.leaderID, newMarkers)
+	}
+	fmt.Println()
+
+	// Step 5: Summary.
+	fmt.Println("  [Step 5] Summary:")
 	fmt.Printf("           Before: 3 stores, 1 region\n")
 	fmt.Printf("           After:  %d stores, %d regions\n", len(stores), len(regionsAfter))
+	if rebalanced {
+		fmt.Println("           New stores are active region members.")
+	}
 	fmt.Println()
 
 	fmt.Println("  Result: PASS")

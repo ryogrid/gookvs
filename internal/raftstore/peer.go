@@ -45,6 +45,11 @@ type PeerConfig struct {
 	// SplitCheckTickInterval is how often the split check tick fires.
 	// If zero, split checking is disabled.
 	SplitCheckTickInterval time.Duration
+
+	// PdHeartbeatTickInterval is how often the leader sends a region heartbeat to PD.
+	// This enables PD's scheduler to run periodically (region balance, move tracking).
+	// If zero, region heartbeats are only sent on leadership change.
+	PdHeartbeatTickInterval time.Duration
 }
 
 // DefaultPeerConfig returns a PeerConfig with sensible defaults.
@@ -62,6 +67,7 @@ func DefaultPeerConfig() PeerConfig {
 		RaftLogGCSizeLimit:       72 * 1024 * 1024, // 72 MiB
 		RaftLogGCThreshold:       50,
 		SplitCheckTickInterval:   10 * time.Second,
+		PdHeartbeatTickInterval:  60 * time.Second,
 	}
 }
 
@@ -243,6 +249,14 @@ func (p *Peer) Run(ctx context.Context) {
 		splitCheckTickerCh = splitCheckTicker.C
 	}
 
+	// Optional PD region heartbeat ticker.
+	var pdHeartbeatTickerCh <-chan time.Time
+	if p.cfg.PdHeartbeatTickInterval > 0 {
+		pdHeartbeatTicker := time.NewTicker(p.cfg.PdHeartbeatTickInterval)
+		defer pdHeartbeatTicker.Stop()
+		pdHeartbeatTickerCh = pdHeartbeatTicker.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -257,6 +271,11 @@ func (p *Peer) Run(ctx context.Context) {
 
 		case <-splitCheckTickerCh:
 			p.onSplitCheckTick()
+
+		case <-pdHeartbeatTickerCh:
+			if p.isLeader.Load() && p.pdTaskCh != nil {
+				p.sendRegionHeartbeatToPD()
+			}
 
 		case msg, ok := <-p.Mailbox:
 			if !ok {
