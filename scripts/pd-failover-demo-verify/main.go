@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -150,7 +151,12 @@ func phase1(pdEndpoints []string) (leaderID uint64, members []pdMember, ok bool)
 		if m.id == leaderID {
 			role = "LEADER"
 		}
-		fmt.Printf("             PD %d (%s): %s\n", m.id, m.clientURL, role)
+		pidStr := "?"
+		pidFile := filepath.Join(*dataDirFlag, fmt.Sprintf("pd%d.pid", m.id))
+		if data, err := os.ReadFile(pidFile); err == nil {
+			pidStr = strings.TrimSpace(string(data))
+		}
+		fmt.Printf("             PD %d (%s): %s  pid=%s\n", m.id, m.clientURL, role, pidStr)
 	}
 	fmt.Println()
 
@@ -231,8 +237,13 @@ func phase2(dataDir string, leaderID uint64, members []pdMember) bool {
 	}
 
 	pidFile := filepath.Join(dataDir, fmt.Sprintf("pd%d.pid", leaderID))
-	fmt.Printf("  [Step 1] Killing PD leader: node %d (%s)\n", leaderID, leaderAddr)
+	pidStr := "?"
+	if data, err := os.ReadFile(pidFile); err == nil {
+		pidStr = strings.TrimSpace(string(data))
+	}
+	fmt.Printf("  [Step 1] Killing PD leader: node %d (%s) pid=%s\n", leaderID, leaderAddr, pidStr)
 	fmt.Printf("           PID file: %s\n", pidFile)
+	showProcessStatus("Process status before kill")
 
 	pid, err := killProcess(pidFile)
 	if err != nil {
@@ -241,6 +252,7 @@ func phase2(dataDir string, leaderID uint64, members []pdMember) bool {
 	}
 	fmt.Printf("           Sent SIGKILL to pid %d\n", pid)
 	time.Sleep(1 * time.Second)
+	showProcessStatus("Process status after kill")
 	fmt.Println()
 
 	fmt.Println("  Result: PASS")
@@ -605,6 +617,23 @@ func getAllStores(ctx context.Context, pdClient pdpb.PDClient) ([]*metapb.Store,
 		return nil, fmt.Errorf("GetAllStores error: %s", resp.GetHeader().GetError().GetMessage())
 	}
 	return resp.GetStores(), nil
+}
+
+func showProcessStatus(label string) {
+	cmd := `ps ax | grep "[.]\/gookv-pd "`
+	fmt.Println()
+	fmt.Printf("           --- %s ---\n", label)
+	fmt.Printf("           exec: %s\n", cmd)
+	out, _ := exec.Command("bash", "-c", cmd).Output()
+	if len(strings.TrimSpace(string(out))) == 0 {
+		fmt.Println("           (no matching processes)")
+	} else {
+		for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+			fmt.Printf("           %s\n", line)
+		}
+	}
+	fmt.Println("           --- end ---")
+	fmt.Println()
 }
 
 func killProcess(pidFile string) (int, error) {
