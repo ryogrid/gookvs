@@ -211,6 +211,78 @@ func CheckTxnStatus(reader *mvcc.MvccReader, primaryKey mvcc.Key, startTS txntyp
 	return &TxnStatus{}, nil
 }
 
+// CheckTxnStatusWithCleanup determines the status of a transaction and handles
+// TTL-based lock cleanup and RollbackIfNotExist. Unlike CheckTxnStatus, this
+// may write rollback records and remove expired locks.
+func CheckTxnStatusWithCleanup(
+	txn *mvcc.MvccTxn,
+	reader *mvcc.MvccReader,
+	primaryKey mvcc.Key,
+	startTS txntypes.TimeStamp,
+	callerStartTS txntypes.TimeStamp,
+	rollbackIfNotExist bool,
+) (*TxnStatus, error) {
+	// Check for lock.
+	lock, err := reader.LoadLock(primaryKey)
+	if err != nil {
+		return nil, err
+	}
+	if lock != nil && lock.StartTS == startTS {
+		// Check if the lock's TTL has expired.
+		// Use physical time comparison: startTS contains physical time in upper bits.
+		lockPhysicalTime := uint64(startTS) >> 18
+		callerPhysicalTime := uint64(callerStartTS) >> 18
+		lockExpireTime := lockPhysicalTime + lock.TTL
+
+		if callerPhysicalTime >= lockExpireTime {
+			// Lock has expired — force rollback.
+			isPessimistic := lock.LockType == txntypes.LockTypePessimistic
+			txn.UnlockKey(primaryKey, isPessimistic)
+
+			// Delete value from CF_DEFAULT if it was written by a put prewrite.
+			if lock.ShortValue == nil && lock.LockType == txntypes.LockTypePut {
+				txn.DeleteValue(primaryKey, startTS)
+			}
+
+			// Write rollback record.
+			rollbackWrite := &txntypes.Write{
+				WriteType: txntypes.WriteTypeRollback,
+				StartTS:   startTS,
+			}
+			txn.PutWrite(primaryKey, startTS, rollbackWrite)
+			return &TxnStatus{IsRolledBack: true}, nil
+		}
+
+		// Lock is still alive.
+		return &TxnStatus{IsLocked: true, Lock: lock}, nil
+	}
+
+	// No lock for this transaction. Check for commit/rollback record.
+	write, commitTS, err := reader.GetTxnCommitRecord(primaryKey, startTS)
+	if err != nil {
+		return nil, err
+	}
+	if write != nil {
+		if write.WriteType == txntypes.WriteTypeRollback {
+			return &TxnStatus{IsRolledBack: true}, nil
+		}
+		return &TxnStatus{CommitTS: commitTS}, nil
+	}
+
+	// Transaction not found. If requested, write a rollback record to prevent
+	// late-arriving prewrites from succeeding.
+	if rollbackIfNotExist {
+		rollbackWrite := &txntypes.Write{
+			WriteType: txntypes.WriteTypeRollback,
+			StartTS:   startTS,
+		}
+		txn.PutWrite(primaryKey, startTS, rollbackWrite)
+		return &TxnStatus{IsRolledBack: true}, nil
+	}
+
+	return &TxnStatus{}, nil
+}
+
 // TxnHeartBeat updates the TTL of an existing lock on the primary key.
 // Returns the actual TTL set on the lock after the update.
 func TxnHeartBeat(txn *mvcc.MvccTxn, reader *mvcc.MvccReader, primaryKey mvcc.Key, startTS txntypes.TimeStamp, adviseTTL uint64) (uint64, error) {

@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/pingcap/kvproto/pkg/metapb"
+	"github.com/ryogrid/gookv/pkg/codec"
 	"github.com/ryogrid/gookv/pkg/pdclient"
 )
 
@@ -46,9 +47,14 @@ func NewRegionCache(pdClient pdclient.Client, resolver *PDStoreResolver) *Region
 
 // LocateKey returns the RegionInfo for the given key.
 // Returns from cache if available; queries PD on cache miss.
+// The key is a raw user key which is encoded for comparison against
+// region boundaries (which use memcomparable encoding).
 func (c *RegionCache) LocateKey(ctx context.Context, key []byte) (*RegionInfo, error) {
+	// Encode the raw user key to match region boundary encoding.
+	encodedKey := codec.EncodeBytes(nil, key)
+
 	c.mu.RLock()
-	if info := c.findInCache(key); info != nil {
+	if info := c.findInCache(encodedKey); info != nil {
 		c.mu.RUnlock()
 		return info, nil
 	}

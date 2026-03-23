@@ -85,8 +85,8 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) error {
 		return err
 	}
 
-	// Commit secondaries in the background (best-effort).
-	go c.commitSecondaries(context.Background())
+	// Commit secondaries synchronously to ensure no orphan locks.
+	c.commitSecondaries(context.Background())
 
 	return nil
 }

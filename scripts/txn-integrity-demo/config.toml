@@ -1,0 +1,8 @@
+[raft-store]
+raft-base-tick-interval = "100ms"
+raft-heartbeat-ticks = 2
+raft-election-timeout-ticks = 10
+region-max-size = "40KB"
+region-split-size = "20KB"
+split-check-tick-interval = "2s"
+pd-heartbeat-tick-interval = "5s"

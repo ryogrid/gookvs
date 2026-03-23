@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/pingcap/kvproto/pkg/errorpb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
@@ -79,7 +80,8 @@ func (t *TxnHandle) Get(ctx context.Context, key []byte) ([]byte, error) {
 	t.mu.Unlock()
 
 	// RPC with lock resolution retry.
-	const maxRetries = 3
+	const maxRetries = 20
+	var lastLockInfo *kvrpcpb.LockInfo
 	for i := 0; i < maxRetries; i++ {
 		value, lockInfo, err := t.kvGet(ctx, key)
 		if err != nil {
@@ -88,10 +90,17 @@ func (t *TxnHandle) Get(ctx context.Context, key []byte) ([]byte, error) {
 		if lockInfo == nil {
 			return value, nil
 		}
+		lastLockInfo = lockInfo
 		// Resolve the lock and retry.
 		if err := t.client.resolver.ResolveLocks(ctx, []*kvrpcpb.LockInfo{lockInfo}); err != nil {
 			return nil, fmt.Errorf("resolve lock: %w", err)
 		}
+		// Brief pause to allow Raft proposals from lock resolution to be applied.
+		time.Sleep(200 * time.Millisecond)
+	}
+	if lastLockInfo != nil {
+		return nil, fmt.Errorf("get key %x: lock resolution retries exhausted (lockVersion=%d, primary=%x)",
+			key, lastLockInfo.GetLockVersion(), lastLockInfo.GetPrimaryLock())
 	}
 	return nil, fmt.Errorf("get key %x: lock resolution retries exhausted", key)
 }
@@ -362,11 +371,22 @@ func (t *TxnHandle) Rollback(ctx context.Context) error {
 		keys = append(keys, []byte(k))
 	}
 
-	// Also include pessimistic lock keys.
+	// In pessimistic mode, clean up both pessimistic locks and any prewrite
+	// locks that may have been created by a partial Commit().
 	if t.opts.Mode == TxnModePessimistic && len(t.lockKeys) > 0 {
 		lockKeys := t.lockKeys
 		t.mu.Unlock()
-		return t.pessimisticRollback(ctx, lockKeys)
+		// Rollback pessimistic locks first.
+		if err := t.pessimisticRollback(ctx, lockKeys); err != nil {
+			// Best-effort: continue to batch rollback even if pessimistic rollback fails.
+			_ = err
+		}
+		// Also batch-rollback membuf keys to clean up any prewrite locks
+		// left by a partial commit attempt.
+		if len(keys) > 0 {
+			return t.batchRollback(ctx, keys)
+		}
+		return nil
 	}
 	t.mu.Unlock()
 

@@ -434,6 +434,60 @@ make pd-failover-demo-stop
 
 Structured output with phase banners (`--- Phase 1/4: ...`), numbered steps, and PASS/FAIL per phase. Exit code 0 on full success, 1 if any phase fails.
 
+## Transaction Integrity Demo
+
+Demonstrates ACID transaction integrity under high concurrency: 1000 bank accounts with $100 each ($100,000 total) undergo random transfers from 32 concurrent goroutines for 30 seconds. After all transfers complete, the demo verifies that the total balance is still exactly $100,000 — proving that no money is created or lost even under heavy contention across multiple regions.
+
+### Prerequisites
+
+- Go installed
+- Ports 2419, 20470-20472, 20490-20492 available
+
+### Running
+
+```bash
+# Build and start PD + 3-node cluster
+make txn-integrity-demo-start
+
+# Wait a few seconds for cluster stabilization, then run the demo
+make txn-integrity-demo-verify
+
+# Stop and clean up
+make txn-integrity-demo-stop
+```
+
+### Ports
+
+| Component | Address |
+|-----------|---------|
+| PD | 127.0.0.1:2419 |
+| Node 1 | 127.0.0.1:20470 (gRPC), :20490 (status) |
+| Node 2 | 127.0.0.1:20471 (gRPC), :20491 (status) |
+| Node 3 | 127.0.0.1:20472 (gRPC), :20492 (status) |
+
+### Demo Configuration
+
+The demo cluster uses `scripts/txn-integrity-demo/config.toml` with split thresholds tuned so that the 1000 accounts (~46KB of MVCC data) produce at least 3 regions, ensuring transfers exercise cross-region 2PC:
+
+```toml
+[raft-store]
+region-max-size = "40KB"
+region-split-size = "20KB"
+split-check-tick-interval = "2s"
+```
+
+### What Each Phase Demonstrates
+
+1. **Initialize 1000 Accounts (Phase 1)**: Seeds 1000 accounts with $100 each via batched transactions, verifies the total is $100,000 via a read-only transaction, then waits for the data to split across at least 3 regions. Prints the region layout showing how accounts are distributed.
+
+2. **Concurrent Transfers (Phase 2)**: Launches concurrent goroutines that each repeatedly pick two random accounts and transfer a random amount ($1 to min($50, sender balance)) using optimistic transactions. Runs for 30 seconds, printing progress every 10 seconds. Reports statistics: successful transfers, conflict retries, insufficient-funds skips, and total dollars moved.
+
+3. **Verify Conservation (Phase 3)**: Reads all 1000 account balances in a single snapshot transaction. Asserts the total equals $100,000. Prints distribution statistics: min/max balance and a histogram ($0, $1-50, $51-100, $101-200, $201-500, $500+).
+
+### Expected Output
+
+Structured output with phase banners (`--- Phase 1/3: ...`), numbered steps, and PASS/FAIL per phase. Phase 2 passes if no unexpected errors occurred. Phase 3 is the critical assertion — it proves transaction atomicity and isolation preserved the monetary invariant. Exit code 0 on full success, 1 if any phase fails.
+
 ## Using the Admin CLI
 
 gookv-ctl commands fall into two categories: **offline commands** (`scan`, `get`, `mvcc`, `dump`, `size`, `compact`, `region`) that read directly from a data directory via `--db` and work without a running cluster, and **online commands** (`store list`, `store status`) that communicate with a running PD server via `--pd`.

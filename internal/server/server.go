@@ -182,7 +182,12 @@ type tikvService struct {
 func (svc *tikvService) KvGet(ctx context.Context, req *kvrpcpb.GetRequest) (*kvrpcpb.GetResponse, error) {
 	resp := &kvrpcpb.GetResponse{}
 
-	value, err := svc.server.storage.Get(req.GetKey(), txntypes.TimeStamp(req.GetVersion()))
+	// Respect isolation level from request context.
+	isolationLevel := mvcc.IsolationLevelSI
+	if req.GetContext() != nil && req.GetContext().GetIsolationLevel() == kvrpcpb.IsolationLevel_RC {
+		isolationLevel = mvcc.IsolationLevelRC
+	}
+	value, err := svc.server.storage.GetWithIsolation(req.GetKey(), txntypes.TimeStamp(req.GetVersion()), isolationLevel)
 	if err != nil {
 		var lockErr *mvcc.LockError
 		if errors.As(err, &lockErr) {
@@ -520,16 +525,38 @@ func (svc *tikvService) KvCleanup(ctx context.Context, req *kvrpcpb.CleanupReque
 }
 
 // KvCheckTxnStatus implements transaction status check.
+// Handles TTL-based lock cleanup and RollbackIfNotExist.
 func (svc *tikvService) KvCheckTxnStatus(ctx context.Context, req *kvrpcpb.CheckTxnStatusRequest) (*kvrpcpb.CheckTxnStatusResponse, error) {
 	resp := &kvrpcpb.CheckTxnStatusResponse{}
 
-	txnStatus, err := svc.server.storage.CheckTxnStatus(
-		req.GetPrimaryKey(),
-		txntypes.TimeStamp(req.GetLockTs()),
+	startTS := txntypes.TimeStamp(req.GetLockTs())
+	callerStartTS := txntypes.TimeStamp(req.GetCallerStartTs())
+	rollbackIfNotExist := req.GetRollbackIfNotExist()
+
+	txnStatus, modifies, err := svc.server.storage.CheckTxnStatusWithCleanup(
+		req.GetPrimaryKey(), startTS, callerStartTS, rollbackIfNotExist,
 	)
 	if err != nil {
 		resp.Error = errToKeyError(err)
 		return resp, nil
+	}
+
+	// If the cleanup generated modifications (lock cleanup or rollback record),
+	// apply them through Raft in cluster mode, or directly in standalone mode.
+	if len(modifies) > 0 {
+		if coord := svc.server.coordinator; coord != nil {
+			if regErr, propErr := svc.proposeModifiesToRegionsWithRegionError(coord, modifies, 10*time.Second); regErr != nil {
+				resp.RegionError = regErr
+				return resp, nil
+			} else if propErr != nil {
+				return nil, status.Errorf(codes.Internal, "raft propose failed: %v", propErr)
+			}
+		} else {
+			if err := svc.server.storage.ApplyModifies(modifies); err != nil {
+				resp.Error = errToKeyError(err)
+				return resp, nil
+			}
+		}
 	}
 
 	if txnStatus.IsLocked && txnStatus.Lock != nil {
@@ -818,12 +845,9 @@ func (svc *tikvService) resolveRegionID(key []byte) uint64 {
 func (svc *tikvService) groupModifiesByRegion(modifies []mvcc.Modify) map[uint64][]mvcc.Modify {
 	groups := make(map[uint64][]mvcc.Modify)
 	for _, m := range modifies {
-		// Decode the codec-encoded key to get the raw user key for region routing.
-		rawKey, _, _ := mvcc.DecodeKey(m.Key)
-		if rawKey == nil {
-			rawKey = m.Key // fallback: use as-is if decode fails
-		}
-		regionID := svc.resolveRegionID(rawKey)
+		// Use the encoded key directly for region routing. Region boundaries
+		// also use encoded keys, so matching is correct.
+		regionID := svc.resolveRegionID(m.Key)
 		groups[regionID] = append(groups[regionID], m)
 	}
 	return groups

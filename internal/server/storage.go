@@ -72,11 +72,16 @@ func (s *Storage) ApplyModifies(modifies []mvcc.Modify) error {
 
 // Get performs a transactional point read at the given timestamp.
 func (s *Storage) Get(key []byte, version txntypes.TimeStamp) ([]byte, error) {
+	return s.GetWithIsolation(key, version, mvcc.IsolationLevelSI)
+}
+
+// GetWithIsolation performs a point read at the given timestamp with the specified isolation level.
+func (s *Storage) GetWithIsolation(key []byte, version txntypes.TimeStamp, level mvcc.IsolationLevel) ([]byte, error) {
 	snap := s.engine.NewSnapshot()
 	reader := mvcc.NewMvccReader(snap)
 	defer reader.Close()
 
-	pg := mvcc.NewPointGetter(reader, version, mvcc.IsolationLevelSI)
+	pg := mvcc.NewPointGetter(reader, version, level)
 	return pg.Get(key)
 }
 
@@ -365,7 +370,7 @@ func (s *Storage) Cleanup(key []byte, startTS txntypes.TimeStamp) (txntypes.Time
 	reader := mvcc.NewMvccReader(snap)
 	defer reader.Close()
 
-	// Check if already committed.
+	// Check if this key already has a commit/rollback record.
 	status, err := txn.CheckTxnStatus(reader, key, startTS)
 	if err != nil {
 		return 0, err
@@ -373,21 +378,81 @@ func (s *Storage) Cleanup(key []byte, startTS txntypes.TimeStamp) (txntypes.Time
 	if status.CommitTS != 0 {
 		return status.CommitTS, nil
 	}
+	if status.IsRolledBack {
+		return 0, nil
+	}
 
+	// Key has a lock. Check the PRIMARY key's status to determine commit/rollback.
+	keyLock, err := reader.LoadLock(key)
+	if err != nil {
+		return 0, err
+	}
+	if keyLock == nil || keyLock.StartTS != startTS {
+		// No lock to clean up.
+		return 0, nil
+	}
+
+	primaryKey := keyLock.Primary
 	mvccTxn := mvcc.NewMvccTxn(startTS)
+
+	// Check primary key status.
+	primaryStatus, err := txn.CheckTxnStatus(reader, primaryKey, startTS)
+	if err != nil {
+		// If primary check fails, default to rollback.
+		if rbErr := txn.Rollback(mvccTxn, reader, key, startTS); rbErr != nil {
+			return 0, rbErr
+		}
+		return 0, s.ApplyModifies(mvccTxn.Modifies)
+	}
+
+	if primaryStatus.CommitTS != 0 {
+		// Primary was committed — commit this secondary key too.
+		if err := txn.ResolveLock(mvccTxn, reader, key, startTS, primaryStatus.CommitTS); err != nil {
+			return 0, err
+		}
+		if err := s.ApplyModifies(mvccTxn.Modifies); err != nil {
+			return 0, err
+		}
+		return primaryStatus.CommitTS, nil
+	}
+
+	// Primary was rolled back or not found — rollback this key.
 	if err := txn.Rollback(mvccTxn, reader, key, startTS); err != nil {
 		return 0, err
 	}
 	return 0, s.ApplyModifies(mvccTxn.Modifies)
 }
 
-// CheckTxnStatus checks the status of a transaction.
+// CheckTxnStatus checks the status of a transaction (read-only, no cleanup).
 func (s *Storage) CheckTxnStatus(primaryKey []byte, startTS txntypes.TimeStamp) (*txn.TxnStatus, error) {
 	snap := s.engine.NewSnapshot()
 	reader := mvcc.NewMvccReader(snap)
 	defer reader.Close()
 
 	return txn.CheckTxnStatus(reader, primaryKey, startTS)
+}
+
+// CheckTxnStatusWithCleanup checks status and handles expired lock cleanup / RollbackIfNotExist.
+// Returns (status, modifies, error). modifies is non-nil when writes occurred (expired lock cleanup
+// or RollbackIfNotExist wrote a rollback record).
+func (s *Storage) CheckTxnStatusWithCleanup(primaryKey []byte, startTS, callerStartTS txntypes.TimeStamp, rollbackIfNotExist bool) (*txn.TxnStatus, []mvcc.Modify, error) {
+	cmdID := s.allocCmdID()
+	lock := s.latches.GenLock([][]byte{primaryKey})
+	for !s.latches.Acquire(lock, cmdID) {
+	}
+	defer s.latches.Release(lock, cmdID)
+
+	snap := s.engine.NewSnapshot()
+	reader := mvcc.NewMvccReader(snap)
+	defer reader.Close()
+
+	mvccTxn := mvcc.NewMvccTxn(startTS)
+	status, err := txn.CheckTxnStatusWithCleanup(mvccTxn, reader, primaryKey, startTS, callerStartTS, rollbackIfNotExist)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return status, mvccTxn.Modifies, nil
 }
 
 // PessimisticLock acquires pessimistic locks on the given keys (standalone mode).
