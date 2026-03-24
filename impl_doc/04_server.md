@@ -85,7 +85,8 @@ type Storage struct {
 
 | Method | Description |
 |---|---|
-| `Get(key, version)` | Transactional point read |
+| `Get(key, version)` | Transactional point read (delegates to `GetWithIsolation` with `IsolationLevelSI`) |
+| `GetWithIsolation(key, version, level)` | Transactional point read with configurable isolation level (SI or RC) |
 | `Scan(startKey, endKey, limit, version, keyOnly)` | Transactional range scan |
 | `BatchGet(keys, version)` | Multi-key transactional read |
 | `Prewrite(mutations, primary, startTS, lockTTL)` | 2PC phase-1 with direct engine write |
@@ -94,7 +95,8 @@ type Storage struct {
 | `CommitModifies(keys, startTS, commitTS)` | 2PC phase-2 returning `[]mvcc.Modify` |
 | `BatchRollback(keys, startTS)` | Rollback locks |
 | `Cleanup(key, startTS)` | Single-key lock cleanup |
-| `CheckTxnStatus(primaryKey, startTS)` | Transaction status inquiry |
+| `CheckTxnStatus(primaryKey, startTS)` | Transaction status inquiry (read-only) |
+| `CheckTxnStatusWithCleanup(primaryKey, startTS, callerStartTS, rollbackIfNotExist)` | Status check with TTL-based lock cleanup; returns (status, modifies, error) |
 | `PessimisticLock(keys, primary, startTS, forUpdateTS, lockTTL)` | Acquire pessimistic locks; returns errors per key |
 | `PessimisticLockModifies(keys, primary, startTS, forUpdateTS, lockTTL)` | Returns `[]mvcc.Modify` and errors per key (for Raft proposal) |
 | `PessimisticRollbackKeys(keys, startTS, forUpdateTS)` | Release pessimistic locks; returns errors per key |
@@ -299,11 +301,12 @@ KvGet(ctx, GetRequest) -> GetResponse
 ```
 
 1. Extract `key` and `version` from the `GetRequest`.
-2. Call `storage.Get(key, TimeStamp(version))`.
-3. On lock error: use `errors.As(err, &lockErr)` to extract `*mvcc.LockError`, then populate `LockInfo` via `lockToLockInfo(lockErr.Key, lockErr.Lock)` with full lock metadata (`PrimaryLock`, `LockVersion`, `LockTtl`, `TxnSize`, `ForUpdateTs`, `UseAsyncCommit`, `MinCommitTs`, `Secondaries`). This is a *logical* error, not a gRPC error.
-4. On other errors: return a gRPC `Internal` status error.
-5. If `value == nil`: set `resp.NotFound = true`.
-6. Otherwise: set `resp.Value = value`.
+2. Read the isolation level from `req.GetContext().GetIsolationLevel()`. If `IsolationLevel_RC`, use `IsolationLevelRC` (Read Committed, skips lock checks); otherwise default to `IsolationLevelSI` (Snapshot Isolation).
+3. Call `storage.GetWithIsolation(key, TimeStamp(version), isolationLevel)`.
+4. On lock error: use `errors.As(err, &lockErr)` to extract `*mvcc.LockError`, then populate `LockInfo` via `lockToLockInfo(lockErr.Key, lockErr.Lock)` with full lock metadata (`PrimaryLock`, `LockVersion`, `LockTtl`, `TxnSize`, `ForUpdateTs`, `UseAsyncCommit`, `MinCommitTs`, `Secondaries`). This is a *logical* error, not a gRPC error. (Only occurs under SI isolation; RC skips lock checks.)
+5. On other errors: return a gRPC `Internal` status error.
+6. If `value == nil`: set `resp.NotFound = true`.
+7. Otherwise: set `resp.Value = value`.
 
 ### 4.2 Region Validation (`validateRegionContext`)
 
@@ -349,6 +352,22 @@ Follows the same dual-mode pattern as KvPrewrite:
 - **Cluster**: `storage.CommitModifies` -> extract region ID from `req.GetContext().GetRegionId()` (falls back to `resolveRegionID(keys[0])` if zero) -> `coord.ProposeModifies(regionID, modifies, ...)` to propose directly to the single target region. On proposal error, converts to structured `regionError` via `proposeErrorToRegionError`. The client groups commit keys by region before sending each request, so multi-region grouping is not needed.
 - **Standalone**: `storage.Commit` -> direct engine write.
 
+### 4.5 KvCheckTxnStatus Handler Flow (dual mode)
+
+```
+KvCheckTxnStatus(ctx, CheckTxnStatusRequest) -> CheckTxnStatusResponse
+```
+
+This handler is now write-capable -- it can clean up expired locks and write protective rollback records.
+
+1. Extract `startTS` (from `LockTs`), `callerStartTS` (from `CallerStartTs`), and `rollbackIfNotExist` (from `RollbackIfNotExist`) from the request.
+2. Call `storage.CheckTxnStatusWithCleanup(primaryKey, startTS, callerStartTS, rollbackIfNotExist)`. Returns `(status, modifies, error)`.
+3. On error: populate `resp.Error` via `errToKeyError`.
+4. If `len(modifies) > 0` (cleanup occurred):
+   - **Cluster mode:** Call `proposeModifiesToRegionsWithRegionError(coord, modifies, 10s)` to apply through Raft. Return `RegionError` on routing failure.
+   - **Standalone mode:** Call `storage.ApplyModifies(modifies)` directly.
+5. Populate response: if locked, set `LockTtl` and `LockInfo`; if committed, set `CommitVersion`; if rolled back, both are zero.
+
 ---
 
 ## 5. Storage Layer
@@ -391,12 +410,16 @@ Steps 1-4 are identical to the standalone path, but step 5 is skipped. Instead:
 - The peer proposes the entry to Raft. After consensus, the `applyFunc` callback fires.
 - `applyEntries` unmarshals each committed entry back to `RaftCmdRequest`, converts the requests to modifies via `RequestsToModifies`, and calls `storage.ApplyModifies`.
 
-### 5.4 CheckTxnStatus
+### 5.4 CheckTxnStatus / CheckTxnStatusWithCleanup
 
-Does not acquire latches (read-only on lock state). Creates a snapshot and reader, then delegates to `txn.CheckTxnStatus`. Returns a `TxnStatus` struct indicating one of three states:
-- Locked (with lock info including TTL, primary, startTS).
-- Committed (with commitTS).
-- Rolled back (both LockTtl and CommitVersion are zero).
+**`CheckTxnStatus(primaryKey, startTS)`** -- Read-only. Does not acquire latches. Creates a snapshot and reader, then delegates to `txn.CheckTxnStatus`. Returns a `TxnStatus` struct indicating one of three states: Locked (with lock info), Committed (with commitTS), or Rolled back (both LockTtl and CommitVersion are zero).
+
+**`CheckTxnStatusWithCleanup(primaryKey, startTS, callerStartTS, rollbackIfNotExist)`** -- Write-capable. Acquires latches on the primary key. Creates a snapshot, reader, and `MvccTxn` accumulator, then delegates to `txn.CheckTxnStatusWithCleanup`. Returns `(*TxnStatus, []mvcc.Modify, error)`. The modifies are non-empty when the function cleaned up an expired lock (TTL-based rollback) or wrote a protective rollback record (`rollbackIfNotExist`). See `03_transaction.md` Section "CheckTxnStatusWithCleanup" for the algorithm details.
+
+**`Cleanup(key, startTS)`** -- Resolves a single key's lock by checking the **primary key's** transaction status. Acquires latches. If the key has no lock or already has a commit/rollback record, returns early. Otherwise, loads the lock to find its `Primary` field, then calls `CheckTxnStatus` on the primary key:
+1. If primary committed → commits this key via `ResolveLock(key, startTS, primaryCommitTS)`.
+2. If primary rolled back or not found → rolls back this key via `Rollback(key, startTS)`.
+3. Applies modifications directly via `ApplyModifies`.
 
 ### 5.5 Pessimistic Lock and Resolve Lock Methods
 
@@ -458,7 +481,7 @@ The following helper methods on `tikvService` enable cross-region Raft proposals
 func (svc *tikvService) groupModifiesByRegion(modifies []mvcc.Modify) map[uint64][]mvcc.Modify
 ```
 
-Groups modifications by target region. Because modify keys are MVCC codec-encoded (`EncodeLockKey` or `EncodeKey`), this function first decodes each key to the raw user key via `mvcc.DecodeKey()` before calling `ResolveRegionForKey()` on the coordinator. If decoding fails, the codec-encoded key is used as-is as a fallback. Returns `map[regionID → []Modify]`.
+Groups modifications by target region. Uses the encoded modify key directly (via `resolveRegionID(m.Key)`) for region lookup. Region boundaries are stored as MVCC-encoded keys, so the encoded modify keys match without decoding. Returns `map[regionID → []Modify]`.
 
 ```go
 func (svc *tikvService) proposeModifiesToRegions(coord *StoreCoordinator, modifies []mvcc.Modify, timeout time.Duration) error
@@ -683,11 +706,12 @@ sequenceDiagram
 
     Client->>gRPC: KvGet(GetRequest{key, version})
     gRPC->>Svc: KvGet(ctx, req)
-    Svc->>Stor: Get(key, TimeStamp(version))
+    Note over Svc: Read isolation level from request context (SI or RC)
+    Svc->>Stor: GetWithIsolation(key, TimeStamp(version), isolationLevel)
     Stor->>Eng: NewSnapshot()
     Eng-->>Stor: Snapshot
     Stor->>MVCC: NewMvccReader(snap)
-    Stor->>MVCC: NewPointGetter(reader, version, SI)
+    Stor->>MVCC: NewPointGetter(reader, version, isolationLevel)
     Stor->>MVCC: pg.Get(key)
     MVCC->>Eng: read CF_LOCK, CF_WRITE, CF_DEFAULT
     Eng-->>MVCC: data

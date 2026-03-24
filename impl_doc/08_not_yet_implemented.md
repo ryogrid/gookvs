@@ -41,7 +41,7 @@ A third implementation round (branch `cross-region-txn`, commit `616cacf16`) add
 - **TxnKVClient** — Transactional KV API entry point: `Begin()` allocates a start timestamp from PD and returns a `TxnHandle`. Supports functional options (`WithPessimistic`, `WithAsyncCommit`, `With1PC`, `WithLockTTL`).
 - **TxnHandle** — Per-transaction handle with `Get()`, `BatchGet()`, `Set()`, `Delete()`, `Commit()`, `Rollback()`. Buffers mutations in a local `membuf` and acquires pessimistic locks eagerly in pessimistic mode.
 - **LockResolver** — Resolves stale locks encountered during reads by checking transaction status (`checkTxnStatus`) and committing or rolling back (`resolveLock`). Uses a channel-based `resolving` map for deduplication.
-- **twoPhaseCommitter** — Executes the 2PC protocol: `selectPrimary` → prewrite (primary-first, secondaries parallel) → `getCommitTS` from PD → `commitPrimary` (sync) → `commitSecondaries` (background). Supports 1PC and async commit paths.
+- **twoPhaseCommitter** — Executes the 2PC protocol: `selectPrimary` → prewrite (primary-first, secondaries parallel) → `getCommitTS` from PD → `commitPrimary` (sync) → `commitSecondaries` (sync, parallel). Supports 1PC and async commit paths.
 - **Server-side enhancements** — `LockError` structured error type (in `mvcc` package) replaces bare `ErrKeyIsLocked`, enabling full `LockInfo` propagation in read RPCs via `lockToLockInfo()`. Multi-region Raft proposal routing via `proposeModifiesToRegionsWithRegionError()`. `BatchRollbackModifies()` for cluster-mode rollback.
 
 A subsequent fix (branch `new-demo-impl`, commit `e09c358fe`) resolved 6 infrastructure bugs required for cross-region transactions to work end-to-end, and added a cross-region transaction demo (`make txn-demo-start/verify/stop` with `scripts/txn-demo-verify/main.go`):
@@ -88,6 +88,17 @@ A sixth implementation round (branch `feat/pd-replication-design` + `master`, co
 | 14 | Async commit prewrite routing fix (propose all to primary region) (`internal/server/server.go`) | Done |
 | 15 | E2E test suite (16 PD replication tests) (`e2e/pd_replication_test.go`) | Done |
 
+A seventh round (branch `txn-integrity-demo`, commits `e0913492b` through `7bda1abb9`) added a **transaction integrity demo** and several bug fixes for cross-region transaction reliability:
+
+- **Transaction integrity demo** — 3-phase bank transfer stress test (`make txn-integrity-demo-start/verify/stop` with `scripts/txn-integrity-demo-verify/main.go`). Seeds 1000 accounts, runs concurrent transfers for 30 seconds, verifies total balance conservation.
+- **CheckTxnStatusWithCleanup** — New write-capable variant of `CheckTxnStatus` with TTL-based expired lock cleanup and `RollbackIfNotExist` (`internal/storage/txn/actions.go`, `internal/server/storage.go`).
+- **RC isolation level support** — `KvGet` handler now respects `IsolationLevel_RC` from request context, delegating to `Storage.GetWithIsolation()`.
+- **RegionCache key encoding fix** — `LocateKey()` now encodes raw user keys via `codec.EncodeBytes()` before comparing with MVCC-encoded region boundaries.
+- **groupModifiesByRegion routing fix** — Uses encoded modify keys directly for region routing instead of decoding back to raw keys.
+- **Pessimistic Rollback fix** — `TxnHandle.Rollback()` now calls both `pessimisticRollback` and `batchRollback` in pessimistic mode to clean up prewrite locks from partial commits.
+- **Synchronous secondary commits** — `commitSecondaries` changed from background goroutine to synchronous execution to prevent orphan locks.
+- **Cleanup handler enhancement** — `Storage.Cleanup()` now checks the primary key's transaction status before committing or rolling back a secondary key's lock.
+
 ## 2. Remaining Items
 
 | # | Category | Feature | Status | Notes |
@@ -98,6 +109,7 @@ A sixth implementation round (branch `feat/pd-replication-design` + `master`, co
 | 4 | Raftstore | Region epoch validation in handleScheduleMessage | Not implemented | Currently relies on Raft's built-in rejection. |
 | 5 | PD | Store heartbeat capacity fields | Not implemented | Capacity/Available/UsedSize not yet populated. |
 | 6 | PD | PD Raft dynamic membership change | Not implemented | PD cluster topology is fixed at startup via `--initial-cluster`. Adding or removing PD nodes at runtime requires a full cluster restart with updated topology. |
+| 7 | Transaction | Cross-region 2PC under high concurrency | Known limitation | See 2.3 |
 
 ### 2.1 BatchCoprocessor
 
@@ -110,3 +122,21 @@ This is a low-priority item since the single-region `Coprocessor` and `Coprocess
 The current PD Raft implementation uses a fixed cluster topology specified via `--initial-cluster` at startup. All PD nodes must be configured with the same initial cluster map. There is no mechanism for runtime PD node addition or removal (unlike KVS nodes, which support join mode via PD).
 
 To change the PD cluster topology, all PD nodes must be stopped and restarted with updated `--initial-cluster` flags. This is acceptable for the typical 3-or-5-node PD deployment but prevents online PD scaling.
+
+### 2.3 Cross-Region Transaction Concurrency Limitation
+
+At high concurrency (4+ concurrent writer goroutines), cross-region transactions can produce orphan prewrite locks due to region routing edge cases after region splits. This manifests as balance discrepancies in transactional workloads like the bank transfer demo.
+
+**Root causes:**
+
+1. **Secondary commit misrouting:** `KvCommit` for secondary keys in cross-region 2PC can misroute Raft proposals when the client's `RegionCache` or the server's `ResolveRegionForKey` returns a stale or incorrect region after splits.
+2. **Lock resolution routing:** `KvResolveLock` suffers from the same region routing issue, preventing automatic cleanup of orphan locks.
+
+**Mitigations applied:**
+
+- `RegionCache.LocateKey()` now encodes raw user keys via `codec.EncodeBytes()` before comparing with region boundaries (which are MVCC-encoded).
+- `groupModifiesByRegion()` now uses encoded modify keys directly for region routing instead of decoding back to raw keys.
+- `commitSecondaries` is now synchronous (not background) to ensure secondary commits complete before the transaction handle is released.
+- `Rollback()` in pessimistic mode now calls both `pessimisticRollback` and `batchRollback` to clean up both lock types.
+
+Despite these fixes, the issue persists at high concurrency due to residual routing edge cases. At low concurrency (≤2 goroutines), cross-region transaction integrity is reliably maintained. Single-region transactions are unaffected at any concurrency level.

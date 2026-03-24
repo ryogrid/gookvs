@@ -458,7 +458,7 @@ Maintains a sorted `[]*RegionInfo` slice (binary search on `StartKey`) plus a `m
 
 | Method | Description |
 |---|---|
-| `LocateKey(ctx, key)` | Returns `*RegionInfo` from cache or queries PD |
+| `LocateKey(ctx, key)` | Encodes the raw user key via `codec.EncodeBytes()` before comparing with region boundaries (which are MVCC-encoded), then returns `*RegionInfo` from cache or queries PD |
 | `InvalidateRegion(regionID)` | Removes stale cache entry |
 | `UpdateLeader(regionID, leader, storeAddr)` | Updates leader in-place |
 | `GroupKeysByRegion(ctx, keys)` | Groups keys by region for batch operations |
@@ -582,12 +582,12 @@ type TxnHandle struct {
 
 | Method | Description |
 |---|---|
-| `Get(ctx, key)` | Reads from `membuf` first, then issues `KvGet` RPC. Retries up to 3 times on lock conflicts using `LockResolver`. Returns `(value, error)`. |
+| `Get(ctx, key)` | Reads from `membuf` first, then issues `KvGet` RPC. Retries up to 20 times on lock conflicts using `LockResolver`, with a 200ms pause between retries to allow Raft proposals to be applied. Error messages include diagnostic info (lockVersion, primary key). Returns `(value, error)`. |
 | `BatchGet(ctx, keys)` | Multi-key read with membuf-first strategy. Returns `([]KvPair, error)`. |
 | `Set(ctx, key, value)` | Buffers a Put mutation. In pessimistic mode, acquires a pessimistic lock via `KvPessimisticLock` RPC. |
 | `Delete(ctx, key)` | Buffers a Delete mutation. In pessimistic mode, acquires a pessimistic lock. |
 | `Commit(ctx)` | Creates a `twoPhaseCommitter` and executes the 2PC protocol. Returns early if `membuf` is empty. |
-| `Rollback(ctx)` | Aborts the transaction. In pessimistic mode, sends `KVPessimisticRollback`; otherwise sends `KvBatchRollback` grouped by region. Idempotent. |
+| `Rollback(ctx)` | Aborts the transaction. In pessimistic mode, sends `KVPessimisticRollback` for pessimistic lock keys AND `KvBatchRollback` for mutation buffer keys (to clean up any prewrite locks from a partial commit). In optimistic mode, sends `KvBatchRollback` grouped by region. Idempotent. |
 | `StartTS()` | Returns the transaction's start timestamp. |
 
 **Error handling:** `Get` and `BatchGet` detect lock conflicts via `LockInfo` in the RPC response and call `LockResolver.ResolveLocks` before retrying.
@@ -644,8 +644,8 @@ type twoPhaseCommitter struct {
 4. **`getCommitTS`** — allocates a new timestamp from PD via `pdClient.GetTS()`.
 5. **`commitPrimary(ctx)`** — sends `KvCommit` RPC for the primary key synchronously. Skips if 1PC already committed (commitTS set during prewrite).
 6. On commit failure: calls `rollback()` and returns the error.
-7. **`commitSecondaries(ctx)`** — commits all secondary keys in a background goroutine. Groups by region and sends `KvCommit` for each group. Best-effort (errors are ignored since the primary is already committed).
-8. Returns success immediately after primary commit.
+7. **`commitSecondaries(ctx)`** — commits all secondary keys **synchronously** (not in a background goroutine). Groups by region and sends `KvCommit` for each group in parallel within `commitSecondaries`. Best-effort (errors are ignored since the primary is already committed). Changed from background to synchronous to prevent orphan prewrite locks when the calling goroutine exits before secondaries are committed.
+8. Returns success after primary commit and synchronous secondary commits.
 
 **Rollback on failure:** `rollback()` groups all mutation keys by region and sends `KvBatchRollback` for each region group in parallel.
 
@@ -688,8 +688,8 @@ sequenceDiagram
     Committer->>Store: KvCommit(primary key, sync)
     Store-->>Committer: ok
 
-    Note over Committer: Background
-    Committer->>Store: KvCommit(secondary keys, async)
+    Note over Committer: Synchronous (prevent orphan locks)
+    Committer->>Store: KvCommit(secondary keys, sync, parallel)
 
     Committer-->>TxnH: nil (success)
     TxnH-->>App: nil

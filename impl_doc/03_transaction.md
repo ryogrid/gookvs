@@ -10,7 +10,7 @@ The layer is organized into the following components:
 - **MvccTxn** (`internal/storage/mvcc/txn.go`): A write-only accumulator that collects all column-family modifications during a single transaction action and flushes them as one atomic batch.
 - **MvccReader** (`internal/storage/mvcc/reader.go`): Provides MVCC-aware reads across all column families, backed by a storage engine snapshot.
 - **PointGetter** (`internal/storage/mvcc/point_getter.go`): An optimized single-key reader supporting SI and RC isolation levels.
-- **2PC Actions** (`internal/storage/txn/actions.go`): Prewrite, Commit, Rollback, and CheckTxnStatus -- the four core Percolator protocol operations.
+- **2PC Actions** (`internal/storage/txn/actions.go`): Prewrite, Commit, Rollback, CheckTxnStatus, and CheckTxnStatusWithCleanup -- the core Percolator protocol operations.
 - **Async Commit and 1PC** (`internal/storage/txn/async_commit.go`): Optimizations that reduce latency for eligible transactions.
 - **Pessimistic Locking** (`internal/storage/txn/pessimistic.go`): Lock-before-write support for interactive transactions.
 - **Latches** (`internal/storage/txn/latch/latch.go`): Hash-based slot array providing deadlock-free command serialization.
@@ -625,6 +625,45 @@ type TxnStatus struct {
 1. **Check lock:** If a lock exists with the matching `StartTS`, return `{IsLocked: true, Lock: lock}`.
 2. **Check write record:** `GetTxnCommitRecord(primaryKey, startTS)`. If it is a Rollback, return `{IsRolledBack: true}`. Otherwise return `{CommitTS: commitTS}`.
 3. **Not found:** Return an empty `TxnStatus` (lock expired or transaction never existed).
+
+### CheckTxnStatusWithCleanup
+
+```go
+func CheckTxnStatusWithCleanup(txn *MvccTxn, reader *MvccReader, primaryKey Key,
+    startTS, callerStartTS TimeStamp, rollbackIfNotExist bool) (*TxnStatus, error)
+```
+
+A write-capable variant of `CheckTxnStatus`. Unlike the read-only version, this function takes an `MvccTxn` accumulator and may produce modifications (lock removals, rollback record writes). It handles two additional scenarios that the read-only version does not:
+
+1. **TTL-based expired lock cleanup:** If the lock's TTL has expired, force-rollback the lock.
+2. **RollbackIfNotExist:** If no lock and no commit/rollback record exists, write a protective rollback record to prevent late-arriving prewrites from succeeding.
+
+**Algorithm:**
+
+```mermaid
+flowchart TD
+    A[Load lock for primaryKey] -->|Lock exists with matching startTS| B{TTL expired?}
+    B -->|"Yes: (startTS >> 18) + TTL <= (callerStartTS >> 18)"| C["Unlock key + delete CF_DEFAULT value<br/>(if put prewrite without short_value)<br/>+ write rollback record"]
+    C --> D["Return {IsRolledBack: true}"]
+    B -->|No: lock still alive| E["Return {IsLocked: true, Lock}"]
+    A -->|No lock for this startTS| F{Commit/rollback record?}
+    F -->|Committed| G["Return {CommitTS}"]
+    F -->|Rolled back| H["Return {IsRolledBack: true}"]
+    F -->|Not found| I{rollbackIfNotExist?}
+    I -->|Yes| J["Write protective rollback record"]
+    J --> K["Return {IsRolledBack: true}"]
+    I -->|No| L["Return empty TxnStatus"]
+```
+
+The TTL check uses the HLC (Hybrid Logical Clock) physical time component. gookv timestamps encode `(physical_ms << 18) | logical`, so extracting the physical time is `ts >> 18`. A lock is considered expired when:
+
+```
+lockPhysicalTime + lock.TTL <= callerPhysicalTime
+```
+
+where `lockPhysicalTime = startTS >> 18` and `callerPhysicalTime = callerStartTS >> 18`.
+
+When rolling back an expired lock, the function distinguishes between pessimistic and optimistic locks via `lock.LockType == LockTypePessimistic` and passes this to `UnlockKey`.
 
 ### Helper Functions
 
