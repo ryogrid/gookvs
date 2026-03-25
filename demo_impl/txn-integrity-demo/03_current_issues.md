@@ -531,3 +531,18 @@ On gRPC error, `SendToRegion` called `closeConn` which closed the connection sha
 With all routing/split fixes applied, 652 transfers succeed with 32 workers. Balance still diverges $50-$200. VERIFY MISMATCH shows commit succeeds (no error) but value is wrong immediately after commit. All mismatches have `errVF=<nil> errVT=<nil>` — not a routing or lock resolution issue.
 
 This is a fundamental lost update problem: two transactions read the same key, both prewrite+commit successfully, the second overwrites the first's value. The Prewrite conflict check should detect this, but fails in some cross-region scenarios.
+
+### Additional findings (TTL test)
+
+Increasing lock TTL from 3s to 30s did NOT fix the issue. TTL-based force-rollback is NOT the root cause. The lost update occurs even with long TTL.
+
+3 consecutive runs with 32 workers: 0/3 passed (even after 1 pass observed earlier — non-deterministic).
+
+### Observed data points
+
+All VERIFY MISMATCHes have `errVF=<nil> errVT=<nil>` — commit succeeds, verification read succeeds (no lock issues), but values don't match. This means:
+- Raft apply is complete (no missing writes)
+- Lock resolution works (no blocked reads)
+- Conflict detection misses some concurrent writes
+
+The miss is likely in the **Prewrite's SeekWrite** call: it reads from a snapshot that doesn't include a concurrent commit from another region. Since the latch only covers keys within a single KvPrewrite RPC (one region), commits to the same key from different transactions via different RPCs can race.
