@@ -430,6 +430,38 @@ The bug must be in one of:
 
 - **Raft proposal ordering**: Two Prewrite proposals for the same key arrive at the same region leader. The LatchGuard should serialize them, but if the latch key space differs between the two requests (e.g., one request has keys [A, B] and another has keys [B, C]), the latches may not overlap correctly.
 
-### Next investigation step
+### Trace analysis results
 
-Add per-transaction trace logging to identify which specific transaction(s) cause balance divergence, then cross-reference with server-side Raft proposal outcomes.
+Per-transaction trace logging was added. Key findings:
+
+**Run 1 (2 workers)**: 1 discrepant account (acct:0576, +$3)
+**Run 2 (2 workers)**: 2 discrepant accounts (acct:0597 +$41, acct:0966 +$25)
+
+**Critical observation for acct:0966**:
+```
+Transfer 1: startTS=...85889 from=0966(bal=$100) to=0664 amount=$25  ← committed
+Transfer 2: startTS=...77345 from=0966(bal=$100) to=0492 amount=$24  ← committed
+```
+
+Both transfers read `acct:0966` balance as $100 and both committed successfully. Transfer 1 writes $75, Transfer 2 writes $76. The later commit overwrites the earlier one. Net loss: $25 (Transfer 1's debit is lost).
+
+**Root cause**: Cross-region 2PC commit serialization.
+
+```
+Transfer 1: primary=acct:0664 (Region 3), secondary=acct:0966 (Region 4)
+Transfer 2: primary=acct:0492 (Region 2), secondary=acct:0966 (Region 4)
+```
+
+When Transfer 1 commits:
+1. commitPrimary(acct:0664) → latch on 0664, Raft apply, latch release
+2. commitSecondaries(acct:0966) → latch on 0966, Raft apply, latch release
+
+When Transfer 2 prewrites acct:0966, the latch serializes with Transfer 1's commitSecondary. BUT Transfer 2's prewrite may execute BEFORE Transfer 1's commitSecondary if they happen to arrive at different times.
+
+The key issue: **commitPrimary(acct:0664) and prewrite(acct:0966) use DIFFERENT latches** (different keys), so they run in parallel. Transfer 2's prewrite can take a snapshot BEFORE Transfer 1's secondary commit is applied, seeing only Transfer 1's prewrite lock (not the commit record).
+
+If the lock resolver resolves Transfer 1's prewrite lock as "committed" (primary committed) and Transfer 2 retries, its new Get() may still use a startTS from BEFORE Transfer 1's commitTS, reading the pre-transfer balance ($100).
+
+**The fundamental issue**: In cross-region 2PC, the commit of the primary key does NOT prevent another transaction from reading the secondary key at a stale timestamp. The secondary's prewrite lock should block the read, but if the lock is resolved (because the primary is committed), the read succeeds with the committed value. However, if the resolution commits the secondary, the subsequent prewrite's conflict check should detect it.
+
+The remaining question is: why does the conflict check miss the committed write?

@@ -38,6 +38,14 @@ const (
 	maxTxnRetries  = 50
 )
 
+// transferRecord logs a successfully committed transfer for post-hoc analysis.
+type transferRecord struct {
+	startTS          uint64
+	from, to         int
+	fromBal, toBal   int
+	amount           int
+}
+
 func main() {
 	flag.Parse()
 
@@ -54,7 +62,8 @@ func main() {
 	}
 	fmt.Println()
 
-	if phase2(*pdAddr) {
+	var records []transferRecord
+	if phase2(*pdAddr, &records) {
 		passed++
 	}
 	fmt.Println()
@@ -64,7 +73,7 @@ func main() {
 	time.Sleep(5 * time.Second)
 	fmt.Println()
 
-	if phase3(*pdAddr) {
+	if phase3(*pdAddr, records) {
 		passed++
 	}
 
@@ -230,7 +239,7 @@ func phase1(pdAddr string) bool {
 
 // --- Phase 2: Concurrent Random Transfers ---
 
-func phase2(pdAddr string) bool {
+func phase2(pdAddr string, records *[]transferRecord) bool {
 	fmt.Printf("--- Phase 2/3: Concurrent Transfers (%d workers, %s) ---\n", numWorkers, duration)
 	fmt.Println()
 
@@ -254,6 +263,7 @@ func phase2(pdAddr string) bool {
 	var errCount atomic.Int64
 	var totalMoved atomic.Int64
 	var lastErr atomic.Value // store last error message for debugging
+	var recordsMu sync.Mutex
 
 	transferCtx, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
@@ -405,6 +415,16 @@ func phase2(pdAddr string) bool {
 
 					transfers.Add(1)
 					totalMoved.Add(int64(amount))
+					recordsMu.Lock()
+					*records = append(*records, transferRecord{
+						startTS: uint64(txn.StartTS()),
+						from:    from,
+						to:      to,
+						fromBal: fromBal,
+						toBal:   toBal,
+						amount:  amount,
+					})
+					recordsMu.Unlock()
 					transferred = true
 					break
 				}
@@ -441,7 +461,7 @@ func phase2(pdAddr string) bool {
 
 // --- Phase 3: Verify Conservation ---
 
-func phase3(pdAddr string) bool {
+func phase3(pdAddr string, records []transferRecord) bool {
 	fmt.Println("--- Phase 3/3: Verify Conservation ---")
 	fmt.Println()
 
@@ -548,6 +568,67 @@ func phase3(pdAddr string) bool {
 		return true
 	}
 	fmt.Printf("  Result: FAIL (balance mismatch: got $%d, expected $%d)\n", total, expectedTotal)
+
+	// Trace analysis: replay transfers against initial balances and compare.
+	if len(records) > 0 && len(balances) == numAccounts {
+		fmt.Println()
+		fmt.Println("  [Trace Analysis]")
+		fmt.Printf("           Replaying %d committed transfers...\n", len(records))
+
+		replayed := make([]int, numAccounts)
+		for i := range replayed {
+			replayed[i] = initialBalance
+		}
+		for _, r := range records {
+			replayed[r.from] -= r.amount
+			replayed[r.to] += r.amount
+		}
+		replayTotal := 0
+		for _, b := range replayed {
+			replayTotal += b
+		}
+		fmt.Printf("           Replayed total: $%d\n", replayTotal)
+
+		// Find discrepant accounts.
+		discrepancies := 0
+		for i := 0; i < numAccounts; i++ {
+			if replayed[i] != balances[i] {
+				discrepancies++
+				if discrepancies <= 20 {
+					fmt.Printf("           DISCREPANCY acct:%04d: replayed=$%d actual=$%d diff=%+d\n",
+						i, replayed[i], balances[i], balances[i]-replayed[i])
+				}
+			}
+		}
+		if discrepancies > 20 {
+			fmt.Printf("           ... and %d more discrepancies\n", discrepancies-20)
+		}
+		fmt.Printf("           Total discrepant accounts: %d\n", discrepancies)
+
+		// Show transfers involving discrepant accounts.
+		if discrepancies > 0 && discrepancies <= 10 {
+			discSet := make(map[int]bool)
+			for i := 0; i < numAccounts; i++ {
+				if replayed[i] != balances[i] {
+					discSet[i] = true
+				}
+			}
+			fmt.Println("           Transfers involving discrepant accounts:")
+			count := 0
+			for _, r := range records {
+				if discSet[r.from] || discSet[r.to] {
+					fmt.Printf("             startTS=%d from=%04d(bal=$%d) to=%04d(bal=$%d) amount=$%d\n",
+						r.startTS, r.from, r.fromBal, r.to, r.toBal, r.amount)
+					count++
+					if count >= 30 {
+						fmt.Println("             ... (truncated)")
+						break
+					}
+				}
+			}
+		}
+	}
+
 	return false
 }
 
