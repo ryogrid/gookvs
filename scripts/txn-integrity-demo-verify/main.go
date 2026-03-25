@@ -729,6 +729,9 @@ func cleanupOrphanLocks(ctx context.Context) int {
 
 	kvsAddrs := []string{"127.0.0.1:20470", "127.0.0.1:20471", "127.0.0.1:20472"}
 	cleaned := 0
+	committed := 0
+	rolledBack := 0
+	noAction := 0
 
 	for _, addr := range kvsAddrs {
 		dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -763,11 +766,21 @@ func cleanupOrphanLocks(ctx context.Context) int {
 				Key:          lockInfo.GetKey(),
 				StartVersion: lockInfo.GetLockVersion(),
 			})
-			if cleanupErr == nil && cleanupResp.GetError() == nil {
+			if cleanupErr == nil && cleanupResp.GetError() == nil && cleanupResp.GetRegionError() == nil {
 				cleaned++
+				if cleanupResp.GetCommitVersion() > 0 {
+					committed++
+				} else {
+					rolledBack++
+				}
+			} else {
+				noAction++
 			}
 		}
 		conn.Close()
+	}
+	if cleaned > 0 {
+		fmt.Printf("             (committed=%d, rolledBack=%d, noAction=%d)\n", committed, rolledBack, noAction)
 	}
 	return cleaned
 }
