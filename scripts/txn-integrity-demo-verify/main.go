@@ -413,6 +413,22 @@ func phase2(pdAddr string, records *[]transferRecord) bool {
 						break
 					}
 
+					// Verify the committed values by reading back immediately.
+					verifyTxn, verifyErr := txnClient.Begin(ctx)
+					if verifyErr == nil {
+						vFrom, _ := verifyTxn.Get(ctx, acctKey(from))
+						vTo, _ := verifyTxn.Get(ctx, acctKey(to))
+						_ = verifyTxn.Rollback(ctx)
+						actualFrom := parseBalance(vFrom)
+						actualTo := parseBalance(vTo)
+						expectedFrom := fromBal - amount
+						expectedTo := toBal + amount
+						if actualFrom != expectedFrom || actualTo != expectedTo {
+							fmt.Fprintf(os.Stderr, "[VERIFY MISMATCH] startTS=%d from=%04d expected=$%d actual=$%d to=%04d expected=$%d actual=$%d amount=$%d\n",
+								txn.StartTS(), from, expectedFrom, actualFrom, to, expectedTo, actualTo, amount)
+						}
+					}
+
 					transfers.Add(1)
 					totalMoved.Add(int64(amount))
 					recordsMu.Lock()
