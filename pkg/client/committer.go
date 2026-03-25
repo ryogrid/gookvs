@@ -225,6 +225,8 @@ func (c *twoPhaseCommitter) commitPrimary(ctx context.Context) error {
 }
 
 // commitSecondaries commits all secondary keys in parallel (best-effort).
+// Each key is committed individually via SendToRegion so that region cache
+// staleness after splits is handled by automatic retry with fresh LocateKey.
 func (c *twoPhaseCommitter) commitSecondaries(ctx context.Context) {
 	// If 1PC, there are no secondaries to commit.
 	if c.opts.Try1PC && len(c.mutations) <= 1 {
@@ -241,22 +243,17 @@ func (c *twoPhaseCommitter) commitSecondaries(ctx context.Context) {
 		return
 	}
 
-	groups, err := c.client.cache.GroupKeysByRegion(ctx, secondaryKeys)
-	if err != nil {
-		return
-	}
-
 	var wg sync.WaitGroup
-	for _, group := range groups {
-		group := group
+	for _, key := range secondaryKeys {
+		key := key
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := c.client.sender.SendToRegion(ctx, group.Keys[0], func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+			err := c.client.sender.SendToRegion(ctx, key, func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
 				resp, err := client.KvCommit(ctx, &kvrpcpb.CommitRequest{
 					Context:       buildContext(info),
 					StartVersion:  uint64(c.startTS),
-					Keys:          group.Keys,
+					Keys:          [][]byte{key},
 					CommitVersion: uint64(c.commitTS),
 				})
 				if err != nil {
@@ -267,21 +264,17 @@ func (c *twoPhaseCommitter) commitSecondaries(ctx context.Context) {
 				}
 				if resp.GetError() != nil {
 					if resp.GetError().GetTxnLockNotFound() != nil {
-						// Lock was resolved by another transaction's lock resolver.
-						// Ensure the secondary is properly committed by resolving it ourselves.
-						// Primary is already committed, so ResolveLock will commit.
-						lockInfo := &kvrpcpb.LockInfo{
-							PrimaryLock: c.primary,
-							LockVersion: uint64(c.startTS),
-							Key:         group.Keys[0],
-						}
-						_ = c.client.resolver.ResolveLocks(ctx, []*kvrpcpb.LockInfo{lockInfo})
+						// Lock was already resolved by another transaction's
+						// lock resolver. Since the primary is committed, the
+						// resolver will have committed this secondary too.
+						// Accept as success.
+						return nil, nil
 					}
 				}
 				return nil, nil
 			})
 			if err != nil {
-				slog.Warn("commitSecondary failed", "keys", len(group.Keys), "startTS", c.startTS, "err", err)
+				slog.Warn("commitSecondary failed", "key", key, "startTS", c.startTS, "err", err)
 			}
 		}()
 	}

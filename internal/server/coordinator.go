@@ -221,13 +221,11 @@ func (sc *StoreCoordinator) ReadIndex(regionID uint64, timeout time.Duration) er
 		return fmt.Errorf("raftstore: not leader for region %d", regionID)
 	}
 
-	// Fast path: if leader lease is valid, skip ReadIndex round-trip.
-	// ReadOnlyLeaseBased mode makes ReadIndex a local operation (no quorum
-	// check needed), so the lease optimization is less critical but still
-	// saves the Raft mailbox round-trip.
-	if peer.IsLeaseValid() {
-		return nil
-	}
+	// Leader lease is implemented but disabled: the lease confirms leadership
+	// but does not guarantee that all committed Raft entries have been applied
+	// to the engine. ReadIndex (ReadOnlySafe) guarantees both leadership AND
+	// that appliedIndex >= readIndex, preventing stale reads.
+	// TODO: re-enable after adding appliedIndex >= commitIndex check to lease path.
 
 	// Generate unique request context.
 	id := peer.NextReadID()

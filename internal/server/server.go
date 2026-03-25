@@ -23,6 +23,7 @@ import (
 	"github.com/ryogrid/gookv/internal/storage/mvcc"
 	"github.com/ryogrid/gookv/internal/storage/txn"
 	"github.com/ryogrid/gookv/pkg/cfnames"
+	"github.com/ryogrid/gookv/pkg/codec"
 	"github.com/ryogrid/gookv/pkg/pdclient"
 	"github.com/ryogrid/gookv/pkg/txntypes"
 	"google.golang.org/grpc"
@@ -449,7 +450,14 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 // KvCommit implements the second phase of 2PC.
 func (svc *tikvService) KvCommit(ctx context.Context, req *kvrpcpb.CommitRequest) (*kvrpcpb.CommitResponse, error) {
 	resp := &kvrpcpb.CommitResponse{}
-	if regErr := svc.validateRegionContext(req.GetContext(), nil); regErr != nil {
+	// Validate with the first key so that after a region split, a commit
+	// sent to the wrong region returns KeyNotInRegion (retriable) instead
+	// of proceeding and getting TxnLockNotFound (non-retriable).
+	var validateKey []byte
+	if len(req.GetKeys()) > 0 {
+		validateKey = req.GetKeys()[0]
+	}
+	if regErr := svc.validateRegionContext(req.GetContext(), validateKey); regErr != nil {
 		resp.RegionError = regErr
 		return resp, nil
 	}
@@ -983,7 +991,10 @@ func (svc *tikvService) validateRegionContext(reqCtx *kvrpcpb.Context, key []byt
 		region := peer.Region()
 		startKey := region.GetStartKey()
 		endKey := region.GetEndKey()
-		if len(startKey) > 0 && bytes.Compare(key, startKey) < 0 {
+		// Region boundaries are encoded (codec.EncodeBytes format).
+		// Encode the raw user key before comparison.
+		encodedKey := codec.EncodeBytes(nil, key)
+		if len(startKey) > 0 && bytes.Compare(encodedKey, startKey) < 0 {
 			return &errorpb.Error{
 				Message: fmt.Sprintf("key %q not in region %d [%q, %q)", key, regionID, startKey, endKey),
 				KeyNotInRegion: &errorpb.KeyNotInRegion{
@@ -994,7 +1005,7 @@ func (svc *tikvService) validateRegionContext(reqCtx *kvrpcpb.Context, key []byt
 				},
 			}
 		}
-		if len(endKey) > 0 && bytes.Compare(key, endKey) >= 0 {
+		if len(endKey) > 0 && bytes.Compare(encodedKey, endKey) >= 0 {
 			return &errorpb.Error{
 				Message: fmt.Sprintf("key %q not in region %d [%q, %q)", key, regionID, startKey, endKey),
 				KeyNotInRegion: &errorpb.KeyNotInRegion{
