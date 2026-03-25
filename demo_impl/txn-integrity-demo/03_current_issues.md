@@ -507,3 +507,27 @@ The remaining question is: why does the conflict check miss the committed write?
 3. **Balance deviation persists ($100-$500)** — Primarily caused by lock resolver rolling back secondaries whose primaries are committed. The fix for "primary locked → don't resolve" helps, but there are cases where CheckTxnStatusWithCleanup forcefully rolls back the primary (TTL expired) after commitPrimary already succeeded — creating an inconsistency.
 
 Root cause: The tight coupling between lock resolution (which can force-rollback primaries via TTL expiry) and the 2PC commit flow (which commits primaries and then secondaries). When these race, the lock resolver may rollback a secondary that should be committed.
+
+### Bug 9: PD ReportBatchSplit sets leader=nil (FIXED)
+
+`ReportBatchSplit` stored new regions with `PutRegion(region, nil)`. When client queried PD for a key in the new region, `leader=nil` was returned. Client picked first peer as leader, which may not be the node that bootstrapped the new region → "region not found".
+
+**Fix**: Set first peer as leader in `ReportBatchSplit`.
+
+### Bug 10: No immediate Raft tick after split bootstrap (FIXED)
+
+After `BootstrapRegion`, the new peer waited up to 100ms (one tick interval) before sending MsgVote to followers. During this delay, followers didn't know about the new region → "region not found" on followers.
+
+**Fix**: Send `PeerMsgTypeTick` to the new peer immediately after `BootstrapRegion`.
+
+### Bug 11: SendToRegion closes shared gRPC connection on error (FIXED)
+
+On gRPC error, `SendToRegion` called `closeConn` which closed the connection shared by all goroutines. Other goroutines' in-flight RPCs got "connection is closing" errors, cascading to 30 retry exhaustion.
+
+**Fix**: Don't close the connection on gRPC error. gRPC handles reconnection automatically.
+
+### Remaining: Lost updates (no errors, values wrong)
+
+With all routing/split fixes applied, 652 transfers succeed with 32 workers. Balance still diverges $50-$200. VERIFY MISMATCH shows commit succeeds (no error) but value is wrong immediately after commit. All mismatches have `errVF=<nil> errVT=<nil>` — not a routing or lock resolution issue.
+
+This is a fundamental lost update problem: two transactions read the same key, both prewrite+commit successfully, the second overwrites the first's value. The Prewrite conflict check should detect this, but fails in some cross-region scenarios.
