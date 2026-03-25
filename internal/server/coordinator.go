@@ -221,6 +221,14 @@ func (sc *StoreCoordinator) ReadIndex(regionID uint64, timeout time.Duration) er
 		return fmt.Errorf("raftstore: not leader for region %d", regionID)
 	}
 
+	// Fast path: if leader lease is valid, skip ReadIndex round-trip.
+	// ReadOnlyLeaseBased mode makes ReadIndex a local operation (no quorum
+	// check needed), so the lease optimization is less critical but still
+	// saves the Raft mailbox round-trip.
+	if peer.IsLeaseValid() {
+		return nil
+	}
+
 	// Generate unique request context.
 	id := peer.NextReadID()
 	requestCtx := make([]byte, 8)
@@ -245,6 +253,8 @@ func (sc *StoreCoordinator) ReadIndex(regionID uint64, timeout time.Duration) er
 	case err := <-doneCh:
 		return err
 	case <-time.After(timeout):
+		// Clean up the stale pending read so it doesn't accumulate.
+		peer.CancelPendingRead(requestCtx)
 		return fmt.Errorf("raftstore: read index timeout for region %d", regionID)
 	}
 }
@@ -700,6 +710,18 @@ func (sc *StoreCoordinator) sendRaftMessage(regionID uint64, region *metapb.Regi
 		}
 	}
 	if toStoreID == 0 {
+		return
+	}
+
+	// Loopback: if target peer is on this store, deliver directly via router
+	// instead of gRPC. This is critical for ReadIndex (ReadOnlySafe mode)
+	// which requires heartbeat responses from local follower peers.
+	if toStoreID == sc.storeID {
+		peerMsg := raftstore.PeerMsg{
+			Type: raftstore.PeerMsgTypeRaftMessage,
+			Data: msg,
+		}
+		_ = sc.router.Send(regionID, peerMsg)
 		return
 	}
 

@@ -565,3 +565,70 @@ In TiKV, this is handled by the region error retry: the wrong node returns `NotL
 **Fix needed**: Either:
 1. Make `commitSecondaries` retry on `LOCK_NOT_FOUND` (not just region errors)
 2. Or ensure the region cache is consistent between Prewrite and Commit (use the same RegionInfo)
+
+---
+
+## Status After Read Index & Region Epoch Implementation
+
+### What was implemented
+
+| Item | File(s) | Status |
+|------|---------|--------|
+| Region Epoch validation (Phase 1) | `server.go` | Complete |
+| sendRaftMessage loopback for same-store peers | `coordinator.go` | Complete |
+| ReadIndex in KvGet, KvScan, KvBatchGet | `server.go` | Complete |
+| ReadIndex in KvCheckSecondaryLocks, KvScanLock | `server.go` | Complete |
+| validateRegionContext in 7 write handlers | `server.go` | Complete |
+| Leader Lease (leaseExpiry, leaseValid, IsLeaseValid) | `peer.go` | Complete |
+| Leader Lease extension in handleReady | `peer.go` | Complete |
+| Leader Lease check in coordinator.ReadIndex | `coordinator.go` | Complete |
+| CancelPendingRead for timeout cleanup | `peer.go`, `msg.go`, `coordinator.go` | Complete |
+| ReadIndex timeout reduced to 2s | `server.go` | Complete |
+| Demo: seeding retry (20 attempts) | `main.go` | Complete |
+| Demo: split-first verification order | `main.go` | Complete |
+| Demo: RC fallback for initial balance verification | `main.go` | Complete |
+
+### Verification results
+
+| Check | Result |
+|-------|--------|
+| `go vet ./...` | Clean |
+| `make test` (3 consecutive) | PASS |
+| `make test-e2e` | PASS |
+| No `TODO(readindex)` comments | Clean |
+| Transaction integrity demo — data integrity | $100,000 exact (Phase 3 always PASS) |
+| Transaction integrity demo — 3 consecutive all-phases PASS | **BLOCKED** by ReadOnlySafe timeout |
+
+### ReadOnlySafe Timeout Issue (Open)
+
+ReadIndex with `ReadOnlySafe` mode times out persistently for some regions after splits. The root cause analysis:
+
+1. **Symptom**: `rawNode.ReadIndex()` is called, but `Ready.ReadStates` is never populated. Timeout after 2 seconds.
+
+2. **Verified working**:
+   - Followers are `recentActive=true` (heartbeat responses are being received)
+   - gRPC send latency is normal (<500ms)
+   - Raft progress shows `StateReplicate`, match=commit for all peers
+   - No message drops (`toStoreID == 0` case never hit)
+   - Protobuf conversion preserves `Context` field (field 12 in both `raftpb` and `eraftpb`)
+
+3. **Hypothesis**: The etcd raft ReadOnlySafe implementation sends a heartbeat with the ReadIndex request context embedded. When the heartbeat response arrives, raft matches the context to produce ReadStates. If the context doesn't round-trip correctly through the gRPC transport → protobuf conversion, ReadStates is never generated. Alternatively, the heartbeat broadcast for ReadIndex may be coalesced with regular heartbeats, and the context is lost.
+
+4. **ReadOnlyLeaseBased alternative**: Tested with `ReadOnlyOption: ReadOnlyLeaseBased`. ReadIndex completes instantly (no quorum round-trip needed). However, this mode caused a data integrity issue ($99,957 vs $100,000 in one run) — likely because a stale leader served reads after a leader change during splits. Not safe for ACID compliance.
+
+5. **Current configuration**: `ReadOnlySafe` with Leader Lease optimization. The lease bypasses ReadIndex for recently-confirmed leaders. This gives good performance when the lease is valid but falls back to ReadOnlySafe (which times out) when the lease expires.
+
+### Impact on Demo
+
+- **Phase 1**: Initial balance verification falls back to RC isolation (SI reads fail due to ReadIndex timeout). Data is correct.
+- **Phase 2**: Most transfers succeed (500-600 successful with 32 workers, 30s). Some VERIFY MISMATCHes occur when verify reads time out, but these are read failures not data corruption.
+- **Phase 3**: Balance conservation always PASS ($100,000 exact) using RC fallback.
+- **Demo exit code**: Fails because Phase 1 verification uses RC fallback instead of SI.
+
+### Next Steps
+
+1. **Debug ReadOnlySafe context propagation**: Add fine-grained logging to track the ReadIndex request context through the full heartbeat round-trip (leader → gRPC → follower → rawNode.Step → handleReady → response → gRPC → leader → rawNode.Step → ReadStates).
+
+2. **Consider persistent gRPC streams**: Current transport creates a new gRPC stream for each Raft message. A persistent bidirectional stream would reduce latency and may resolve timing issues.
+
+3. **Fix Bug 12 (commit to wrong node)**: The VERIFY MISMATCH errors also stem from the stale region cache in `commitSecondaries`. Fixing this would eliminate false positive VERIFY MISMATCHes independent of ReadIndex.

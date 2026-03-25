@@ -34,6 +34,8 @@ const (
 	PeerMsgTypeSchedule
 	// PeerMsgTypeReadIndex requests a linearizable read index from the Raft leader.
 	PeerMsgTypeReadIndex
+	// PeerMsgTypeCancelRead cancels a timed-out pending read.
+	PeerMsgTypeCancelRead
 )
 
 // PeerMsg is a message delivered to a peer goroutine's mailbox.

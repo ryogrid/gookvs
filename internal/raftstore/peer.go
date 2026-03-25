@@ -125,6 +125,12 @@ type Peer struct {
 	// nextReadID generates unique request contexts for ReadIndex.
 	nextReadID atomic.Uint64
 
+	// Leader lease: allows serving reads without ReadIndex round-trip
+	// when the leader has recently confirmed its leadership via heartbeats.
+	// Lease duration is 80% of election timeout (conservative).
+	leaseExpiry time.Time
+	leaseValid  atomic.Bool
+
 	// State flags.
 	stopped     atomic.Bool
 	isLeader    atomic.Bool
@@ -177,6 +183,7 @@ func NewPeer(
 		MaxSizePerMsg:   cfg.MaxSizePerMsg,
 		CheckQuorum:     true,
 		PreVote:         cfg.PreVote,
+		ReadOnlyOption:  raft.ReadOnlySafe,
 	}
 
 	rawNode, err := raft.NewRawNode(raftCfg)
@@ -245,6 +252,36 @@ func (p *Peer) SetSnapTaskCh(ch chan<- GenSnapTask) {
 // Thread-safe: uses atomic counter.
 func (p *Peer) NextReadID() uint64 {
 	return p.nextReadID.Add(1)
+}
+
+// IsLeaseValid returns true if the leader lease is currently valid.
+// Thread-safe: uses atomic bool.
+func (p *Peer) IsLeaseValid() bool {
+	if !p.leaseValid.Load() {
+		return false
+	}
+	if time.Now().After(p.leaseExpiry) {
+		p.leaseValid.Store(false)
+		return false
+	}
+	return true
+}
+
+// CancelPendingRead removes a timed-out pending read from the map.
+// Called by the coordinator when ReadIndex times out, to prevent
+// stale entries from accumulating in the peer.
+// Thread-safe: sends a cancel message via the mailbox.
+func (p *Peer) CancelPendingRead(requestCtx []byte) {
+	msg := PeerMsg{
+		Type: PeerMsgTypeCancelRead,
+		Data: requestCtx,
+	}
+	select {
+	case p.Mailbox <- msg:
+	default:
+		// Mailbox full — the pending read will be cleaned up eventually
+		// when the peer processes other messages.
+	}
 }
 
 // UpdateRegion replaces the peer's region metadata (e.g., after a split).
@@ -355,6 +392,10 @@ func (p *Peer) handleMessage(msg PeerMsg) {
 		req := msg.Data.(*ReadIndexRequest)
 		p.handleReadIndexRequest(req)
 
+	case PeerMsgTypeCancelRead:
+		ctx := msg.Data.([]byte)
+		delete(p.pendingReads, string(ctx))
+
 	default:
 		// Unknown message type; ignore.
 	}
@@ -457,8 +498,15 @@ func (p *Peer) handleReady() {
 		p.isLeader.Store(rd.SoftState.Lead == p.peerID)
 		if p.isLeader.Load() && !wasLeader {
 			p.sendRegionHeartbeatToPD()
+			// Extend leader lease on leadership confirmation.
+			electionTimeout := time.Duration(p.cfg.RaftElectionTimeoutTicks) * p.cfg.RaftBaseTickInterval
+			p.leaseExpiry = time.Now().Add(electionTimeout * 4 / 5)
+			p.leaseValid.Store(true)
 		}
-		// Cleanup pending reads on leader stepdown.
+		// Invalidate lease and cleanup pending reads on leader stepdown.
+		if !p.isLeader.Load() && wasLeader {
+			p.leaseValid.Store(false)
+		}
 		if !p.isLeader.Load() && len(p.pendingReads) > 0 {
 			for key, pr := range p.pendingReads {
 				pr.callback(fmt.Errorf("not leader for region %d", p.regionID))
@@ -509,6 +557,12 @@ func (p *Peer) handleReady() {
 	}
 
 	// Process ReadStates from ReadIndex.
+	if len(rd.ReadStates) > 0 && p.isLeader.Load() {
+		// ReadStates confirm quorum — extend leader lease.
+		electionTimeout := time.Duration(p.cfg.RaftElectionTimeoutTicks) * p.cfg.RaftBaseTickInterval
+		p.leaseExpiry = time.Now().Add(electionTimeout * 4 / 5)
+		p.leaseValid.Store(true)
+	}
 	for _, rs := range rd.ReadStates {
 		key := string(rs.RequestCtx)
 		if pr, ok := p.pendingReads[key]; ok {

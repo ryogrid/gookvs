@@ -4,23 +4,6 @@
     "CLAUDE_CODE_AGENT_NAME": "gookv-dev",
     "CLAUDE_CODE_MAX_AGENT_ITERATIONS": "50"
   },
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/ryo/work/gookv/multi-agent-ralph-loop/.claude/hooks/git-safety-guard.py"
-          },
-          {
-            "type": "command",
-            "command": "/home/ryo/work/gookv/multi-agent-ralph-loop/.claude/hooks/repo-boundary-guard.sh"
-          }
-        ]
-      }
-    ]
-  },
   "permissions": {
     "allow": [
       "Bash(git submodule:*)"

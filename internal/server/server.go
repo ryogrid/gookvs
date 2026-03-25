@@ -190,16 +190,9 @@ func (svc *tikvService) KvGet(ctx context.Context, req *kvrpcpb.GetRequest) (*kv
 	}
 
 	// ReadIndex: ensure linearizable read in cluster mode.
-	// Currently disabled pending investigation of ReadIndex timeout issues
-	// with the etcd raft library's ReadOnlySafe mode. The infrastructure
-	// (peer.handleReadIndexRequest, coordinator.ReadIndex, pendingReads)
-	// is fully implemented and ready to enable once the raft heartbeat
-	// flow is verified to support ReadIndex quorum confirmation.
-	// TODO(readindex): Enable after fixing raft ReadIndex integration.
-	/*
 	if coord := svc.server.coordinator; coord != nil && req.GetContext().GetRegionId() != 0 {
 		regionID := req.GetContext().GetRegionId()
-		if err := coord.ReadIndex(regionID, 5*time.Second); err != nil {
+		if err := coord.ReadIndex(regionID, 2*time.Second); err != nil {
 			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
 				resp.RegionError = regErr
 				return resp, nil
@@ -208,7 +201,6 @@ func (svc *tikvService) KvGet(ctx context.Context, req *kvrpcpb.GetRequest) (*kv
 			return resp, nil
 		}
 	}
-	*/
 
 	// Respect isolation level from request context.
 	isolationLevel := mvcc.IsolationLevelSI
@@ -246,16 +238,9 @@ func (svc *tikvService) KvScan(ctx context.Context, req *kvrpcpb.ScanRequest) (*
 	}
 
 	// ReadIndex: ensure linearizable read in cluster mode.
-	// Currently disabled pending investigation of ReadIndex timeout issues
-	// with the etcd raft library's ReadOnlySafe mode. The infrastructure
-	// (peer.handleReadIndexRequest, coordinator.ReadIndex, pendingReads)
-	// is fully implemented and ready to enable once the raft heartbeat
-	// flow is verified to support ReadIndex quorum confirmation.
-	// TODO(readindex): Enable after fixing raft ReadIndex integration.
-	/*
 	if coord := svc.server.coordinator; coord != nil && req.GetContext().GetRegionId() != 0 {
 		regionID := req.GetContext().GetRegionId()
-		if err := coord.ReadIndex(regionID, 5*time.Second); err != nil {
+		if err := coord.ReadIndex(regionID, 2*time.Second); err != nil {
 			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
 				resp.RegionError = regErr
 				return resp, nil
@@ -264,7 +249,6 @@ func (svc *tikvService) KvScan(ctx context.Context, req *kvrpcpb.ScanRequest) (*
 			return resp, nil
 		}
 	}
-	*/
 
 	pairs, err := svc.server.storage.Scan(
 		req.GetStartKey(),
@@ -297,6 +281,10 @@ func (svc *tikvService) KvScan(ctx context.Context, req *kvrpcpb.ScanRequest) (*
 // KvPrewrite implements the first phase of 2PC, with async commit and 1PC support.
 func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteRequest) (*kvrpcpb.PrewriteResponse, error) {
 	resp := &kvrpcpb.PrewriteResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), nil); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 
 	mutations := make([]txn.Mutation, len(req.GetMutations()))
 	for i, m := range req.GetMutations() {
@@ -461,6 +449,10 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 // KvCommit implements the second phase of 2PC.
 func (svc *tikvService) KvCommit(ctx context.Context, req *kvrpcpb.CommitRequest) (*kvrpcpb.CommitResponse, error) {
 	resp := &kvrpcpb.CommitResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), nil); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 
 	keys := req.GetKeys()
 	startTS := txntypes.TimeStamp(req.GetStartVersion())
@@ -510,16 +502,9 @@ func (svc *tikvService) KvBatchGet(ctx context.Context, req *kvrpcpb.BatchGetReq
 	}
 
 	// ReadIndex: ensure linearizable read in cluster mode.
-	// Currently disabled pending investigation of ReadIndex timeout issues
-	// with the etcd raft library's ReadOnlySafe mode. The infrastructure
-	// (peer.handleReadIndexRequest, coordinator.ReadIndex, pendingReads)
-	// is fully implemented and ready to enable once the raft heartbeat
-	// flow is verified to support ReadIndex quorum confirmation.
-	// TODO(readindex): Enable after fixing raft ReadIndex integration.
-	/*
 	if coord := svc.server.coordinator; coord != nil && req.GetContext().GetRegionId() != 0 {
 		regionID := req.GetContext().GetRegionId()
-		if err := coord.ReadIndex(regionID, 5*time.Second); err != nil {
+		if err := coord.ReadIndex(regionID, 2*time.Second); err != nil {
 			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
 				resp.RegionError = regErr
 				return resp, nil
@@ -528,7 +513,6 @@ func (svc *tikvService) KvBatchGet(ctx context.Context, req *kvrpcpb.BatchGetReq
 			return resp, nil
 		}
 	}
-	*/
 
 	pairs, err := svc.server.storage.BatchGet(
 		req.GetKeys(),
@@ -561,6 +545,10 @@ func (svc *tikvService) KvBatchGet(ctx context.Context, req *kvrpcpb.BatchGetReq
 // KvBatchRollback implements batch rollback.
 func (svc *tikvService) KvBatchRollback(ctx context.Context, req *kvrpcpb.BatchRollbackRequest) (*kvrpcpb.BatchRollbackResponse, error) {
 	resp := &kvrpcpb.BatchRollbackResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), nil); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 
 	keys := req.GetKeys()
 	startTS := txntypes.TimeStamp(req.GetStartVersion())
@@ -601,6 +589,10 @@ func (svc *tikvService) KvBatchRollback(ctx context.Context, req *kvrpcpb.BatchR
 // KvCleanup implements lock cleanup.
 func (svc *tikvService) KvCleanup(ctx context.Context, req *kvrpcpb.CleanupRequest) (*kvrpcpb.CleanupResponse, error) {
 	resp := &kvrpcpb.CleanupResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), req.GetKey()); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 
 	if coord := svc.server.coordinator; coord != nil {
 		commitTS, modifies, err, guard := svc.server.storage.CleanupModifies(
@@ -654,6 +646,10 @@ func (svc *tikvService) KvCleanup(ctx context.Context, req *kvrpcpb.CleanupReque
 // Handles TTL-based lock cleanup and RollbackIfNotExist.
 func (svc *tikvService) KvCheckTxnStatus(ctx context.Context, req *kvrpcpb.CheckTxnStatusRequest) (*kvrpcpb.CheckTxnStatusResponse, error) {
 	resp := &kvrpcpb.CheckTxnStatusResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), req.GetPrimaryKey()); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 
 	startTS := txntypes.TimeStamp(req.GetLockTs())
 	callerStartTS := txntypes.TimeStamp(req.GetCallerStartTs())
@@ -715,6 +711,10 @@ func (svc *tikvService) KvCheckTxnStatus(ctx context.Context, req *kvrpcpb.Check
 // KvPessimisticLock implements the KvPessimisticLock RPC.
 func (svc *tikvService) KvPessimisticLock(ctx context.Context, req *kvrpcpb.PessimisticLockRequest) (*kvrpcpb.PessimisticLockResponse, error) {
 	resp := &kvrpcpb.PessimisticLockResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), nil); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 
 	keys := make([][]byte, len(req.GetMutations()))
 	for i, m := range req.GetMutations() {
@@ -785,6 +785,10 @@ func (svc *tikvService) KvTxnHeartBeat(ctx context.Context, req *kvrpcpb.TxnHear
 // KvResolveLock implements the KvResolveLock RPC.
 func (svc *tikvService) KvResolveLock(ctx context.Context, req *kvrpcpb.ResolveLockRequest) (*kvrpcpb.ResolveLockResponse, error) {
 	resp := &kvrpcpb.ResolveLockResponse{}
+	if regErr := svc.validateRegionContext(req.GetContext(), nil); regErr != nil {
+		resp.RegionError = regErr
+		return resp, nil
+	}
 
 	startTS := txntypes.TimeStamp(req.GetStartVersion())
 	commitTS := txntypes.TimeStamp(req.GetCommitVersion())
@@ -827,6 +831,20 @@ func (svc *tikvService) KvResolveLock(ctx context.Context, req *kvrpcpb.ResolveL
 // KvCheckSecondaryLocks implements the KvCheckSecondaryLocks RPC for async commit.
 func (svc *tikvService) KvCheckSecondaryLocks(ctx context.Context, req *kvrpcpb.CheckSecondaryLocksRequest) (*kvrpcpb.CheckSecondaryLocksResponse, error) {
 	resp := &kvrpcpb.CheckSecondaryLocksResponse{}
+
+	// ReadIndex: ensure linearizable read in cluster mode.
+	if coord := svc.server.coordinator; coord != nil && req.GetContext().GetRegionId() != 0 {
+		regionID := req.GetContext().GetRegionId()
+		if err := coord.ReadIndex(regionID, 2*time.Second); err != nil {
+			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
+				resp.RegionError = regErr
+				return resp, nil
+			}
+			resp.RegionError = &errorpb.Error{Message: err.Error()}
+			return resp, nil
+		}
+	}
+
 	startTS := txntypes.TimeStamp(req.GetStartVersion())
 
 	statuses, commitTS, err := svc.server.storage.CheckSecondaryLocks(req.GetKeys(), startTS)
@@ -854,6 +872,19 @@ func (svc *tikvService) KvScanLock(ctx context.Context, req *kvrpcpb.ScanLockReq
 	if regErr := svc.validateRegionContext(req.GetContext(), req.GetStartKey()); regErr != nil {
 		resp.RegionError = regErr
 		return resp, nil
+	}
+
+	// ReadIndex: ensure linearizable read in cluster mode.
+	if coord := svc.server.coordinator; coord != nil && req.GetContext().GetRegionId() != 0 {
+		regionID := req.GetContext().GetRegionId()
+		if err := coord.ReadIndex(regionID, 2*time.Second); err != nil {
+			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
+				resp.RegionError = regErr
+				return resp, nil
+			}
+			resp.RegionError = &errorpb.Error{Message: err.Error()}
+			return resp, nil
+		}
 	}
 
 	results, err := svc.server.storage.ScanLock(

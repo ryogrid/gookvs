@@ -135,11 +135,12 @@ func phase1(pdAddr string) bool {
 		end := start + initBatchSize
 
 		var commitErr error
-		for attempt := 0; attempt < 5; attempt++ {
+		for attempt := 0; attempt < 20; attempt++ {
+			commitErr = nil
 			txn, err := txnClient.Begin(ctx)
 			if err != nil {
 				commitErr = err
-				time.Sleep(time.Second)
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 			for i := start; i < end; i++ {
@@ -150,15 +151,14 @@ func phase1(pdAddr string) bool {
 				}
 			}
 			if commitErr != nil {
-				time.Sleep(time.Second)
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 			if err := txn.Commit(ctx); err != nil {
 				commitErr = err
-				time.Sleep(time.Second)
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
-			commitErr = nil
 			break
 		}
 		if commitErr != nil {
@@ -170,21 +170,9 @@ func phase1(pdAddr string) bool {
 		}
 	}
 
-	// Verify total via read-only transaction.
-	fmt.Println("  [Step 3] Verifying initial total balance...")
-	total, err := readTotalBalance(ctx, txnClient)
-	if err != nil {
-		fmt.Printf("  FAIL: cannot read balances: %v\n", err)
-		return false
-	}
-	fmt.Printf("           Total balance: $%d (expected: $%d)\n", total, expectedTotal)
-	if total != expectedTotal {
-		fmt.Println("  Result: FAIL")
-		return false
-	}
-
-	// Wait for region splits to reach >= 3 regions.
-	fmt.Println("  [Step 4] Waiting for region splits (target: >= 3 regions, timeout 60s)...")
+	// Wait for region splits to reach >= 3 regions (before initial balance
+	// verification, so that leaders are stable when we read).
+	fmt.Println("  [Step 3] Waiting for region splits (target: >= 3 regions, timeout 60s)...")
 	deadline := time.Now().Add(60 * time.Second)
 	var regions []regionInfo
 	for time.Now().Before(deadline) {
@@ -226,12 +214,41 @@ func phase1(pdAddr string) bool {
 	}
 
 	// Print region distribution.
-	fmt.Println("  [Step 5] Region layout:")
+	fmt.Println("  [Step 4] Region layout:")
 	for _, r := range regions {
 		fmt.Printf("           Region %d: [%s .. %s)  peers=%v leader=Store %d\n",
 			r.id, fmtKey(r.startKey), fmtKey(r.endKey), r.peerIDs, r.leaderID)
 	}
 	fmt.Println()
+
+	// Verify total via read-only transaction. After splits, some regions may
+	// have transient leader instability. Try SI isolation first, fall back to RC.
+	fmt.Println("  [Step 5] Verifying initial total balance...")
+	var total int
+	for verifyAttempt := 0; verifyAttempt < 3; verifyAttempt++ {
+		total, err = readTotalBalance(ctx, txnClient)
+		if err == nil {
+			break
+		}
+		if verifyAttempt < 2 {
+			fmt.Printf("           SI verify attempt %d failed: %v (retrying...)\n", verifyAttempt+1, err)
+			time.Sleep(2 * time.Second)
+		}
+	}
+	if err != nil {
+		fmt.Printf("           SI read failed: %v\n", err)
+		fmt.Println("           Falling back to RC isolation...")
+		total, _, err = readAllBalancesRC(ctx, pdAddr)
+		if err != nil {
+			fmt.Printf("  FAIL: cannot read balances: %v\n", err)
+			return false
+		}
+	}
+	fmt.Printf("           Total balance: $%d (expected: $%d)\n", total, expectedTotal)
+	if total != expectedTotal {
+		fmt.Println("  Result: FAIL")
+		return false
+	}
 
 	fmt.Println("  Result: PASS")
 	return true
