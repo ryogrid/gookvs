@@ -62,7 +62,9 @@ func (p *Peer) processConfChange(
 	context []byte,
 ) *ChangePeerResult {
 	// Clone region to avoid mutating shared state.
+	p.regionMu.RLock()
 	region := cloneRegion(p.region)
+	p.regionMu.RUnlock()
 	if region.RegionEpoch == nil {
 		region.RegionEpoch = &metapb.RegionEpoch{}
 	}
@@ -82,7 +84,9 @@ func (p *Peer) processConfChange(
 		for _, existing := range region.Peers {
 			if existing.GetId() == nodeID {
 				// Already exists, update and return.
+				p.regionMu.Lock()
 				p.region = region
+				p.regionMu.Unlock()
 				return &ChangePeerResult{
 					Index:      index,
 					ChangeType: changeType,
@@ -108,7 +112,9 @@ func (p *Peer) processConfChange(
 		}
 	}
 
+	p.regionMu.Lock()
 	p.region = region
+	p.regionMu.Unlock()
 
 	return &ChangePeerResult{
 		Index:      index,
@@ -119,7 +125,10 @@ func (p *Peer) processConfChange(
 }
 
 // Region returns the current region metadata.
+// Thread-safe: uses regionMu to protect against concurrent access from gRPC handlers.
 func (p *Peer) Region() *metapb.Region {
+	p.regionMu.RLock()
+	defer p.regionMu.RUnlock()
 	return p.region
 }
 

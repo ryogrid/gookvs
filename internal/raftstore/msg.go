@@ -32,6 +32,8 @@ const (
 	PeerMsgTypeCasual
 	// PeerMsgTypeSchedule carries PD scheduling commands.
 	PeerMsgTypeSchedule
+	// PeerMsgTypeReadIndex requests a linearizable read index from the Raft leader.
+	PeerMsgTypeReadIndex
 )
 
 // PeerMsg is a message delivered to a peer goroutine's mailbox.
@@ -165,6 +167,14 @@ type ScheduleMsg struct {
 	TransferLeader *pdpb.TransferLeader
 	ChangePeer     *pdpb.ChangePeer
 	Merge          *pdpb.Merge
+}
+
+// ReadIndexRequest carries a read index request from the coordinator to the peer.
+type ReadIndexRequest struct {
+	// RequestCtx is an opaque context used to correlate the request with the response.
+	RequestCtx []byte
+	// Callback is invoked when the read index is ready (appliedIndex >= readIndex).
+	Callback func(error)
 }
 
 // Raft initialization constants (matching TiKV).

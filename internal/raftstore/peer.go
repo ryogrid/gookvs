@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -78,6 +79,7 @@ type Peer struct {
 	peerID   uint64
 	storeID  uint64
 	region   *metapb.Region
+	regionMu sync.RWMutex // protects region field (accessed from peer goroutine + gRPC handlers)
 
 	rawNode *raft.RawNode
 	storage *PeerStorage
@@ -116,10 +118,24 @@ type Peer struct {
 	// May be nil if split checking is not configured.
 	splitCheckCh chan<- split.SplitCheckTask
 
+	// pendingReads tracks in-flight read index requests.
+	// Key: string(requestCtx), Value: *pendingRead.
+	pendingReads map[string]*pendingRead
+
+	// nextReadID generates unique request contexts for ReadIndex.
+	nextReadID atomic.Uint64
+
 	// State flags.
 	stopped     atomic.Bool
 	isLeader    atomic.Bool
 	initialized bool
+}
+
+// pendingRead represents a pending read index request waiting for
+// appliedIndex to advance past readIndex.
+type pendingRead struct {
+	readIndex uint64
+	callback  func(error)
 }
 
 // NewPeer creates a new Peer for the given region.
@@ -185,6 +201,7 @@ func NewPeer(
 		cfg:              cfg,
 		Mailbox:          make(chan PeerMsg, cfg.MailboxCapacity),
 		pendingProposals: make(map[uint64]func([]byte, error)),
+		pendingReads:     make(map[string]*pendingRead),
 		initialized:      true,
 	}
 
@@ -224,8 +241,19 @@ func (p *Peer) SetSnapTaskCh(ch chan<- GenSnapTask) {
 	p.storage.SetRegion(p.region)
 }
 
+// NextReadID returns a unique ID for a ReadIndex request.
+// Thread-safe: uses atomic counter.
+func (p *Peer) NextReadID() uint64 {
+	return p.nextReadID.Add(1)
+}
+
 // UpdateRegion replaces the peer's region metadata (e.g., after a split).
-func (p *Peer) UpdateRegion(r *metapb.Region) { p.region = r }
+// Thread-safe: uses regionMu to protect against concurrent access from gRPC handlers.
+func (p *Peer) UpdateRegion(r *metapb.Region) {
+	p.regionMu.Lock()
+	defer p.regionMu.Unlock()
+	p.region = r
+}
 
 // Run starts the peer's main event loop. Blocks until the context is cancelled
 // or the peer is destroyed.
@@ -322,6 +350,10 @@ func (p *Peer) handleMessage(msg PeerMsg) {
 		p.stopped.Store(true)
 		// Drain mailbox.
 		close(p.Mailbox)
+
+	case PeerMsgTypeReadIndex:
+		req := msg.Data.(*ReadIndexRequest)
+		p.handleReadIndexRequest(req)
 
 	default:
 		// Unknown message type; ignore.
@@ -426,6 +458,13 @@ func (p *Peer) handleReady() {
 		if p.isLeader.Load() && !wasLeader {
 			p.sendRegionHeartbeatToPD()
 		}
+		// Cleanup pending reads on leader stepdown.
+		if !p.isLeader.Load() && len(p.pendingReads) > 0 {
+			for key, pr := range p.pendingReads {
+				pr.callback(fmt.Errorf("not leader for region %d", p.regionID))
+				delete(p.pendingReads, key)
+			}
+		}
 	}
 
 	// Persist entries and hard state.
@@ -465,6 +504,30 @@ func (p *Peer) handleReady() {
 			if cb, ok := p.pendingProposals[e.Index]; ok {
 				cb(e.Data, nil)
 				delete(p.pendingProposals, e.Index)
+			}
+		}
+	}
+
+	// Process ReadStates from ReadIndex.
+	for _, rs := range rd.ReadStates {
+		key := string(rs.RequestCtx)
+		if pr, ok := p.pendingReads[key]; ok {
+			pr.readIndex = rs.Index
+			if p.storage.AppliedIndex() >= rs.Index {
+				pr.callback(nil)
+				delete(p.pendingReads, key)
+			}
+		}
+	}
+
+	// Sweep pendingReads for any that are now satisfiable
+	// (applied index may have advanced from committed entries above).
+	if len(p.pendingReads) > 0 {
+		appliedIdx := p.storage.AppliedIndex()
+		for key, pr := range p.pendingReads {
+			if pr.readIndex > 0 && appliedIdx >= pr.readIndex {
+				pr.callback(nil)
+				delete(p.pendingReads, key)
 			}
 		}
 	}
@@ -649,6 +712,19 @@ func (p *Peer) sendRegionHeartbeatToPD() {
 	select {
 	case p.pdTaskCh <- info:
 	default:
+	}
+}
+
+// handleReadIndexRequest handles a linearizable read index request.
+func (p *Peer) handleReadIndexRequest(req *ReadIndexRequest) {
+	if !p.isLeader.Load() {
+		req.Callback(fmt.Errorf("not leader for region %d", p.regionID))
+		return
+	}
+	p.rawNode.ReadIndex(req.RequestCtx)
+	p.pendingReads[string(req.RequestCtx)] = &pendingRead{
+		readIndex: 0,
+		callback:  req.Callback,
 	}
 }
 

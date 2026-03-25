@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -200,6 +201,51 @@ func (sc *StoreCoordinator) applyEntries(entries []raftpb.Entry) {
 		if len(modifies) > 0 {
 			_ = sc.storage.ApplyModifies(modifies)
 		}
+	}
+}
+
+// ReadIndex performs a linearizable read index check for the given region.
+// The Raft leader confirms it is still the leader by contacting a quorum,
+// then waits for the applied index to reach the committed index.
+// Returns nil when it is safe to read from the local engine.
+func (sc *StoreCoordinator) ReadIndex(regionID uint64, timeout time.Duration) error {
+	sc.mu.RLock()
+	peer, ok := sc.peers[regionID]
+	sc.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("raftstore: region %d not found", regionID)
+	}
+
+	if !peer.IsLeader() {
+		return fmt.Errorf("raftstore: not leader for region %d", regionID)
+	}
+
+	// Generate unique request context.
+	id := peer.NextReadID()
+	requestCtx := make([]byte, 8)
+	binary.BigEndian.PutUint64(requestCtx, id)
+
+	doneCh := make(chan error, 1)
+	req := &raftstore.ReadIndexRequest{
+		RequestCtx: requestCtx,
+		Callback:   func(err error) { doneCh <- err },
+	}
+
+	msg := raftstore.PeerMsg{
+		Type: raftstore.PeerMsgTypeReadIndex,
+		Data: req,
+	}
+
+	if err := sc.router.Send(regionID, msg); err != nil {
+		return fmt.Errorf("raftstore: send read index: %w", err)
+	}
+
+	select {
+	case err := <-doneCh:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("raftstore: read index timeout for region %d", regionID)
 	}
 }
 

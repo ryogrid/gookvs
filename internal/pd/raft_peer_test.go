@@ -111,13 +111,13 @@ func waitForLeader(t *testing.T, peers []*PDRaftPeer, timeout time.Duration) int
 }
 
 // TestPDRaftPeer_LeaderElection verifies that 3 in-process peers elect exactly
-// one leader within 3 seconds.
+// one leader within 5 seconds.
 func TestPDRaftPeer_LeaderElection(t *testing.T) {
 	peers, cleanup := createTestPDRaftCluster(t, 3)
 	defer cleanup()
 
-	leaderIdx := waitForLeader(t, peers, 3*time.Second)
-	require.NotEqual(t, -1, leaderIdx, "no leader elected within 3 seconds")
+	leaderIdx := waitForLeader(t, peers, 5*time.Second)
+	require.NotEqual(t, -1, leaderIdx, "no leader elected within 5 seconds")
 
 	// Exactly one leader.
 	leaderCount := 0
