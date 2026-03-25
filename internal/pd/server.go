@@ -4,6 +4,7 @@
 package pd
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"github.com/ryogrid/gookv/internal/engine/rocks"
 	"github.com/ryogrid/gookv/internal/engine/traits"
 	"github.com/ryogrid/gookv/pkg/cfnames"
+	"github.com/ryogrid/gookv/pkg/codec"
 	"github.com/ryogrid/gookv/pkg/keys"
 )
 
@@ -1149,15 +1151,19 @@ func (m *MetadataStore) GetRegionByKey(key []byte) (*metapb.Region, *metapb.Peer
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	// Encode the raw user key to match the format of region boundaries
+	// (which use memcomparable encoding from the split checker).
+	encodedKey := codec.EncodeBytes(nil, key)
+
 	// Linear scan for simplicity. In production, use a B-tree.
 	for id, region := range m.regions {
 		startKey := region.GetStartKey()
 		endKey := region.GetEndKey()
 
-		if len(startKey) > 0 && string(key) < string(startKey) {
+		if len(startKey) > 0 && bytes.Compare(encodedKey, startKey) < 0 {
 			continue
 		}
-		if len(endKey) > 0 && string(key) >= string(endKey) {
+		if len(endKey) > 0 && bytes.Compare(encodedKey, endKey) >= 0 {
 			continue
 		}
 		return region, m.leaders[id]
