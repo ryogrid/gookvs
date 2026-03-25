@@ -264,3 +264,120 @@ The Prewrite conflict check (`SeekWrite` for commitTS > startTS) relies on the *
 - Add per-transaction logging in Phase 2 to capture: startTS, keys, read values, computed amounts, commit result
 - Cross-reference with the actual final balances to identify which transaction(s) caused the discrepancy
 - Compare `Prewrite` conflict detection with TiKV's `check_for_newer_version` implementation
+
+---
+
+## Status After Prewrite Conflict Check Loop Fix
+
+### What was fixed (commit `0bebe5b1f`)
+
+`Prewrite` conflict detection now **loops through CF_WRITE records** in descending commitTS order, skipping Rollback and Lock records, to find the most recent data-changing write. Previously it checked only the first record — if that was a Rollback, real conflicts were missed.
+
+```go
+// BEFORE: single check
+write, commitTS, _ := reader.SeekWrite(key, TSMax)
+if write != nil && commitTS > props.StartTS {
+    if write.WriteType != Rollback && write.WriteType != Lock {
+        return ErrWriteConflict  // ← missed if first record is Rollback
+    }
+}
+
+// AFTER: loop like TiKV's check_for_newer_version
+seekTS := TSMax
+for i := 0; i < SeekBound*2; i++ {
+    write, commitTS, _ := reader.SeekWrite(key, seekTS)
+    if write == nil || commitTS <= props.StartTS { break }
+    if write.WriteType != Rollback && write.WriteType != Lock {
+        return ErrWriteConflict  // ← finds conflicts hidden behind Rollbacks
+    }
+    seekTS = commitTS.Prev()  // skip and check older records
+}
+```
+
+### Current test results
+
+| Workers | Transfers | Balance | Result |
+|---------|-----------|---------|--------|
+| 1 | 409 | $100,000 | **PASS** |
+| 32 | 282–369 | $99,844–$100,164 | **FAIL** ($10–$200 deviation) |
+
+### Key observation
+
+**SI read succeeds for all 1000 accounts** — no lock resolution errors, no RC fallback needed. Yet the total balance is wrong. This means:
+
+1. All locks are properly committed or rolled back (no orphan lock issue)
+2. The committed values themselves are incorrect — some transactions committed values that violate the conservation invariant
+3. The problem is purely a concurrency issue (1 worker = PASS)
+
+### Root cause hypothesis: Lost Update via Stale Read
+
+The demo's transfer logic is:
+
+```
+1. Begin(startTS=T1)
+2. Get(from) → reads balance at T1 → $80
+3. Get(to)   → reads balance at T1 → $120
+4. Set(from, $60)  → buffer only
+5. Set(to, $140)   → buffer only
+6. Commit()  → Prewrite + Commit
+```
+
+The Prewrite conflict check verifies no other transaction has **written** to `from` or `to` since `startTS=T1`. But consider:
+
+```mermaid
+sequenceDiagram
+    participant A as Txn A (startTS=10)
+    participant B as Txn B (startTS=12)
+    participant S as Server
+
+    A->>S: Get(acct:100) → $80 at ts=10
+    B->>S: Get(acct:100) → $80 at ts=12
+    A->>S: Get(acct:200) → $120 at ts=10
+    B->>S: Get(acct:300) → $50 at ts=12
+
+    Note over A: Transfer $20: acct:100→acct:200
+    Note over B: Transfer $30: acct:100→acct:300
+
+    A->>S: Prewrite(acct:100=$60, acct:200=$140)
+    Note over S: No conflict, lock acquired
+    A->>S: Commit(commitTS=15)
+    Note over S: acct:100=$60, acct:200=$140 committed
+
+    B->>S: Prewrite(acct:100=$50, acct:200 not touched)
+    Note over S: SeekWrite(acct:100): finds Put@15 > startTS=12
+    Note over S: → ErrWriteConflict ✓
+
+    Note over B: Retry with new startTS=16
+    B->>S: Get(acct:100) → $60 at ts=16
+    B->>S: Prewrite(acct:100=$30, acct:300=$80)
+    Note over S: No conflict → commit OK
+```
+
+This scenario is correct — TxnB retries and reads the updated value. **But what if the retry logic in the demo doesn't re-read?**
+
+Looking at the demo code:
+
+```go
+for retry := 0; retry < maxTxnRetries; retry++ {
+    txn, err := txnClient.Begin(ctx)  // ← NEW startTS each retry
+    fromVal, err := txn.Get(ctx, acctKey(from))  // ← RE-READ
+    toVal, err := txn.Get(ctx, acctKey(to))      // ← RE-READ
+    // ... compute ...
+    txn.Set(...)
+    txn.Commit(ctx)
+}
+```
+
+The demo **does re-read** on each retry (new `Begin` = new `startTS` = new snapshot). So the retry logic is correct.
+
+### Remaining investigation direction
+
+The issue must be in the server-side transaction processing. Possible causes:
+
+1. **Prewrite succeeds for both keys but commit only applies to one** — partial commit where primary commits but secondary's Raft proposal is silently lost (not "not leader" error but just dropped)
+2. **The latch doesn't cover the right keys** — PrewriteModifies latches on the mutation keys, but the client sends mutations grouped by region. If a transaction has keys in Region A and Region B, two separate KvPrewrite RPCs are sent. Each one latches independently. Between them, another transaction could interleave.
+3. **commitSecondaries silently fails** — secondary commit errors are ignored. The secondary's prewrite lock remains as an orphan. The cleanup commits or rollbacks it, but by then the balance computation is wrong if the cleanup makes the wrong decision.
+
+**Most likely**: Item 3 + the `CleanupModifies` making wrong commit/rollback decisions for orphan locks. When `CleanupModifies` finds a locked secondary whose primary is "still locked" (another transaction hasn't finished), it currently **rollbacks the secondary**. But the primary may subsequently commit, resulting in: primary committed (debit applied) but secondary rolled back (credit lost).
+
+This matches the observed +$X deviation: credits are lost when secondaries are prematurely rolled back.
