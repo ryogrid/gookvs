@@ -27,8 +27,8 @@
 - [x] 4.2 make test — 3 consecutive passes
 - [x] 4.3 make test-e2e — all pass
 - [ ] 4.4 Transaction integrity demo — 3 consecutive PASSes (32 workers)
-      **BLOCKED**: ReadOnlySafe timeout prevents SI reads after splits.
-      Data integrity is correct ($100,000 exact via RC fallback).
-      See demo_impl/txn-integrity-demo/03_current_issues.md for details.
+      **BLOCKED**: ReadIndex now works (AppliedIndex fix resolved timeout).
+      Remaining blocker: Bug 12 (commit to wrong node after split) causes
+      $50-$100 balance divergence. See 03_current_issues.md for details.
 - [x] 4.5 No TODO(readindex) comments remaining
 - [x] 4.6 TODO.md fully checked
