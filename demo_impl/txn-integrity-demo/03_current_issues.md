@@ -486,6 +486,24 @@ The remaining question is: why does the conflict check miss the committed write?
 
 `committer.go:commitSecondaries()` checked `resp.GetRegionError()` but not `resp.GetError()` (KeyError). When the server returned `txn_lock_not_found` (because lock resolver already resolved the lock), the error was silently ignored. This is mostly benign (lock was already resolved) but indicates the lock resolver's decision may have been wrong.
 
-### Remaining issue
+### Bug 7: PD GetRegionByKey compares raw key against encoded boundaries (FIXED)
 
-Balance still diverges ($10-$30 range) after all fixes. Per-transfer verification (VERIFY MISMATCH) shows credit amounts that don't match — `actual > expected` for the to-account, suggesting a prior committed value is visible instead of the new one. Root cause investigation continues.
+`MetadataStore.GetRegionByKey` used `string(key) < string(startKey)` to compare raw user keys against encoded region boundaries. Raw keys always sort before encoded keys → most regions never match → PD returns nil → lock resolution fails with "max retries exhausted".
+
+**Fix**: Encode the lookup key with `codec.EncodeBytes` and compare with `bytes.Compare`.
+
+### Bug 8: SendToRegion no backoff between retries (FIXED)
+
+`SendToRegion` retried immediately on region errors. During region splits, new region peers may not be registered yet → "region not found" 30 times in ~1ms → exhausted.
+
+**Fix**: Added 100ms sleep after handling a region error.
+
+### Remaining issues
+
+1. **`commitSecondary: txn_lock_not_found`** — Lock resolver resolves the lock before commitSecondary executes. This is a normal race in Percolator 2PC. The lock resolver commits the secondary correctly (primary is committed). However, the `txn_lock_not_found` response is currently ignored.
+
+2. **`grpc: the client connection is closing`** — `SendToRegion` closes the connection on gRPC error, then retries. If it re-dials the same address, it should get a new connection. But `closeConn` may race with concurrent RPCs.
+
+3. **Balance deviation persists ($100-$500)** — Primarily caused by lock resolver rolling back secondaries whose primaries are committed. The fix for "primary locked → don't resolve" helps, but there are cases where CheckTxnStatusWithCleanup forcefully rolls back the primary (TTL expired) after commitPrimary already succeeded — creating an inconsistency.
+
+Root cause: The tight coupling between lock resolution (which can force-rollback primaries via TTL expiry) and the 2PC commit flow (which commits primaries and then secondaries). When these race, the lock resolver may rollback a secondary that should be committed.

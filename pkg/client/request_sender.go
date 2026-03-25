@@ -51,6 +51,7 @@ type RPCFunc func(client tikvpb.TikvClient, info *RegionInfo) (regionErr *errorp
 // SendToRegion locates the region for the given key, sends the RPC,
 // and retries on retriable region errors.
 func (s *RegionRequestSender) SendToRegion(ctx context.Context, key []byte, rpcFn RPCFunc) error {
+	var lastRegionErr string
 	for attempt := 0; attempt <= s.maxRetries; attempt++ {
 		info, err := s.cache.LocateKey(ctx, key)
 		if err != nil {
@@ -71,6 +72,7 @@ func (s *RegionRequestSender) SendToRegion(ctx context.Context, key []byte, rpcF
 			// gRPC-level error: invalidate and retry.
 			s.cache.InvalidateRegion(info.Region.GetId())
 			s.closeConn(info.StoreAddr)
+			lastRegionErr = fmt.Sprintf("grpc: %v", err)
 			continue
 		}
 
@@ -78,13 +80,16 @@ func (s *RegionRequestSender) SendToRegion(ctx context.Context, key []byte, rpcF
 			return nil // success
 		}
 
+		lastRegionErr = regionErr.GetMessage()
 		// Handle region errors with cache invalidation.
 		if !s.handleRegionError(ctx, info, regionErr) {
 			return fmt.Errorf("region error: %s", regionErr.GetMessage())
 		}
-		// Retry after handling.
+		// Brief backoff before retry to allow region state to stabilize
+		// (e.g., new region peers being created after a split).
+		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("max retries (%d) exhausted", s.maxRetries)
+	return fmt.Errorf("max retries (%d) exhausted (last: %s, key=%x)", s.maxRetries, lastRegionErr, key)
 }
 
 // handleRegionError processes a region error, invalidates cache as needed,
