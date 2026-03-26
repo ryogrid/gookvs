@@ -25,17 +25,25 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-var pdAddr = flag.String("pd", "127.0.0.1:2419", "PD address")
+var (
+	pdAddr         = flag.String("pd", "127.0.0.1:2419", "PD address")
+	flagAccounts   = flag.Int("accounts", 1000, "Number of accounts")
+	flagWorkers    = flag.Int("workers", 32, "Number of concurrent workers")
+	flagDuration   = flag.Duration("duration", 30*time.Second, "Transfer phase duration")
+)
 
 const (
-	numAccounts    = 1000
 	initialBalance = 100
-	expectedTotal  = numAccounts * initialBalance // $100,000
-	numWorkers     = 32
-	duration       = 30 * time.Second
 	transferMax    = 50
 	initBatchSize  = 50
 	maxTxnRetries  = 50
+)
+
+var (
+	numAccounts int
+	expectedTotal int
+	numWorkers  int
+	duration    time.Duration
 )
 
 // transferRecord logs a successfully committed transfer for post-hoc analysis.
@@ -48,6 +56,10 @@ type transferRecord struct {
 
 func main() {
 	flag.Parse()
+	numAccounts = *flagAccounts
+	expectedTotal = numAccounts * initialBalance
+	numWorkers = *flagWorkers
+	duration = *flagDuration
 
 	fmt.Println("================================================================")
 	fmt.Println("       gookv Transaction Integrity Demo")
@@ -172,8 +184,12 @@ func phase1(pdAddr string) bool {
 
 	// Wait for region splits to reach >= 3 regions (before initial balance
 	// verification, so that leaders are stable when we read).
-	fmt.Println("  [Step 3] Waiting for region splits (target: >= 3 regions, timeout 60s)...")
-	deadline := time.Now().Add(60 * time.Second)
+	splitTimeout := 30 * time.Second
+	if numAccounts <= 200 {
+		splitTimeout = 15 * time.Second
+	}
+	fmt.Printf("  [Step 3] Waiting for region splits (target: >= 3 regions, timeout %s)...\n", splitTimeout)
+	deadline := time.Now().Add(splitTimeout)
 	var regions []regionInfo
 	for time.Now().Before(deadline) {
 		regions, err = getAllRegions(ctx, pdClient)
@@ -186,14 +202,15 @@ func phase1(pdAddr string) bool {
 		time.Sleep(2 * time.Second)
 	}
 	if len(regions) < 3 {
-		fmt.Printf("  WARNING: only %d region(s) after 60s (target: 3+). Proceeding anyway.\n", len(regions))
+		fmt.Printf("  WARNING: only %d region(s) after %s (target: 3+). Proceeding anyway.\n", len(regions), splitTimeout)
 	} else {
 		fmt.Printf("           Region count: %d  Split complete!\n", len(regions))
 	}
 
 	// Wait for all regions to have leaders (important after split).
-	fmt.Println("           Waiting for all regions to elect leaders (timeout 30s)...")
-	leaderDeadline := time.Now().Add(30 * time.Second)
+	leaderTimeout := 15 * time.Second
+	fmt.Printf("           Waiting for all regions to elect leaders (timeout %s)...\n", leaderTimeout)
+	leaderDeadline := time.Now().Add(leaderTimeout)
 	for time.Now().Before(leaderDeadline) {
 		regions, err = getAllRegions(ctx, pdClient)
 		if err != nil {

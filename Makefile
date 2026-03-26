@@ -1,4 +1,6 @@
-.PHONY: test build vet proto test-e2e cluster-start cluster-stop cluster-verify pd-cluster-start pd-cluster-stop pd-cluster-verify txn-demo-start txn-demo-stop txn-demo-verify scale-demo-start scale-demo-stop scale-demo-verify pd-failover-demo-start pd-failover-demo-stop pd-failover-demo-verify txn-integrity-demo-start txn-integrity-demo-stop txn-integrity-demo-verify
+.PHONY: test vet proto test-e2e cluster-start cluster-stop cluster-verify pd-cluster-start pd-cluster-stop pd-cluster-verify txn-demo-start txn-demo-stop txn-demo-verify scale-demo-start scale-demo-stop scale-demo-verify pd-failover-demo-start pd-failover-demo-stop pd-failover-demo-verify txn-integrity-demo-start txn-integrity-demo-stop txn-integrity-demo-verify
+
+GO_SRC := $(shell find cmd/ internal/ pkg/ -name '*.go')
 
 CLUSTER_DIR = /tmp/gookv-cluster
 CLUSTER_NODES = 5
@@ -13,9 +15,15 @@ test:
 test-e2e:
 	go test ./e2e/... -v -count=1 -timeout 120s
 
-build:
+build: gookv-server gookv-ctl gookv-pd
+
+gookv-server: $(GO_SRC) go.mod go.sum
 	go build -o gookv-server ./cmd/gookv-server
+
+gookv-ctl: $(GO_SRC) go.mod go.sum
 	go build -o gookv-ctl ./cmd/gookv-ctl
+
+gookv-pd: $(GO_SRC) go.mod go.sum
 	go build -o gookv-pd ./cmd/gookv-pd
 
 vet:
