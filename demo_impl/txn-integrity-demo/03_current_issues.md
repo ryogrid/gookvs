@@ -804,8 +804,46 @@ This is a **separate bug** from the data integrity issue. The split bootstrap pr
 - **Apply-level filtering**: Removed (causes more harm than good without Raft admin command splits)
 - **Long-term**: Splits as Raft admin commands would eliminate all timing gaps
 
+---
+
+## Status After Apply-Level Filter Removal + Panic Recovery
+
+### Raft panic investigation
+
+Added `recover()` around `rawNode.Step()` with detailed logging (`[RAFT-PANIC]` tag) to catch and log the exact message that causes the panic. After removing apply-level filtering, **no panic occurred** in the 32w/1000a run. The previous crash was likely caused by the apply-level filter itself creating inconsistency between AppliedIndex and actual engine state.
+
+### 32w/1000a results
+
+| Metric | Value |
+|--------|-------|
+| Phase 1 | PASS ($100,000) |
+| Phase 2 | PASS (290 transfers, 67 conflicts) |
+| Orphan locks | committed=0, rolledBack=1 |
+| Phase 3 | **FAIL** ($99,967, −$33) |
+| DISCREPANCY | 1 account (acct:0471) |
+
+### Root cause of $33 discrepancy
+
+VERIFY MISMATCH shows: `from=0216 to=0471 amount=$33` — commit succeeded (record shows), but secondary (acct:0471) commit failed:
+```
+commitSecondary failed key="acct:0756" err="max retries (10) exhausted (last: lock not found, retrying for replication)"
+```
+
+The prewrite succeeded (client received no error), but the secondary's prewrite lock was not found at commit time. This is the same pattern as before: **prewrite's `ProposeModifies` returned success, but the Raft proposal was rejected by the epoch check or the lock was not applied**.
+
+The propose-time epoch check narrows the window but does not eliminate it entirely. Between the epoch check in `ProposeModifies` and the actual `rawNode.Propose()`, a split can change the epoch. The proposal enters the Raft log but the epoch was stale.
+
+### Current architecture limitations
+
+The remaining $33 divergence stems from a fundamental limitation: **gookv's splits are not Raft admin commands**. Without ordering guarantees between data entries and split operations in the Raft log, there will always be a timing window where a proposal can enter the log just before/after a split.
+
+TiKV solves this with:
+1. Splits as Raft admin commands (ordered in the log)
+2. Apply delegate with per-entry region metadata
+3. `CmdEpochChecker` that tracks pending admin commands
+
 ### Next Steps
 
-1. **Debug Raft log corruption**: Investigate why child regions receive parent's commit index during split bootstrap
-2. **Fix split bootstrap**: Ensure child region starts with clean Raft state (lastIndex matching actual entries)
-3. **Re-test at 32w/1000a**: After crash fix, verify data integrity at full scale
+1. Consider implementing splits as Raft admin commands (definitive fix)
+2. Alternatively, increase `commitSecondary` retry count and sleep duration to handle transient failures
+3. The `isPrimaryCommitted` check successfully handles 10+ cases per run — this is working correctly

@@ -374,11 +374,25 @@ func (p *Peer) handleMessage(msg PeerMsg) {
 	switch msg.Type {
 	case PeerMsgTypeRaftMessage:
 		raftMsg := msg.Data.(*raftpb.Message)
-		if err := p.rawNode.Step(*raftMsg); err != nil {
-			// Log error but continue — invalid messages are expected
-			// during normal operation (e.g., stale messages).
-			_ = err
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					lastIdx, _ := p.storage.LastIndex()
+					slog.Error("[RAFT-PANIC] rawNode.Step panicked",
+						"region", p.regionID, "peer", p.peerID,
+						"msgType", raftMsg.Type.String(),
+						"msgFrom", raftMsg.From, "msgTo", raftMsg.To,
+						"msgTerm", raftMsg.Term, "msgCommit", raftMsg.Commit,
+						"msgLogTerm", raftMsg.LogTerm, "msgIndex", raftMsg.Index,
+						"msgEntriesLen", len(raftMsg.Entries),
+						"localLastIndex", lastIdx,
+						"panic", r)
+				}
+			}()
+			if err := p.rawNode.Step(*raftMsg); err != nil {
+				_ = err
+			}
+		}()
 
 	case PeerMsgTypeRaftCommand:
 		cmd := msg.Data.(*RaftCommand)
