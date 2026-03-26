@@ -415,8 +415,8 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 				return resp, nil
 			}
 			regionID := req.GetContext().GetRegionId()
-			if regionID == 0 {
-				regionID = svc.resolveRegionID(primary)
+			if regionID == 0 && len(mutations) > 0 {
+				regionID = svc.resolveRegionID(mutations[0].Key)
 			}
 			if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
 				if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
@@ -456,11 +456,12 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 			return resp, nil
 		}
 		// Route modifies to the correct region. When RegionId is provided
-		// (client-grouped), propose to that single region. Otherwise, group
-		// by region for correct apply-level key range filtering.
+		// (client-grouped), propose to that single region. Otherwise, resolve
+		// using the first mutation key (not the primary lock, which may be
+		// in a different region for secondary prewrites).
 		regionID := req.GetContext().GetRegionId()
-		if regionID == 0 {
-			regionID = svc.resolveRegionID(primary)
+		if regionID == 0 && len(mutations) > 0 {
+			regionID = svc.resolveRegionID(mutations[0].Key)
 		}
 		if err := coord.ProposeModifies(regionID, modifies, 10*time.Second); err != nil {
 			if regErr := proposeErrorToRegionError(err, regionID); regErr != nil {
