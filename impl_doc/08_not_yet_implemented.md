@@ -125,32 +125,25 @@ To change the PD cluster topology, all PD nodes must be stopped and restarted wi
 
 ### 2.3 Cross-Region Transaction Concurrency Limitation
 
-At high concurrency (4+ concurrent writer goroutines), cross-region transactions can produce orphan prewrite locks due to region routing edge cases after region splits. This manifests as balance discrepancies in transactional workloads like the bank transfer demo.
+At high concurrency (32 concurrent workers), cross-region transactions show $50-$100 balance divergence in the bank transfer demo despite extensive fixes across 8 rounds.
 
-**Root causes:**
+**What has been fixed (all implemented and verified):**
 
-1. **Secondary commit misrouting:** `KvCommit` for secondary keys in cross-region 2PC can misroute Raft proposals when the client's `RegionCache` or the server's `ResolveRegionForKey` returns a stale or incorrect region after splits.
-2. **Lock resolution routing:** `KvResolveLock` suffers from the same region routing issue, preventing automatic cleanup of orphan locks.
-3. **Split key encoding mismatch (Bug 12):** Split keys were stored as raw MVCC-encoded bytes, but PD and client routing compared raw user keys — causing region boundary mismatches after splits. Commit secondary was sent to the wrong node after split.
+1. **ReadIndex protocol** (ReadOnlySafe mode) — linearizable reads via Raft quorum confirmation. Includes no-op propose for `committedEntryInCurrentTerm`, `AppliedIndex` tracking in `handleReady`, `CancelPendingRead` for timeout cleanup, `ErrMailboxFull` retry, and batch mailbox drain.
+2. **Region Epoch validation** — `validateRegionContext` checks epoch version + confVer on all RPC handlers. Returns `EpochNotMatch` with current region metadata.
+3. **Apply-level key range filtering** — `applyEntriesForPeer` filters out-of-range modify keys per-key (CF-aware: `DecodeLockKey` for CF_LOCK, `DecodeKey` for CF_WRITE/CF_DEFAULT). Matches TiKV's `check_key_in_region` in `handle_put`/`handle_delete`.
+4. **Per-key commitSecondaries** — each secondary committed individually via `SendToRegion` with retry. `TxnLockNotFound` retried 5 times before accepting as resolved.
+5. **KvCommit key range validation** — `validateRegionContext` checks key against region boundaries with `codec.EncodeBytes` encoding.
+6. **KvPrewrite per-key validation** — defense-in-depth: validates all mutation keys belong to current region when `RegionId` is set.
+7. **KvPrewrite region routing fix** — uses `mutations[0].Key` instead of primary lock key for `resolveRegionID` (primary may be in a different region for secondary prewrites).
+8. **Leader Lease** — implemented but disabled. The lease confirms leadership but does not guarantee `appliedIndex >= commitIndex`, so `ReadOnlySafe` is used instead.
+9. **LatchGuard pattern** — holds latch across Raft proposal to prevent stale snapshot reads.
+10. **Split checker boundary encoding** — decodes MVCC keys and re-encodes as `EncodeLockKey` for consistent region boundaries.
 
-**Mitigations applied (rounds 1-2):**
+**Remaining root cause: missing propose-time epoch check**
 
-- `RegionCache.LocateKey()` now encodes raw user keys via `codec.EncodeBytes()` before comparing with region boundaries (which are MVCC-encoded).
-- `groupModifiesByRegion()` now uses encoded modify keys directly for region routing instead of decoding back to raw keys.
-- `commitSecondaries` is now synchronous (not background) to ensure secondary commits complete before the transaction handle is released.
-- `Rollback()` in pessimistic mode now calls both `pessimisticRollback` and `batchRollback` to clean up both lock types.
+TiKV uses `CmdEpochChecker` to reject stale-epoch proposals BEFORE they enter the Raft log (`tikv/components/raftstore/src/store/peer.rs:4723-4731`). gookv checks epoch at the RPC level (`validateRegionContext`) but NOT at Raft propose time. Between the RPC validation and the Raft proposal, a split can change region boundaries, allowing a prewrite to be proposed to a region that no longer owns the key.
 
-**Additional mitigations (round 3 — `txn-integrity-demo-region-idx-and-epoch` branch):**
+Additionally, TiKV has store-wide latches + shared engine snapshot that serialize prewrites for the same key regardless of region. gookv also has these (`latch.New(2048)` in `storage.go`, `engine.NewSnapshot()` shared across regions), so same-key conflict detection works correctly within a single store. The issue arises when two stores each have a different region's leader for the same key range during a split transition.
 
-- **Split key re-encoding:** `scanRegionSize()` now decodes MVCC keys via `mvcc.DecodeKey()` and re-encodes as `mvcc.EncodeLockKey()` (memcomparable, no timestamp), ensuring region boundaries use a consistent format across all routing operations.
-- **PD `GetRegionByKey` key encoding:** Now encodes raw keys via `codec.EncodeBytes()` before comparing with region boundaries.
-- **PD `ReportBatchSplit` leader assignment:** Now sets the first peer as leader when storing split regions (previously passed nil).
-- **Prewrite conflict check:** Now loops through write records, skipping Rollback/Lock records to find actual data-changing write conflicts (matching TiKV's `check_for_newer_version` logic).
-- **GetWrite single-iterator scan:** Rewritten from a `SeekWrite`-based loop with `SeekBound*2` limit to a single iterator that scans all records — eliminates missed writes when many rollback records exist.
-- **CleanupModifies restructured:** Now checks lock existence first; if no lock exists, returns early. If lock exists, checks primary status, then either commits (ResolveLock) or directly removes lock and writes rollback record.
-- **LockResolver premature rollback prevention:** `resolveSingleLock` now returns nil if the primary is still locked (LockTtl > 0, CommitVersion == 0), avoiding premature rollback of in-progress transactions.
-- **commitSecondaries TxnLockNotFound handling:** Now calls `ResolveLocks` when encountering `TxnLockNotFound` (lock was resolved by another txn's lock resolver), ensuring the secondary is properly committed.
-- **SendToRegion retry backoff:** 100ms backoff between retries to allow region state to stabilize after splits. No longer closes gRPC connections on error (prevents cascading failures).
-- **Immediate Raft tick after split:** `handleSplitCheckResult` sends `PeerMsgTypeTick` to new regions to force immediate `MsgVote`, accelerating peer creation on other nodes.
-
-Despite these fixes, the issue persists at high concurrency due to the fundamental lack of Region Epoch validation and linearizable reads (reads bypass Raft). See `design_doc/region_index_and_epoch/` for the planned fix. At low concurrency (≤2 goroutines), cross-region transaction integrity is reliably maintained. Single-region transactions are unaffected at any concurrency level.
+See `design_doc/cross_region_2pc_integrity/` for the detailed design document addressing this issue.
