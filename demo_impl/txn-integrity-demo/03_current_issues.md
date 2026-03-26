@@ -842,8 +842,34 @@ TiKV solves this with:
 2. Apply delegate with per-entry region metadata
 3. `CmdEpochChecker` that tracks pending admin commands
 
+---
+
+## Status After Split as Raft Admin Command
+
+### Implementation
+
+Split is now proposed and committed through the Raft log (`split_admin.go`, tag byte 0x02). The split entry is detected in `handleReady`'s committed entries loop (alongside ConfChange) and executed via `applySplitAdminEntry` → `ExecSplitAdmin` → `UpdateRegion`. ALL entries flow to `applyFunc` unconditionally (split admin entries are harmlessly skipped at protobuf unmarshal). Child regions are bootstrapped via `handleSplitApplyResult` after the split result is received from the peer.
+
+### Test results
+
+| Scale | Result | Notes |
+|-------|--------|-------|
+| Unit tests | PASS | |
+| E2E tests | PASS | |
+| 32w/1000a | FAIL ($99,972, −$28) | No server crash. 3 DISCREPANCY accounts |
+
+### Remaining issue analysis
+
+`commitPrimary returned error but primary is committed` occurs 12 times — these are handled by `isPrimaryCommitted`. However, DISCREPANCY shows transfers where both primary and secondary values are at initial balance ($100), meaning **the prewrite lock was never applied to the engine despite prewrite success**.
+
+12 cases of `txn_lock_not_found` on commitPrimary = prewrite lock not in engine. The prewrite `ProposeModifies` succeeded (returned nil), meaning the Raft proposal was committed and the callback fired. The apply function runs unconditionally (no filtering). The lock should be in the shared engine.
+
+**Current hypothesis**: The prewrite propose succeeded, but the Raft entry was committed in a region whose leader has since changed (split caused leader transfer). The new leader's `handleReady` applies the entry but uses a different engine snapshot context. However, all regions share the same engine, so this should not matter.
+
+**Alternative hypothesis**: Raft log GC truncated the prewrite entry before it could be applied on all replicas. The entry was committed (quorum agreed) but not yet applied on the node receiving the commit request. This would explain `txn_lock_not_found` despite prewrite success.
+
 ### Next Steps
 
-1. Consider implementing splits as Raft admin commands (definitive fix)
-2. Alternatively, increase `commitSecondary` retry count and sleep duration to handle transient failures
-3. The `isPrimaryCommitted` check successfully handles 10+ cases per run — this is working correctly
+1. Add trace logging to confirm prewrite entries are being applied to the engine
+2. Investigate whether Raft log GC is truncating entries before apply on all replicas
+3. Check if `CommitModifies` reads from a stale snapshot (before prewrite apply)
