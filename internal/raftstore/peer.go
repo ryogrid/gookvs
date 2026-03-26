@@ -492,24 +492,21 @@ func (p *Peer) handleScheduleMessage(msg *ScheduleMsg) {
 
 func (p *Peer) propose(cmd *RaftCommand) {
 	if cmd.Request == nil {
-		if cmd.Callback != nil {
-			cmd.Callback(nil)
-		}
+		slog.Warn("propose: nil request", "region", p.regionID)
 		return
 	}
 
 	data, err := cmd.Request.Marshal()
 	if err != nil {
-		if cmd.Callback != nil {
-			cmd.Callback(nil)
-		}
+		slog.Warn("propose: marshal failed", "region", p.regionID, "err", err)
 		return
 	}
 
 	if err := p.rawNode.Propose(data); err != nil {
-		if cmd.Callback != nil {
-			cmd.Callback(nil)
-		}
+		slog.Warn("propose: rawNode.Propose failed", "region", p.regionID, "err", err)
+		// Do NOT call callback — let ProposeModifies timeout and return error.
+		// Calling callback with nil would make ProposeModifies report success
+		// even though the entry never entered the Raft log.
 		return
 	}
 

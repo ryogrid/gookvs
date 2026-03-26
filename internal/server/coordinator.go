@@ -212,13 +212,11 @@ func (sc *StoreCoordinator) applyEntriesForPeer(peer *raftstore.Peer, entries []
 			continue
 		}
 
-		// Apply all modifies unconditionally. The propose-time epoch check
-		// in ProposeModifies prevents stale proposals from entering the Raft
-		// log. Any proposal that passed the epoch check at propose time is
-		// valid and must be applied — filtering at apply time would silently
-		// drop committed writes when a split occurs between propose and apply,
-		// causing data loss (prewrite reports success but lock is not written).
-		_ = sc.storage.ApplyModifies(modifies)
+		// Apply all modifies unconditionally.
+		if err := sc.storage.ApplyModifies(modifies); err != nil {
+			slog.Warn("[APPLY-TRACE] ApplyModifies failed",
+				"modifies", len(modifies), "err", err)
+		}
 	}
 }
 
