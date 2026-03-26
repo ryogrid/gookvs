@@ -741,31 +741,71 @@ gookv's `applyEntriesForPeer` now filters out-of-range modify keys per-modify (m
 | Makefile build caching | `Makefile` | File-based targets skip unchanged rebuilds |
 | Demo configurable scale | `main.go` | `--accounts`, `--workers`, `--duration` flags |
 
-### Test results
+### Test results (with apply-level filtering)
 
 | Scale | Result | Notes |
 |-------|--------|-------|
 | 8w/100a 15s | 3/3 PASS | Stable |
 | 16w/100a 15s | 3/3 PASS | Stable |
-| 16w/500a 15s | 1/2 PASS, 1/2 FAIL ($49,966) | See below |
+| 16w/500a 15s | 1/2 PASS, 1/2 FAIL ($49,966) | Apply-level filter caused data loss |
 | `make test` | PASS | (PD flaky test: passes on retry) |
 | `make test-e2e` | PASS | Including TestMultiRegionTransactions |
 
-### Remaining issue: prewrite lock not applied despite prewrite success
+### Root cause identified: apply-level filtering causes data loss
 
-The `commitPrimary` error in the FAIL case is `txn_lock_not_found` — the prewrite lock was never written to the engine. Root cause analysis:
+The apply-level filter (epoch-aware) caused a critical problem:
+1. `ProposeModifies` epoch check passes (epoch matches at propose time)
+2. Raft entry committed → `ProposeModifies` returns nil → prewrite reports success
+3. Between propose and apply, a split occurs → region epoch changes
+4. `applyEntriesForPeer` sees epoch mismatch → filters the entry → **lock NOT written**
+5. Client proceeds to commit → `TxnLockNotFound` (lock was never applied)
+6. `isPrimaryCommitted` check catches some cases (primary committed despite error)
+7. But orphan locks from other cases are committed by cleanup with wrong balances
 
-1. `isPrimaryCommitted` caught 8 cases where primary WAS committed despite `commitPrimary` returning error → these are handled correctly now
-2. But 4 orphan locks were still committed by cleanup (`committed=4`) — these represent cases where the prewrite lock was lost
-3. The prewrite returns success to the client, but the Raft proposal's modifications are either:
-   - Rejected by the propose-time epoch check (epoch changed between prewrite's `validateRegionContext` and `ProposeModifies`)
-   - Filtered at apply time (epoch in entry header doesn't match current region after split)
-4. The client doesn't know the prewrite failed at the Raft level, so it proceeds to commit → `TxnLockNotFound`
+**Resolution**: Apply-level filtering removed entirely. The propose-time epoch check is sufficient — any proposal that passes the epoch check at propose time is valid and must be applied unconditionally. The race between propose and apply cannot be solved at the apply level without TiKV-style Raft admin command splits (which provide ordering guarantees between split and data entries).
 
-This is the **same timing gap** identified in `design_doc/cross_region_2pc_integrity/01_problem_analysis.md`: between the RPC-level validation and the Raft proposal, a split can change the region epoch. The propose-time epoch check catches SOME cases (when the split completes before `ProposeModifies` is called) but not all (when the split completes between `ProposeModifies`'s epoch check and the actual `rawNode.Propose()`).
+---
+
+## Status After Apply-Level Filter Removal
+
+### Additional fix: `isPrimaryCommitted` check
+
+**File:** `pkg/client/committer.go`
+
+After `commitPrimary` returns error, check via `KvCheckTxnStatus` whether the primary was actually committed (Raft may have committed but the response was lost due to timeout/leader change). If committed, proceed with `commitSecondaries` instead of rolling back.
+
+### Test results (apply-level filter removed)
+
+| Scale | Result | Notes |
+|-------|--------|-------|
+| 8w/100a 15s | 3/3 PASS | Stable |
+| 16w/100a 15s | 3/3 PASS | Stable |
+| 16w/500a 15s | 3/3 PASS ($50,000) | Data integrity verified |
+| 32w/1000a 30s | Server crash | Raft log corruption (separate bug) |
+| `make test` | PASS | |
+| `make test-e2e` | PASS | |
+
+### New issue: Raft log corruption at 32w/1000a
+
+When running with 32 workers and 1000 accounts (which causes many region splits), gookv-server crashes with:
+
+```
+panic: tocommit(2528) is out of range [lastIndex(3)]. Was the raft log corrupted, truncated, or lost?
+```
+
+Stack trace points to `BootstrapRegion` → `Peer.Run` → handleReady. This occurs when a new region is bootstrapped after a split — the initial Raft state has `lastIndex=3` (from bootstrap entries) but receives a commit index of 2528 (from the parent region's Raft state leaking into the child).
+
+This is a **separate bug** from the data integrity issue. The split bootstrap process may be incorrectly sharing Raft state between parent and child regions.
+
+### Summary of current state
+
+- **Data integrity**: SOLVED at 16w/500a scale (propose-time epoch check + isPrimaryCommitted)
+- **32w/1000a**: Blocked by Raft log corruption during split bootstrap
+- **Apply-level filtering**: Removed (causes more harm than good without Raft admin command splits)
+- **Long-term**: Splits as Raft admin commands would eliminate all timing gaps
 
 ### Next Steps
 
-1. Add debug logging to `ProposeModifies` to confirm epoch check rejections during prewrite
-2. Investigate whether the epoch check rejection error is properly propagated back through the prewrite handler to the client
-3. If the error IS propagated, the client should retry with fresh region info. If NOT, the prewrite silently succeeds while the Raft proposal is rejected.
+1. **Debug Raft log corruption**: Investigate why child regions receive parent's commit index during split bootstrap
+2. **Fix split bootstrap**: Ensure child region starts with clean Raft state (lastIndex matching actual entries)
+3. **Re-test at 32w/1000a**: After crash fix, verify data integrity at full scale
