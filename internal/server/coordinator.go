@@ -21,6 +21,8 @@ import (
 	"github.com/ryogrid/gookv/internal/raftstore/split"
 	"github.com/ryogrid/gookv/internal/server/transport"
 	"github.com/ryogrid/gookv/internal/storage/mvcc"
+	"github.com/ryogrid/gookv/pkg/cfnames"
+	"github.com/ryogrid/gookv/pkg/codec"
 	"github.com/ryogrid/gookv/pkg/pdclient"
 )
 
@@ -141,8 +143,8 @@ func (sc *StoreCoordinator) BootstrapRegion(region *metapb.Region, allPeers []ra
 	})
 
 	// Wire applyFunc to apply committed entries to the KV storage engine.
-	peer.SetApplyFunc(func(regionID uint64, entries []raftpb.Entry) {
-		sc.applyEntries(entries)
+	peer.SetApplyFunc(func(_ uint64, entries []raftpb.Entry) {
+		sc.applyEntriesForPeer(peer, entries)
 	})
 
 	// Wire PD task channel for region heartbeats.
@@ -180,8 +182,11 @@ func (sc *StoreCoordinator) BootstrapRegion(region *metapb.Region, allPeers []ra
 	return nil
 }
 
-// applyEntries applies committed Raft entries to the KV storage engine.
-func (sc *StoreCoordinator) applyEntries(entries []raftpb.Entry) {
+// applyEntriesForPeer applies committed Raft entries to the KV storage engine.
+// The peer parameter provides the region metadata for key range validation.
+// Entries whose keys fall outside the region's current range (e.g., due
+// to a concurrent split) are atomically skipped to prevent data corruption.
+func (sc *StoreCoordinator) applyEntriesForPeer(peer *raftstore.Peer, entries []raftpb.Entry) {
 	for _, entry := range entries {
 		if entry.Type != raftpb.EntryNormal || len(entry.Data) == 0 {
 			continue
@@ -196,11 +201,56 @@ func (sc *StoreCoordinator) applyEntries(entries []raftpb.Entry) {
 			continue
 		}
 
-		// Convert protobuf requests back to MVCC modifications and apply.
+		// Convert protobuf requests back to MVCC modifications.
 		modifies := RequestsToModifies(req.Requests)
-		if len(modifies) > 0 {
-			_ = sc.storage.ApplyModifies(modifies)
+		if len(modifies) == 0 {
+			continue
 		}
+
+		// Validate that ALL keys belong to the current region's range.
+		// After a split, the region's range may have shrunk. Entries
+		// proposed before the split but applied after must be rejected
+		// if their keys are now outside the range.
+		region := peer.Region()
+		startKey := region.GetStartKey()
+		endKey := region.GetEndKey()
+
+		outOfRange := false
+		for _, m := range modifies {
+			if m.Type == mvcc.ModifyTypeDeleteRange {
+				continue // DeleteRange checked separately if needed
+			}
+			// Decode the modify key to raw user key using CF-aware logic.
+			// CF_LOCK keys use EncodeLockKey (no timestamp suffix).
+			// CF_WRITE and CF_DEFAULT keys use EncodeKey (with timestamp).
+			// RawKV keys are unencoded and will fail to decode — skip them.
+			var rawKey []byte
+			if m.CF == cfnames.CFLock {
+				rawKey, _ = mvcc.DecodeLockKey(m.Key)
+			} else {
+				rawKey, _, _ = mvcc.DecodeKey(m.Key)
+			}
+			if len(rawKey) == 0 {
+				continue // unencoded key (RawKV) or decode failed — skip validation
+			}
+			encodedKey := codec.EncodeBytes(nil, rawKey)
+			if len(startKey) > 0 && bytes.Compare(encodedKey, startKey) < 0 {
+				outOfRange = true
+				break
+			}
+			if len(endKey) > 0 && bytes.Compare(encodedKey, endKey) >= 0 {
+				outOfRange = true
+				break
+			}
+		}
+
+		if outOfRange {
+			slog.Debug("applyEntries: skipping out-of-range entry",
+				"region", peer.RegionID(), "modifies", len(modifies))
+			continue
+		}
+
+		_ = sc.storage.ApplyModifies(modifies)
 	}
 }
 
@@ -462,8 +512,8 @@ func (sc *StoreCoordinator) CreatePeer(req *raftstore.CreatePeerRequest) error {
 			sc.sendRaftMessage(regionID, req.Region, req.PeerID, &msgs[i])
 		}
 	})
-	peer.SetApplyFunc(func(regionID uint64, entries []raftpb.Entry) {
-		sc.applyEntries(entries)
+	peer.SetApplyFunc(func(_ uint64, entries []raftpb.Entry) {
+		sc.applyEntriesForPeer(peer, entries)
 	})
 	if sc.pdTaskCh != nil {
 		peer.SetPDTaskCh(sc.pdTaskCh)

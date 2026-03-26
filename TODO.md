@@ -1,51 +1,24 @@
-# Read Index and Region Epoch — Complete Implementation
+# Bug 13 Fix: Apply-Level Key Range Validation
 
-## Phase 1: Region Epoch Validation (DONE)
+## Production Code
 
-- [x] 1.1-1.10 All epoch validation items complete
+- [x] 1.1 Change `applyEntries` signature to accept `regionID`
+- [x] 1.2 Update `BootstrapRegion` closure to pass `regionID` to `applyEntries`
+- [x] 1.3 Update `handleSplitCheckResult` closure (via `BootstrapRegion`) — already passes regionID
+- [x] 1.4 Implement key range validation in `applyEntries` (CF-aware decode, atomic reject)
+- [x] 1.5 Add per-key validation to KvPrewrite handler
 
-## Phase 2: Read Index Activation (DONE)
+## Unit Tests
 
-- [x] 2.1 Fix sendRaftMessage loopback for same-store peers
-- [x] 2.2 Enable ReadIndex in KvGet (uncomment)
-- [x] 2.3 Enable ReadIndex in KvScan (uncomment)
-- [x] 2.4 Enable ReadIndex in KvBatchGet (uncomment)
-- [x] 2.5 Add ReadIndex to KvCheckSecondaryLocks
-- [x] 2.6 Add ReadIndex to KvScanLock
-- [x] 2.7 Re-add validateRegionContext to 7 write handlers
+- [ ] 2.1 TestApplyEntriesSkipsOutOfRangeEntry
+- [ ] 2.2 TestApplyEntriesAcceptsInRangeEntry
+- [ ] 2.3 TestApplyEntriesHandlesMixedCFs
+- [ ] 2.4 TestApplyEntriesSkipsSplitBoundaryEntry
+- [ ] 2.5 TestKvPrewriteRejectsKeyOutOfRegion
 
-## Phase 3: Leader Lease Optimization (DONE)
+## Verification
 
-- [x] 3.1 Add leaseExpiry and leaseValid fields to Peer
-- [x] 3.2 Add IsLeaseValid() method
-- [x] 3.3 Extend lease in handleReady on leadership confirmation
-- [x] 3.4 Check lease in coordinator.ReadIndex() before Raft round-trip
-- Note: Leader Lease disabled — does not guarantee appliedIndex >= commitIndex.
-
-## Phase 3.5: ReadIndex Bug Fixes (DONE)
-
-- [x] 3.5.1 Fix AppliedIndex never updated (root cause of ReadOnlySafe timeout)
-- [x] 3.5.2 Propose no-op before ReadIndex for committedEntryInCurrentTerm gate
-- [x] 3.5.3 ErrMailboxFull retry in HandleRaftMessage
-- [x] 3.5.4 Batch mailbox drain in Peer Run loop
-
-## Phase 3.6: Bug 12 — Commit to Wrong Node After Split (DONE)
-
-- [x] 3.6.1 Rewrite commitSecondaries: per-key SendToRegion with retry
-- [x] 3.6.2 TxnLockNotFound retry with counter (5 retries before accepting)
-- [x] 3.6.3 KvCommit validates key range via validateRegionContext
-- [x] 3.6.4 Fix validateRegionContext key encoding (codec.EncodeBytes)
-
-## Phase 4: Verification
-
-- [x] 4.1 go vet clean
-- [x] 4.2 make test — 3 consecutive passes
-- [x] 4.3 make test-e2e — all pass
-- [ ] 4.4 Transaction integrity demo — 3 consecutive PASSes (32 workers)
-      Bug 12 fixes applied. Remaining: cross-region prewrite interleaving.
-      Two concurrent txns can both prewrite the same key via different
-      region leaders after a split, bypassing conflict detection because
-      each leader's snapshot doesn't see the other's prewrite (different
-      Raft groups). See 03_current_issues.md.
-- [x] 4.5 No TODO(readindex) comments remaining
-- [x] 4.6 TODO.md fully checked
+- [ ] 3.1 go vet clean
+- [ ] 3.2 make test — pass
+- [ ] 3.3 make test-e2e — pass
+- [ ] 3.4 Final: TODO.md all checked, no stale TODO comments in codebase

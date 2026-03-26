@@ -287,6 +287,41 @@ func (svc *tikvService) KvPrewrite(ctx context.Context, req *kvrpcpb.PrewriteReq
 		return resp, nil
 	}
 
+	// Defense-in-depth: validate ALL mutation keys belong to the current region.
+	// The client groups mutations by region, but after a split the grouping
+	// may be stale. Reject the entire request if any key is out of range.
+	if coord := svc.server.coordinator; coord != nil && req.GetContext().GetRegionId() != 0 {
+		peer := coord.GetPeer(req.GetContext().GetRegionId())
+		if peer != nil {
+			region := peer.Region()
+			startKey := region.GetStartKey()
+			endKey := region.GetEndKey()
+			for _, m := range req.GetMutations() {
+				encodedKey := codec.EncodeBytes(nil, m.GetKey())
+				if len(startKey) > 0 && bytes.Compare(encodedKey, startKey) < 0 {
+					resp.RegionError = &errorpb.Error{
+						Message: fmt.Sprintf("key %q not in region %d", m.GetKey(), req.GetContext().GetRegionId()),
+						KeyNotInRegion: &errorpb.KeyNotInRegion{
+							Key: m.GetKey(), RegionId: req.GetContext().GetRegionId(),
+							StartKey: startKey, EndKey: endKey,
+						},
+					}
+					return resp, nil
+				}
+				if len(endKey) > 0 && bytes.Compare(encodedKey, endKey) >= 0 {
+					resp.RegionError = &errorpb.Error{
+						Message: fmt.Sprintf("key %q not in region %d", m.GetKey(), req.GetContext().GetRegionId()),
+						KeyNotInRegion: &errorpb.KeyNotInRegion{
+							Key: m.GetKey(), RegionId: req.GetContext().GetRegionId(),
+							StartKey: startKey, EndKey: endKey,
+						},
+					}
+					return resp, nil
+				}
+			}
+		}
+	}
+
 	mutations := make([]txn.Mutation, len(req.GetMutations()))
 	for i, m := range req.GetMutations() {
 		var op txn.MutationOp
