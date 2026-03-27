@@ -4,7 +4,7 @@
 
 This document tracks features in the gookv codebase that are not yet fully implemented or remain partially complete. Items are verified against the Go source code.
 
-As of 2026-03-20, two rounds of feature completion have been performed, followed by a cross-region transactional client implementation. The first round (branch `feat/remaining-items-and-multiregion-e2e`) addressed 12 items, and the second round (branch `feature/lack-features-3`, commit `c52b215b7`) implemented 6 additional features. The features implemented in the first round were:
+As of 2026-03-28, nine rounds of feature completion have been performed, followed by a cross-region transactional client implementation. The first round (branch `feat/remaining-items-and-multiregion-e2e`) addressed 12 items, and the second round (branch `feature/lack-features-3`, commit `c52b215b7`) implemented 6 additional features. The features implemented in the first round were:
 
 - **Async Commit / 1PC gRPC path** — `KvPrewrite` handler routes to 1PC or async commit paths based on request flags.
 - **KvCheckSecondaryLocks** — Full handler with lock inspection and commit detection.
@@ -99,6 +99,87 @@ A seventh round (branch `txn-integrity-demo`, commits `e0913492b` through `7bda1
 - **Synchronous secondary commits** — `commitSecondaries` changed from background goroutine to synchronous execution to prevent orphan locks.
 - **Cleanup handler enhancement** — `Storage.Cleanup()` now checks the primary key's transaction status before committing or rolling back a secondary key's lock.
 
+An eighth round (branch `external-e2e-tests`) added an **E2E test library** and migrated existing tests from internal-API-based to external-binary-based testing:
+
+- **pkg/e2elib/** — PostgreSQL TAP-style test library for managing external gookv-server and gookv-pd processes:
+  - `GokvNode` — manages a single gookv-server process (start/stop/restart, port allocation, log capture).
+  - `PDNode` — manages a single gookv-pd process.
+  - `GokvCluster` — orchestrates PD + N gookv-server nodes with auto-split configuration support.
+  - `PDCluster` — manages multi-node PD clusters with Raft replication (`--initial-cluster`, `--pd-id`).
+  - `PortAllocator` — file-based flock port allocation (range 10200–32767).
+  - Test helpers: `WaitForCondition`, `WaitForRegionCount`, `WaitForStoreCount`, `WaitForRegionLeader`, `SeedAccounts`, `ReadAllBalances`, `DialTikvClient`.
+- **e2e_external/** — 72 external-binary-based tests across 15 files, covering raw KV, transactions, async commit, cluster operations, multi-region routing, PD replication, region splits, add-node, and leader failover.
+- **Standalone server mode** — `gookv-server` auto-detects standalone mode when no `--store-id`, `--pd-endpoints`, or `--initial-cluster` flags are provided. PD endpoint validation relaxed to allow empty endpoints.
+- **Makefile** — `test-e2e-external` target (depends on `build`).
+
+A ninth round (branch `apply-review-result`) applied fixes for a **comprehensive code review** covering all 77 identified issues (19 Critical, 25 High, 33 Medium) across the entire codebase:
+
+**Storage/MVCC layer:**
+- Backward scan iterator bound conditions fixed (`scanner.go`).
+- PointGetter now skips pessimistic locks (invisible to readers, matching Scanner behavior).
+- Async commit prewrite conflict check loops through `SeekBound*2` write records (matching regular Prewrite).
+- `CleanupModifies` writes rollback record on primary check failure (prevents late commit).
+- Latch `AcquireBlocking` with channel-based wake (replaces 21 spin-wait sites in `storage.go`).
+- GC worker acquires latches per batch before writing; shared atomic command ID counter with Storage.
+- GC removes orphaned Delete markers when no older Put versions exist.
+
+**Client library:**
+- Region cache evicts overlapping stale entries after split.
+- `BatchGet` groups keys by region (was sending all to single region).
+- `isPrimaryCommitted` returns error instead of swallowing.
+- Deterministic primary key selection (lexicographic sort, cached).
+- `DeleteRange` and `Checksum` span region boundaries.
+- `commitSecondaries` batched by region with per-key fallback on `TxnLockNotFound`.
+- `Scan` recomputes region bounds inside `SendToRegion` callback for fresh boundaries on retry.
+- `LockResolver` resolving map periodically recreated to allow GC of old backing array.
+
+**Server/RPC layer:**
+- `KVPessimisticRollback` and `KvTxnHeartBeat` routed through Raft in cluster mode (were bypassing replication).
+- Region validation (`validateRegionContext`) added to `RawPut`, `RawDelete`, `KVPessimisticRollback`, `KvTxnHeartBeat`.
+- `KvDeleteRange` uses request region ID instead of hardcoded `1`.
+- Long-lived gRPC stream per store for Raft transport (replaces per-message stream creation).
+- Connection pool round-robin via atomic counter (was hardcoded index 0).
+- Loopback routing resolves target peer's region ID via `FindRegionByPeerID`.
+- `ReadPool.Stop()` drains pending tasks before returning.
+
+**Raft layer:**
+- `RecoverFromEngine` restores `ApplyState` from disk (was resetting to defaults on restart).
+- `PersistApplyState` called in `handleReady` after committed entries (was never persisted).
+- `InitialState` derives `ConfState` from region peer list (was returning empty).
+- `ApplySnapshot` passes region start/end keys to clear stale data.
+- Proposal callback redesign: monotonic proposal ID embedded in entry data, replaces `lastIdx+1` index tracking.
+- Admin entries (ConfChange, SplitAdmin, CompactLog) filtered from `applyFunc` input.
+- `failAllPendingProposals` on leader stepdown; `sweepStaleProposals` for timeout cleanup.
+- `PeerMsgTypeDestroy` no longer closes Mailbox (prevents panic on concurrent sends).
+- `leaseExpiry` stored as `atomic.Int64` (was unprotected `time.Time`).
+- `handleReady` guarded by `stopped` flag check.
+- `readEntriesFromEngine` returns error on entry gap.
+
+**PD layer:**
+- Atomic bootstrap in Raft mode (single `CmdSetBootstrapped` proposal with Store + Region).
+- `ReportBatchSplit` sets Leader field in Raft mode proposals.
+- FIFO proposal tracking replaces index-based map (`LastIndex()+1` bug).
+- `PDSnapshot` includes `StoreLastHeartbeat` for state transfer.
+- TSO overflow advances physical to `max(physical+1, now_ms)`.
+- Scheduler excludes leader peer from excess replica shedding.
+- `GCSafePointManager` uses `RWMutex` for reads.
+- `MockClient` TSO protected by mutex.
+
+**Entry/Config/Codec:**
+- Coprocessor Float64 encoding uses `math.Float64bits`/`Float64frombits` (was reading `I64` field).
+- `--store-id=0` with `--initial-cluster` validated as error.
+- `SelectionExecutor` uses kind-aware `IsZeroValue()` truthiness check.
+- `ReadableSize` parser uses `strconv.ParseUint` with validation.
+- `parseInitialCluster` returns fatal error on malformed entries.
+- Config validates `StatusAddr` non-empty.
+- `EncodeRPNExpression` handles all constant types (Uint64, Float64, Bytes, Null).
+
+**Infrastructure:**
+- gRPC upgraded from v1.59.0 to v1.79.3; `grpc.Dial` migrated to `grpc.NewClient`.
+- `ExecCommitMerge` dead code removed; error returned for non-adjacent regions.
+
+See `review_results/` for detailed review reports and design documents.
+
 ## 2. Remaining Items
 
 | # | Category | Feature | Status | Notes |
@@ -109,7 +190,8 @@ A seventh round (branch `txn-integrity-demo`, commits `e0913492b` through `7bda1
 | 4 | Raftstore | Region epoch validation in handleScheduleMessage | Not implemented | Currently relies on Raft's built-in rejection. |
 | 5 | PD | Store heartbeat capacity fields | Not implemented | Capacity/Available/UsedSize not yet populated. |
 | 6 | PD | PD Raft dynamic membership change | Not implemented | PD cluster topology is fixed at startup via `--initial-cluster`. Adding or removing PD nodes at runtime requires a full cluster restart with updated topology. |
-| 7 | Transaction | Cross-region 2PC under high concurrency | Known limitation | See 2.3 |
+| 7 | Transaction | Cross-region 2PC under high concurrency | **RESOLVED** | See 2.3. Fully functional after 10 cumulative fixes. |
+| 8 | Raftstore | Split key selection from dominant CF | Deferred | `scanRegionSize` picks split key from whichever CF reaches the midpoint first. Low impact — splits may be slightly unbalanced but data integrity is unaffected. |
 
 ### 2.1 BatchCoprocessor
 
