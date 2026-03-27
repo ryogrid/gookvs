@@ -260,9 +260,7 @@ func (c *twoPhaseCommitter) commitPrimary(ctx context.Context) error {
 	})
 }
 
-// commitSecondaries commits all secondary keys in parallel (best-effort).
-// Each key is committed individually via SendToRegion so that region cache
-// staleness after splits is handled by automatic retry with fresh LocateKey.
+// commitSecondaries commits all secondary keys grouped by region in parallel.
 func (c *twoPhaseCommitter) commitSecondaries(ctx context.Context) {
 	// If 1PC, there are no secondaries to commit.
 	if c.opts.Try1PC && len(c.mutations) <= 1 {
@@ -279,8 +277,66 @@ func (c *twoPhaseCommitter) commitSecondaries(ctx context.Context) {
 		return
 	}
 
+	groups, err := c.client.cache.GroupKeysByRegion(ctx, secondaryKeys)
+	if err != nil {
+		// Fallback: commit each key individually if grouping fails.
+		slog.Warn("commitSecondaries: GroupKeysByRegion failed, falling back to per-key", "err", err)
+		c.commitSecondariesPerKey(ctx, secondaryKeys)
+		return
+	}
+
 	var wg sync.WaitGroup
-	for _, key := range secondaryKeys {
+	for _, group := range groups {
+		group := group
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			lockNotFoundRetries := 0
+			err := c.client.sender.SendToRegion(ctx, group.Keys[0], func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+				resp, err := client.KvCommit(ctx, &kvrpcpb.CommitRequest{
+					Context:       buildContext(info),
+					StartVersion:  uint64(c.startTS),
+					Keys:          group.Keys,
+					CommitVersion: uint64(c.commitTS),
+				})
+				if err != nil {
+					return nil, err
+				}
+				if resp.GetRegionError() != nil {
+					return resp.GetRegionError(), nil
+				}
+				if resp.GetError() != nil {
+					if resp.GetError().GetTxnLockNotFound() != nil {
+						lockNotFoundRetries++
+						if lockNotFoundRetries <= 5 {
+							return &errorpb.Error{
+								Message:   "lock not found, retrying for replication",
+								NotLeader: &errorpb.NotLeader{RegionId: info.Region.GetId()},
+							}, nil
+						}
+						// One key's lock was resolved but the server rejected
+						// the entire batch. Fall back to per-key commit.
+						return nil, fmt.Errorf("batch TxnLockNotFound after retries")
+					}
+				}
+				return nil, nil
+			})
+			if err != nil {
+				slog.Warn("commitSecondaries batch failed, falling back to per-key",
+					"regionKeys", len(group.Keys), "startTS", c.startTS, "err", err)
+				c.commitSecondariesPerKey(ctx, group.Keys)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// commitSecondariesPerKey commits each key individually as a fallback.
+// Used when a batched commit fails (e.g., after a region split causes some
+// keys in the batch to no longer belong to the same region).
+func (c *twoPhaseCommitter) commitSecondariesPerKey(ctx context.Context, keys [][]byte) {
+	var wg sync.WaitGroup
+	for _, key := range keys {
 		key := key
 		wg.Add(1)
 		go func() {
@@ -303,22 +359,18 @@ func (c *twoPhaseCommitter) commitSecondaries(ctx context.Context) {
 					if resp.GetError().GetTxnLockNotFound() != nil {
 						lockNotFoundRetries++
 						if lockNotFoundRetries <= 5 {
-							// Lock not found — may be Raft replication delay
-							// (prewrite applied on another node but not here yet).
-							// Retry via region error to allow replication to catch up.
 							return &errorpb.Error{
 								Message:   "lock not found, retrying for replication",
 								NotLeader: &errorpb.NotLeader{RegionId: info.Region.GetId()},
 							}, nil
 						}
-						// After 5 retries, accept as genuinely resolved.
 						return nil, nil
 					}
 				}
 				return nil, nil
 			})
 			if err != nil {
-				slog.Warn("commitSecondary failed", "key", key, "startTS", c.startTS, "err", err)
+				slog.Warn("commitSecondary per-key failed", "key", key, "startTS", c.startTS, "err", err)
 			}
 		}()
 	}
