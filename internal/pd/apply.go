@@ -16,6 +16,14 @@ func (s *PDServer) applyCommand(cmd PDCommand) ([]byte, error) {
 			return nil, fmt.Errorf("applyCommand: CmdSetBootstrapped: Bootstrapped field is nil")
 		}
 		s.meta.SetBootstrapped(*cmd.Bootstrapped)
+		// Atomic bootstrap: if Store and Region are included, apply them
+		// in the same proposal to avoid partially-bootstrapped state.
+		if cmd.Store != nil {
+			s.meta.PutStore(cmd.Store)
+		}
+		if cmd.Region != nil {
+			s.meta.PutRegion(cmd.Region, cmd.Leader)
+		}
 		return nil, nil
 
 	case CmdPutStore:

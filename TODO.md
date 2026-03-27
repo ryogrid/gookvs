@@ -77,14 +77,14 @@
 
 ### Critical
 - [ ] C1: Proposal index tracking reads stale LastIndex (raft_peer.go:250-255)
-- [ ] C2: Non-atomic bootstrap in Raft mode (server.go:574-605)
-- [ ] C3: ReportBatchSplit missing Leader field in Raft mode (server.go:858-864)
+- [x] C2: Non-atomic bootstrap in Raft mode (server.go:574-605)
+- [x] C3: ReportBatchSplit missing Leader field in Raft mode (server.go:858-864)
 - [ ] C4: Snapshot doesn't include storeLastHeartbeat (snapshot.go)
 
 ### Moderate
 - [ ] M1: TSO logical overflow may produce non-monotonic timestamps (server.go:1199-1221)
 - [ ] M3: scheduleExcessReplicaShedding may remove leader (scheduler.go:156-187)
-- [ ] M5: MockClient TSO race condition (pdclient/mock.go:64-80)
+- [x] M5: MockClient TSO race condition (pdclient/mock.go:64-80)
 
 ### Minor
 - [ ] m1: GetSafePoint uses Mutex instead of RWMutex (server.go:1256)

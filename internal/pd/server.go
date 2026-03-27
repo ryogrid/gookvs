@@ -579,27 +579,17 @@ func (s *PDServer) Bootstrap(ctx context.Context, req *pdpb.BootstrapRequest) (*
 		}, nil
 	}
 
-	// Propose SetBootstrapped(true).
+	// Atomic bootstrap: combine SetBootstrapped + PutStore + PutRegion
+	// into a single Raft proposal to avoid partially-bootstrapped state.
 	bTrue := true
-	cmd := PDCommand{Type: CmdSetBootstrapped, Bootstrapped: &bTrue}
+	cmd := PDCommand{
+		Type:         CmdSetBootstrapped,
+		Bootstrapped: &bTrue,
+		Store:        req.GetStore(),
+		Region:       req.GetRegion(),
+	}
 	if _, err := s.raftPeer.ProposeAndWait(ctx, cmd); err != nil {
 		return nil, err
-	}
-
-	// Propose PutStore.
-	if store := req.GetStore(); store != nil {
-		cmd = PDCommand{Type: CmdPutStore, Store: store}
-		if _, err := s.raftPeer.ProposeAndWait(ctx, cmd); err != nil {
-			return nil, err
-		}
-	}
-
-	// Propose PutRegion.
-	if region := req.GetRegion(); region != nil {
-		cmd = PDCommand{Type: CmdPutRegion, Region: region}
-		if _, err := s.raftPeer.ProposeAndWait(ctx, cmd); err != nil {
-			return nil, err
-		}
 	}
 
 	return &pdpb.BootstrapResponse{Header: s.header()}, nil
@@ -857,7 +847,11 @@ func (s *PDServer) ReportBatchSplit(ctx context.Context, req *pdpb.ReportBatchSp
 
 	// Leader: propose each region via Raft.
 	for _, region := range req.GetRegions() {
-		cmd := PDCommand{Type: CmdPutRegion, Region: region}
+		var leader *metapb.Peer
+		if len(region.GetPeers()) > 0 {
+			leader = region.GetPeers()[0]
+		}
+		cmd := PDCommand{Type: CmdPutRegion, Region: region, Leader: leader}
 		if _, err := s.raftPeer.ProposeAndWait(ctx, cmd); err != nil {
 			return nil, err
 		}

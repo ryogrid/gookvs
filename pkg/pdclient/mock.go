@@ -20,9 +20,10 @@ type MockClient struct {
 	bootstrapped bool
 	nextID       atomic.Uint64
 
-	// TSO state.
-	tsoPhysical atomic.Int64
-	tsoLogical  atomic.Int64
+	// TSO state (protected by tsoMu for overflow safety).
+	tsoMu       sync.Mutex
+	tsoPhysical int64
+	tsoLogical  int64
 
 	// Store registry: storeID -> store.
 	stores map[uint64]*metapb.Store
@@ -54,7 +55,7 @@ func NewMockClient(clusterID uint64) *MockClient {
 		storeStats:         make(map[uint64]*pdpb.StoreStats),
 	}
 	c.nextID.Store(1000) // Start IDs at 1000 to avoid conflicts.
-	c.tsoPhysical.Store(1)
+	c.tsoPhysical = 1
 	return c
 }
 
@@ -62,15 +63,19 @@ func NewMockClient(clusterID uint64) *MockClient {
 var _ Client = (*MockClient)(nil)
 
 func (c *MockClient) GetTS(_ context.Context) (TimeStamp, error) {
-	logical := c.tsoLogical.Add(1)
-	physical := c.tsoPhysical.Load()
+	c.tsoMu.Lock()
+	defer c.tsoMu.Unlock()
+
+	c.tsoLogical++
+	logical := c.tsoLogical
+	physical := c.tsoPhysical
 
 	// Roll over logical counter.
 	if logical >= (1 << 18) {
-		c.tsoPhysical.Add(1)
-		c.tsoLogical.Store(0)
-		physical = c.tsoPhysical.Load()
-		logical = 0
+		c.tsoPhysical++
+		c.tsoLogical = 1
+		physical = c.tsoPhysical
+		logical = 1
 	}
 
 	return TimeStamp{
