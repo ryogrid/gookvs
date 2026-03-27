@@ -381,7 +381,12 @@ func (s *PeerStorage) ApplySnapshot(snap raftpb.Snapshot) error {
 			return fmt.Errorf("raftstore: unmarshal snapshot data: %w", err)
 		}
 
-		if err := ApplySnapshotData(s.engine, sd, nil, nil); err != nil {
+		var snapStartKey, snapEndKey []byte
+		if s.region != nil {
+			snapStartKey = s.region.GetStartKey()
+			snapEndKey = s.region.GetEndKey()
+		}
+		if err := ApplySnapshotData(s.engine, sd, snapStartKey, snapEndKey); err != nil {
 			return fmt.Errorf("raftstore: apply snapshot data: %w", err)
 		}
 	}

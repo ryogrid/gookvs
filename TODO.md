@@ -3,21 +3,21 @@
 ## 01 Raft Layer (`internal/raftstore/`)
 
 ### Critical
-- [ ] C1: RecoverFromEngine never restores ApplyState from disk (storage.go:296)
-- [ ] C2: PersistApplyState never called in production; apply progress not saved (storage.go:401, peer.go:599)
-- [ ] C3: InitialState returns empty ConfState; multi-node restart fails (storage.go:68)
-- [ ] C4: ApplySnapshot passes nil key range; stale data not cleared (snapshot.go:384)
+- [x] C1: RecoverFromEngine never restores ApplyState from disk (storage.go:296)
+- [x] C2: PersistApplyState never called in production; apply progress not saved (storage.go:401, peer.go:599)
+- [x] C3: InitialState returns empty ConfState; multi-node restart fails (storage.go:68)
+- [x] C4: ApplySnapshot passes nil key range; stale data not cleared (snapshot.go:384)
 
 ### High
 - [ ] H1: PeerMsgTypeDestroy closes Mailbox causing panic on concurrent sends (peer.go:425-428)
-- [ ] H2: leaseExpiry accessed from multiple goroutines without sync (peer.go:131-132)
-- [ ] H3: handleReady runs after peer destroyed (peer.go:376-378)
+- [x] H2: leaseExpiry accessed from multiple goroutines without sync (peer.go:131-132)
+- [x] H3: handleReady runs after peer destroyed (peer.go:376-378)
 - [ ] H4: Admin entries sent to applyFunc; relies on format incompatibility (peer.go:579-600)
 - [ ] C5/H5: Proposal callback index tracking breaks with batched proposals (peer.go:515-521)
 
 ### Medium
 - [ ] M1: readEntriesFromEngine silently stops on gap (storage.go:481-484)
-- [ ] M2: onRaftLogGCTick underflow when appliedIdx=1 (peer.go:696)
+- [x] M2: onRaftLogGCTick underflow when appliedIdx=1 (peer.go:696)
 - [ ] M3: Snapshot ConfState not set in metadata (snapshot.go:353-359)
 - [ ] M4: scanRegionSize picks split key from first CF only (split/checker.go:140-191)
 - [ ] M5: ExecCommitMerge dead code and fragile fallback (merge.go:118-140)

@@ -128,8 +128,8 @@ type Peer struct {
 	// Leader lease: allows serving reads without ReadIndex round-trip
 	// when the leader has recently confirmed its leadership via heartbeats.
 	// Lease duration is 80% of election timeout (conservative).
-	leaseExpiry time.Time
-	leaseValid  atomic.Bool
+	leaseExpiryNanos atomic.Int64 // Unix nanoseconds; accessed from multiple goroutines
+	leaseValid       atomic.Bool
 
 	// splitResultCh sends split results to the coordinator for child
 	// region bootstrapping. Only used by the leader.
@@ -269,7 +269,7 @@ func (p *Peer) IsLeaseValid() bool {
 	if !p.leaseValid.Load() {
 		return false
 	}
-	if time.Now().After(p.leaseExpiry) {
+	if time.Now().UnixNano() > p.leaseExpiryNanos.Load() {
 		p.leaseValid.Store(false)
 		return false
 	}
@@ -375,6 +375,9 @@ func (p *Peer) Run(ctx context.Context) {
 		drained:
 		}
 
+		if p.stopped.Load() {
+			return
+		}
 		p.handleReady()
 	}
 }
@@ -536,7 +539,7 @@ func (p *Peer) handleReady() {
 			p.sendRegionHeartbeatToPD()
 			// Extend leader lease on leadership confirmation.
 			electionTimeout := time.Duration(p.cfg.RaftElectionTimeoutTicks) * p.cfg.RaftBaseTickInterval
-			p.leaseExpiry = time.Now().Add(electionTimeout * 4 / 5)
+			p.leaseExpiryNanos.Store(time.Now().Add(electionTimeout * 4 / 5).UnixNano())
 			p.leaseValid.Store(true)
 		}
 		// Invalidate lease and cleanup pending reads on leader stepdown.
@@ -598,13 +601,18 @@ func (p *Peer) handleReady() {
 		// Update applied index so ReadIndex can confirm data is readable.
 		lastEntry := rd.CommittedEntries[len(rd.CommittedEntries)-1]
 		p.storage.SetAppliedIndex(lastEntry.Index)
+
+		// Persist ApplyState so it survives restarts.
+		if err := p.storage.PersistApplyState(); err != nil {
+			slog.Error("APPLY-STATE-PERSIST failed", "error", err, "region", p.regionID)
+		}
 	}
 
 	// Process ReadStates from ReadIndex.
 	if len(rd.ReadStates) > 0 && p.isLeader.Load() {
 		// ReadStates confirm quorum — extend leader lease.
 		electionTimeout := time.Duration(p.cfg.RaftElectionTimeoutTicks) * p.cfg.RaftBaseTickInterval
-		p.leaseExpiry = time.Now().Add(electionTimeout * 4 / 5)
+		p.leaseExpiryNanos.Store(time.Now().Add(electionTimeout * 4 / 5).UnixNano())
 		p.leaseValid.Store(true)
 	}
 	for _, rs := range rd.ReadStates {
@@ -692,7 +700,10 @@ func (p *Peer) onRaftLogGCTick() {
 		compactIdx = minMatch
 	}
 
-	// Don't compact past applied index - 1.
+	// Don't compact past applied index - 1. Guard against underflow.
+	if appliedIdx < 2 {
+		return
+	}
 	if compactIdx > appliedIdx-1 {
 		compactIdx = appliedIdx - 1
 	}

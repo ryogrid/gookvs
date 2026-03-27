@@ -65,10 +65,19 @@ func NewPeerStorage(regionID uint64, engine traits.KvEngine) *PeerStorage {
 }
 
 // InitialState returns the initial HardState and ConfState from storage.
+// ConfState is derived from the region's peer list so that Raft knows its
+// cluster membership after restart.
 func (s *PeerStorage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.hardState, raftpb.ConfState{}, nil
+
+	var cs raftpb.ConfState
+	if s.region != nil {
+		for _, peer := range s.region.GetPeers() {
+			cs.Voters = append(cs.Voters, peer.GetId())
+		}
+	}
+	return s.hardState, cs, nil
 }
 
 // Entries returns a slice of Raft log entries in [lo, hi), capped at maxSize bytes.
@@ -341,6 +350,25 @@ func (s *PeerStorage) RecoverFromEngine() error {
 			entries = entries[len(entries)-maxCacheSize:]
 		}
 		s.entries = entries
+	}
+
+	// Recover ApplyState.
+	applyData, err := s.engine.Get(cfnames.CFRaft, keys.ApplyStateKey(s.regionID))
+	if err == nil && len(applyData) == 24 {
+		s.applyState.AppliedIndex = uint64(applyData[0])<<56 | uint64(applyData[1])<<48 |
+			uint64(applyData[2])<<40 | uint64(applyData[3])<<32 |
+			uint64(applyData[4])<<24 | uint64(applyData[5])<<16 |
+			uint64(applyData[6])<<8 | uint64(applyData[7])
+		s.applyState.TruncatedIndex = uint64(applyData[8])<<56 | uint64(applyData[9])<<48 |
+			uint64(applyData[10])<<40 | uint64(applyData[11])<<32 |
+			uint64(applyData[12])<<24 | uint64(applyData[13])<<16 |
+			uint64(applyData[14])<<8 | uint64(applyData[15])
+		s.applyState.TruncatedTerm = uint64(applyData[16])<<56 | uint64(applyData[17])<<48 |
+			uint64(applyData[18])<<40 | uint64(applyData[19])<<32 |
+			uint64(applyData[20])<<24 | uint64(applyData[21])<<16 |
+			uint64(applyData[22])<<8 | uint64(applyData[23])
+	} else if err != nil && err != traits.ErrNotFound {
+		return fmt.Errorf("raftstore: read apply state: %w", err)
 	}
 
 	return nil
