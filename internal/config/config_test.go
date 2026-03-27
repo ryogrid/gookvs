@@ -64,11 +64,11 @@ func TestValidateEmptyDataDir(t *testing.T) {
 }
 
 func TestValidateEmptyPDEndpoints(t *testing.T) {
+	// Empty PD endpoints are valid (standalone mode).
 	cfg := DefaultConfig()
 	cfg.PD.Endpoints = nil
 	err := cfg.Validate()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "pd endpoints must not be empty")
+	assert.NoError(t, err)
 }
 
 func TestValidateRaftTimers(t *testing.T) {
@@ -289,7 +289,7 @@ func TestMultipleValidationErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid log level")
 	assert.Contains(t, err.Error(), "server addr")
 	assert.Contains(t, err.Error(), "data-dir")
-	assert.Contains(t, err.Error(), "pd endpoints")
+	// PD endpoints are optional (standalone mode), so no error expected.
 }
 
 func TestLoadFromFileDefaults(t *testing.T) {
