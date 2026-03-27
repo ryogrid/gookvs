@@ -3,37 +3,12 @@ package e2e_external_test
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ryogrid/gookv/pkg/client"
-	"github.com/ryogrid/gookv/pkg/e2elib"
 )
-
-// newClientCluster creates a 3-node cluster and returns the cluster and a RawKVClient.
-// It waits for Raft leader election before returning.
-func newClientCluster(t *testing.T) (*e2elib.GokvCluster, *client.RawKVClient) {
-	t.Helper()
-	e2elib.SkipIfNoBinary(t, "gookv-server", "gookv-pd")
-
-	cluster := e2elib.NewGokvCluster(t, e2elib.GokvClusterConfig{NumNodes: 3})
-	require.NoError(t, cluster.Start())
-	t.Cleanup(func() { cluster.Stop() })
-
-	rawKV := cluster.RawKV()
-
-	// Wait for Raft leader election by polling with a Put/Get.
-	e2elib.WaitForCondition(t, 30*time.Second, "cluster leader election", func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		err := rawKV.Put(ctx, []byte("__health__"), []byte("ok"))
-		return err == nil
-	})
-
-	return cluster, rawKV
-}
 
 // --- Region Cache Tests ---
 

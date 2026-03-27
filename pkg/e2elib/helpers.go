@@ -264,7 +264,7 @@ func ReadAllBalances(t *testing.T, txnKV *client.TxnKVClient, numAccounts int) (
 func DialTikvClient(t *testing.T, addr string) tikvpb.TikvClient {
 	t.Helper()
 
-	conn, err := grpc.Dial(addr,
+	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {

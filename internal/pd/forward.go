@@ -40,7 +40,7 @@ func (s *PDServer) getLeaderClient() (pdpb.PDClient, error) {
 		return nil, fmt.Errorf("pd: no client address for leader %d", leaderID)
 	}
 
-	conn, err := grpc.Dial(addr,
+	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {

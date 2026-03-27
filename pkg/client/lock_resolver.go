@@ -18,8 +18,9 @@ type LockResolver struct {
 	cache    *RegionCache
 	pdClient pdclient.Client
 
-	mu        sync.Mutex
-	resolving map[lockKey]chan struct{}
+	mu           sync.Mutex
+	resolving    map[lockKey]chan struct{}
+	resolveCount int // tracks total resolutions since last map reset
 }
 
 type lockKey struct {
@@ -72,6 +73,13 @@ func (lr *LockResolver) resolveSingleLock(ctx context.Context, lock *kvrpcpb.Loc
 	defer func() {
 		lr.mu.Lock()
 		delete(lr.resolving, lk)
+		lr.resolveCount++
+		// Periodically recreate the map to release old backing memory.
+		// Threshold of 1000 avoids churning on every single resolve.
+		if len(lr.resolving) == 0 && lr.resolveCount >= 1000 {
+			lr.resolving = make(map[lockKey]chan struct{})
+			lr.resolveCount = 0
+		}
 		lr.mu.Unlock()
 		close(ch)
 	}()

@@ -32,7 +32,7 @@ func testSetup(t *testing.T) (tikvpb.TikvClient, func()) {
 
 	require.NoError(t, srv.Start())
 
-	conn, err := grpc.Dial(
+	conn, err := grpc.NewClient(
 		srv.Addr(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
@@ -678,7 +678,7 @@ func TestServerStartStop(t *testing.T) {
 	assert.NotEmpty(t, addr)
 
 	// Verify server is reachable.
-	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 
 	client := tikvpb.NewTikvClient(conn)

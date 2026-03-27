@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"math/rand"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -41,6 +42,7 @@ type ReadPool struct {
 	queueDepth atomic.Int64 // current tasks queued
 	alpha      float64      // EWMA smoothing factor (0-1)
 	stopCh     chan struct{}
+	wg         sync.WaitGroup
 }
 
 // NewReadPool creates a read pool with the given number of workers.
@@ -55,8 +57,12 @@ func NewReadPool(workers int) *ReadPool {
 		stopCh:  make(chan struct{}),
 	}
 
+	rp.wg.Add(workers)
 	for i := 0; i < workers; i++ {
-		go rp.worker()
+		go func() {
+			defer rp.wg.Done()
+			rp.worker()
+		}()
 	}
 
 	return rp
@@ -108,9 +114,11 @@ func (rp *ReadPool) Workers() int {
 	return rp.workers
 }
 
-// Stop stops the read pool.
+// Stop stops the read pool. It signals workers to stop and waits for them
+// to drain all pending tasks before returning.
 func (rp *ReadPool) Stop() {
 	close(rp.stopCh)
+	rp.wg.Wait()
 }
 
 func (rp *ReadPool) worker() {
@@ -119,7 +127,15 @@ func (rp *ReadPool) worker() {
 		case task := <-rp.taskCh:
 			task()
 		case <-rp.stopCh:
-			return
+			// Drain remaining tasks before exiting.
+			for {
+				select {
+				case task := <-rp.taskCh:
+					task()
+				default:
+					return
+				}
+			}
 		}
 	}
 }

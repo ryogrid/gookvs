@@ -23,7 +23,7 @@ func startTestPDServer(t *testing.T) (*PDServer, pdpb.PDClient) {
 	require.NoError(t, s.Start())
 	t.Cleanup(func() { s.Stop() })
 
-	conn, err := grpc.Dial(s.Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(s.Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
 

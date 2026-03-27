@@ -277,11 +277,8 @@ func (p *connPool) get(dialTimeout time.Duration) (*grpc.ClientConn, error) {
 	}
 
 	// Establish new connection.
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-
 	slog.Debug("raft.dial", "addr", p.addr)
-	conn, err := grpc.DialContext(ctx, p.addr,
+	conn, err := grpc.NewClient(p.addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                60 * time.Second,

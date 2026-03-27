@@ -146,11 +146,8 @@ func (s *RegionRequestSender) getOrDial(addr string) (*grpc.ClientConn, error) {
 		return conn, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.dialTimeout)
-	defer cancel()
-
 	slog.Debug("tikv.dial", "addr", addr)
-	conn, err := grpc.DialContext(ctx, addr,
+	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64<<20)),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{

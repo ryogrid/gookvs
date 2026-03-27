@@ -154,9 +154,11 @@ func NewClient(ctx context.Context, cfg Config) (Client, error) {
 	var err error
 	for i, ep := range cfg.Endpoints {
 		slog.Debug("pd.dial", "endpoint", ep)
-		conn, err = grpc.DialContext(ctx, ep,
+		// TODO: grpc.DialContext is deprecated; migrate to grpc.NewClient
+		// once a non-blocking connection establishment pattern is adopted.
+		conn, err = grpc.DialContext(ctx, ep, //nolint:staticcheck
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithBlock(),
+			grpc.WithBlock(), //nolint:staticcheck
 		)
 		if err == nil {
 			connIdx = i
@@ -208,9 +210,11 @@ func (c *grpcClient) reconnect() error {
 
 		slog.Debug("pd.reconnect.leader", "addr", leaderAddr)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		conn, err := grpc.DialContext(ctx, leaderAddr,
+		// TODO: grpc.DialContext is deprecated; migrate to grpc.NewClient
+		// once a non-blocking connection establishment pattern is adopted.
+		conn, err := grpc.DialContext(ctx, leaderAddr, //nolint:staticcheck
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithBlock(),
+			grpc.WithBlock(), //nolint:staticcheck
 		)
 		cancel()
 		if err == nil {
@@ -237,9 +241,11 @@ func (c *grpcClient) reconnect() error {
 
 		slog.Debug("pd.reconnect", "endpoint", ep)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		conn, err := grpc.DialContext(ctx, ep,
+		// TODO: grpc.DialContext is deprecated; migrate to grpc.NewClient
+		// once a non-blocking connection establishment pattern is adopted.
+		conn, err := grpc.DialContext(ctx, ep, //nolint:staticcheck
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithBlock(),
+			grpc.WithBlock(), //nolint:staticcheck
 		)
 		cancel()
 		if err != nil {

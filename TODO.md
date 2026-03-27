@@ -20,7 +20,7 @@
 - [x] M2: onRaftLogGCTick underflow when appliedIdx=1 (peer.go:696)
 - [x] M3: Snapshot ConfState not set in metadata (snapshot.go:353-359)
 - [ ] M4: scanRegionSize picks split key from first CF only (split/checker.go:140-191)
-- [ ] M5: ExecCommitMerge dead code and fragile fallback (merge.go:118-140)
+- [x] M5: ExecCommitMerge dead code and fragile fallback (merge.go:118-140)
 - [ ] M6: Proposal callback always calls success regardless of entry data (peer.go:493-521)
 
 ## 02 Server/RPC Layer (`internal/server/`)
@@ -34,7 +34,7 @@
 - [ ] C6: Transport creates new gRPC stream per Send (transport.go:78-102)
 
 ### Potential/Medium
-- [ ] P1: ReadPool.Stop() doesn't drain pending tasks (flow/flow.go:112-114)
+- [x] P1: ReadPool.Stop() doesn't drain pending tasks (flow/flow.go:112-114)
 - [ ] P3: Connection pool always uses index 0 (transport.go:249)
 - [x] P4: TOCTOU in pd_resolver — performance only, not correctness (pd_resolver.go:52-75)
 - [x] P6: KvDeleteRange hardcodes region ID 1 (server.go:1541)
@@ -70,7 +70,7 @@
 - [x] M1: prewriteRegion returns conflict instead of retrying after lock resolve — by design (upper layer retries)
 - [x] M2: lockNotFoundRetries counter accumulates across retries — verified: counter is per-closure, no accumulation
 - [x] M3: isRetryableRegionError is dead code (request_sender.go:132-142)
-- [ ] M4: lock_resolver resolving map grows unboundedly (lock_resolver.go:22-23,69)
+- [x] M4: lock_resolver resolving map grows unboundedly (lock_resolver.go:22-23,69)
 - [x] M5: Scan reuses stale scanEnd after region error (rawkv.go:274-338)
 
 ## 05 PD Layer (`internal/pd/`, `pkg/pdclient/`)
@@ -88,7 +88,7 @@
 
 ### Minor
 - [x] m1: GetSafePoint uses Mutex instead of RWMutex (server.go:1256)
-- [ ] m5: Replace deprecated grpc.Dial with grpc.NewClient (various)
+- [x] m5: grpc upgraded to v1.79.3; grpc.Dial → grpc.NewClient migrated (DialContext+WithBlock sites remain)
 
 ## 06 Entry/Config/Codec
 
@@ -108,7 +108,7 @@
 ## 07 Test Code
 
 ### High
-- [ ] 1.1: GC test doesn't verify old version deleted (gc_worker_test.go)
+- [x] 1.1: GC test doesn't verify old version deleted (gc_worker_test.go)
 - [x] 4.1: Log file handles leaked in e2elib process management (pdcluster.go, gokvnode.go)
 - [x] 4.2: PDCluster Restart() leaks old log file handle (pdcluster.go)
 
@@ -118,4 +118,4 @@
 - [x] 1.4: Cross-node replication test ignores all errors (cluster_server_test.go)
 - [x] 1.5: TSO via follower test has no failure assertions (pd_replication_test.go)
 - [x] 1.6: TSO forwarding test passes with zero successes (pd_replication_test.go)
-- [ ] 5.1: Duplicate newClusterWithLeader/newClientCluster helpers (e2e_external/)
+- [x] 5.1: Duplicate newClusterWithLeader/newClientCluster helpers (e2e_external/)

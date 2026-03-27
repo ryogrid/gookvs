@@ -77,10 +77,12 @@ func TestGCWorkerCleansOldVersions(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, commitResp.GetError())
 
-	// Run GC with safe point at version 35 (should clean up version at 20).
+	// Run GC with safe point at version 45 (above both commits).
+	// GC keeps the latest Put at/below safe point (commitTS=40) and removes
+	// older versions (commitTS=20) via gcStateRemoveAll.
 	done := make(chan error, 1)
 	err = gcWorker.Schedule(gc.GCTask{
-		SafePoint: txntypes.TimeStamp(35),
+		SafePoint: txntypes.TimeStamp(45),
 		Callback:  func(err error) { done <- err },
 	})
 	require.NoError(t, err)
@@ -92,11 +94,17 @@ func TestGCWorkerCleansOldVersions(t *testing.T) {
 		t.Fatal("GC timed out")
 	}
 
-	// The latest version should still be readable.
+	// The latest version (commitTS=40) should still be readable.
 	getResp, err := client.KvGet(ctx, &kvrpcpb.GetRequest{Key: []byte("gc-key"), Version: 50})
 	require.NoError(t, err)
 	assert.False(t, getResp.GetNotFound())
 	assert.Equal(t, []byte("new-val"), getResp.GetValue(), "latest version should be preserved")
+
+	// The old version (commitTS=20) should have been garbage collected.
+	// Reading at version 25 (after old commit but before new commit) should find nothing.
+	getResp, err = client.KvGet(ctx, &kvrpcpb.GetRequest{Key: []byte("gc-key"), Version: 25})
+	require.NoError(t, err)
+	assert.True(t, getResp.GetNotFound(), "old version should have been garbage collected")
 
 	t.Log("GC worker test passed")
 }
@@ -143,10 +151,10 @@ func TestGCWorkerMultipleKeys(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Run GC with safe point 35.
+	// Run GC with safe point 45 (above both commits).
 	done := make(chan error, 1)
 	err = gcWorker.Schedule(gc.GCTask{
-		SafePoint: txntypes.TimeStamp(35),
+		SafePoint: txntypes.TimeStamp(45),
 		Callback:  func(err error) { done <- err },
 	})
 	require.NoError(t, err)
@@ -166,6 +174,15 @@ func TestGCWorkerMultipleKeys(t *testing.T) {
 	getResp, err = client.KvGet(ctx, &kvrpcpb.GetRequest{Key: []byte("gc-multi-b"), Version: 50})
 	require.NoError(t, err)
 	assert.Equal(t, []byte("b-new"), getResp.GetValue())
+
+	// Old versions (commitTS=20) should have been garbage collected.
+	getResp, err = client.KvGet(ctx, &kvrpcpb.GetRequest{Key: []byte("gc-multi-a"), Version: 25})
+	require.NoError(t, err)
+	assert.True(t, getResp.GetNotFound(), "old version of gc-multi-a should have been garbage collected")
+
+	getResp, err = client.KvGet(ctx, &kvrpcpb.GetRequest{Key: []byte("gc-multi-b"), Version: 25})
+	require.NoError(t, err)
+	assert.True(t, getResp.GetNotFound(), "old version of gc-multi-b should have been garbage collected")
 
 	t.Log("GC worker multi-key test passed")
 }

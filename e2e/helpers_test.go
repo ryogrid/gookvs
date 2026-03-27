@@ -12,7 +12,7 @@ import (
 // dialTikvClient creates a gRPC connection to the given address and returns a TikvClient.
 func dialTikvClient(t *testing.T, addr string) (*grpc.ClientConn, tikvpb.TikvClient) {
 	t.Helper()
-	conn, err := grpc.Dial(addr,
+	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	require.NoError(t, err)

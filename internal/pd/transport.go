@@ -114,11 +114,8 @@ func (t *PDTransport) getOrCreateConn(peerID uint64) (*grpc.ClientConn, error) {
 		return nil, fmt.Errorf("unknown peer ID %d", peerID)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
 	slog.Debug("pd transport: dialing peer", "peer", peerID, "addr", addr)
-	conn, err := grpc.DialContext(ctx, addr,
+	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                60 * time.Second,

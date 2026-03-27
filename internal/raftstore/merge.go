@@ -112,14 +112,7 @@ func ExecCommitMerge(target *metapb.Region, source *metapb.Region) (*CommitMerge
 		merged.RegionEpoch = &metapb.RegionEpoch{}
 	}
 
-	// Determine merge direction and extend key range.
-	// Right merge: target.EndKey == source.StartKey -> expand target.EndKey
-	// Left merge: target.StartKey == source.EndKey -> expand target.StartKey
-	if bytes.Equal(target.GetEndKey(), source.GetStartKey()) ||
-		(len(target.GetEndKey()) == 0 && len(source.GetStartKey()) == 0) {
-		// This shouldn't happen for right merge -- let's handle both cases.
-	}
-
+	// Determine merge direction. Source must be adjacent to target.
 	if len(source.GetStartKey()) > 0 && bytes.Equal(target.GetEndKey(), source.GetStartKey()) {
 		// Right merge: source is right-adjacent to target.
 		merged.EndKey = append([]byte(nil), source.GetEndKey()...)
@@ -127,16 +120,9 @@ func ExecCommitMerge(target *metapb.Region, source *metapb.Region) (*CommitMerge
 		// Left merge: source is left-adjacent to target.
 		merged.StartKey = append([]byte(nil), source.GetStartKey()...)
 	} else {
-		// Fallback: extend to cover both ranges.
-		if len(source.GetStartKey()) > 0 && (len(merged.GetStartKey()) == 0 || bytes.Compare(source.GetStartKey(), merged.GetStartKey()) < 0) {
-			merged.StartKey = append([]byte(nil), source.GetStartKey()...)
-		}
-		if len(source.GetEndKey()) > 0 && (len(merged.GetEndKey()) == 0 || bytes.Compare(source.GetEndKey(), merged.GetEndKey()) > 0) {
-			merged.EndKey = append([]byte(nil), source.GetEndKey()...)
-		}
-		if len(source.GetEndKey()) == 0 {
-			merged.EndKey = nil
-		}
+		return nil, fmt.Errorf("merge: source region %d [%x, %x) is not adjacent to target region %d [%x, %x)",
+			source.GetId(), source.GetStartKey(), source.GetEndKey(),
+			target.GetId(), target.GetStartKey(), target.GetEndKey())
 	}
 
 	// Set epoch: max(source.version, target.version) + 1.
