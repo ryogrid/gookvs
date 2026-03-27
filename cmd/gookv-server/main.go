@@ -67,6 +67,10 @@ func main() {
 	}
 	if *pdEndpoints != "" {
 		cfg.PD.Endpoints = splitEndpoints(*pdEndpoints)
+	} else if *configPath == "" && *storeID == 0 && *initialCluster == "" {
+		// No explicit PD endpoints, no config file, no cluster flags:
+		// clear the default PD endpoints to enable standalone mode.
+		cfg.PD.Endpoints = nil
 	}
 	if *logLevel != "" {
 		cfg.Log.Level = *logLevel

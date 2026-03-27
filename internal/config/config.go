@@ -266,10 +266,7 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("storage data-dir must not be empty"))
 	}
 
-	// Validate PD endpoints.
-	if len(c.PD.Endpoints) == 0 {
-		errs = append(errs, errors.New("pd endpoints must not be empty"))
-	}
+	// PD endpoints are optional: empty means standalone mode (no Raft, no cluster).
 
 	// Validate raft store.
 	if c.RaftStore.RaftHeartbeatTicks <= 0 {
