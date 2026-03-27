@@ -128,6 +128,8 @@ func (c *RegionCache) loadFromPD(ctx context.Context, key []byte) (*RegionInfo, 
 }
 
 // insertLocked inserts a RegionInfo into the sorted slice and byID map.
+// It evicts any existing regions whose key range overlaps with the new region,
+// which happens after a region split when the old region's range is stale.
 // Must be called with write lock held.
 func (c *RegionCache) insertLocked(info *RegionInfo) {
 	regionID := info.Region.GetId()
@@ -137,6 +139,22 @@ func (c *RegionCache) insertLocked(info *RegionInfo) {
 		c.regions[idx] = info
 		return
 	}
+
+	// Evict any stale overlapping regions (e.g., old pre-split region covering [a,z)
+	// when the new post-split region covers [a,m)).
+	newStart := info.Region.GetStartKey()
+	newEnd := info.Region.GetEndKey()
+	var kept []*RegionInfo
+	for _, existing := range c.regions {
+		eStart := existing.Region.GetStartKey()
+		eEnd := existing.Region.GetEndKey()
+		if existing.Region.GetId() != regionID && regionsOverlap(eStart, eEnd, newStart, newEnd) {
+			// Stale region — evict it.
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	c.regions = kept
 
 	// Find insertion point.
 	startKey := info.Region.GetStartKey()
@@ -151,6 +169,20 @@ func (c *RegionCache) insertLocked(info *RegionInfo) {
 
 	// Rebuild byID (indices shifted).
 	c.rebuildByID()
+}
+
+// regionsOverlap returns true if two key ranges overlap.
+// Empty end key means +infinity.
+func regionsOverlap(aStart, aEnd, bStart, bEnd []byte) bool {
+	// a starts after b ends?
+	if len(bEnd) > 0 && bytes.Compare(aStart, bEnd) >= 0 {
+		return false
+	}
+	// b starts after a ends?
+	if len(aEnd) > 0 && bytes.Compare(bStart, aEnd) >= 0 {
+		return false
+	}
+	return true
 }
 
 // rebuildByID reconstructs the byID index from the current regions slice.

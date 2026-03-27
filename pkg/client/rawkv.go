@@ -337,27 +337,53 @@ func (c *RawKVClient) Scan(ctx context.Context, startKey, endKey []byte, limit i
 	return result, nil
 }
 
-// DeleteRange deletes all keys in a range.
+// DeleteRange deletes all keys in a range, spanning region boundaries.
 func (c *RawKVClient) DeleteRange(ctx context.Context, startKey, endKey []byte) error {
-	return c.sender.SendToRegion(ctx, startKey, func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
-		slog.Debug("rawkv.DeleteRange", "start", fmt.Sprintf("%x", startKey), "end", fmt.Sprintf("%x", endKey))
-		resp, err := client.RawDeleteRange(ctx, &kvrpcpb.RawDeleteRangeRequest{
-			Context:  buildContext(info),
-			StartKey: startKey,
-			EndKey:   endKey,
-			Cf:       c.cf,
+	currentKey := startKey
+	for {
+		info, err := c.cache.LocateKey(ctx, currentKey)
+		if err != nil {
+			return err
+		}
+
+		regionEnd := info.Region.GetEndKey()
+		rangeEnd := endKey
+		if len(regionEnd) > 0 && (len(rangeEnd) == 0 || bytes.Compare(regionEnd, rangeEnd) < 0) {
+			rangeEnd = regionEnd
+		}
+
+		err = c.sender.SendToRegion(ctx, currentKey, func(client tikvpb.TikvClient, rInfo *RegionInfo) (*errorpb.Error, error) {
+			slog.Debug("rawkv.DeleteRange", "start", fmt.Sprintf("%x", currentKey), "end", fmt.Sprintf("%x", rangeEnd))
+			resp, err := client.RawDeleteRange(ctx, &kvrpcpb.RawDeleteRangeRequest{
+				Context:  buildContext(rInfo),
+				StartKey: currentKey,
+				EndKey:   rangeEnd,
+				Cf:       c.cf,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if resp.GetRegionError() != nil {
+				return resp.GetRegionError(), nil
+			}
+			if resp.GetError() != "" {
+				return nil, errFromString(resp.GetError())
+			}
+			return nil, nil
 		})
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if resp.GetRegionError() != nil {
-			return resp.GetRegionError(), nil
+
+		if len(regionEnd) == 0 {
+			break
 		}
-		if resp.GetError() != "" {
-			return nil, errFromString(resp.GetError())
+		if len(endKey) > 0 && bytes.Compare(regionEnd, endKey) >= 0 {
+			break
 		}
-		return nil, nil
-	})
+		currentKey = regionEnd
+	}
+	return nil
 }
 
 // CompareAndSwap atomically compares and swaps a value.
@@ -390,32 +416,58 @@ func (c *RawKVClient) CompareAndSwap(ctx context.Context, key, value, prevValue 
 	return succeed, previousValue, err
 }
 
-// Checksum computes a checksum over a key range.
+// Checksum computes a checksum over a key range, spanning region boundaries.
 func (c *RawKVClient) Checksum(ctx context.Context, startKey, endKey []byte) (uint64, uint64, uint64, error) {
 	var checksum, totalKvs, totalBytes uint64
-	err := c.sender.SendToRegion(ctx, startKey, func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
-		slog.Debug("rawkv.Checksum", "start", fmt.Sprintf("%x", startKey), "end", fmt.Sprintf("%x", endKey))
-		resp, err := client.RawChecksum(ctx, &kvrpcpb.RawChecksumRequest{
-			Context: buildContext(info),
-			Ranges: []*kvrpcpb.KeyRange{
-				{StartKey: startKey, EndKey: endKey},
-			},
+	currentKey := startKey
+
+	for {
+		info, err := c.cache.LocateKey(ctx, currentKey)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+
+		regionEnd := info.Region.GetEndKey()
+		rangeEnd := endKey
+		if len(regionEnd) > 0 && (len(rangeEnd) == 0 || bytes.Compare(regionEnd, rangeEnd) < 0) {
+			rangeEnd = regionEnd
+		}
+
+		err = c.sender.SendToRegion(ctx, currentKey, func(client tikvpb.TikvClient, rInfo *RegionInfo) (*errorpb.Error, error) {
+			slog.Debug("rawkv.Checksum", "start", fmt.Sprintf("%x", currentKey), "end", fmt.Sprintf("%x", rangeEnd))
+			resp, err := client.RawChecksum(ctx, &kvrpcpb.RawChecksumRequest{
+				Context: buildContext(rInfo),
+				Ranges: []*kvrpcpb.KeyRange{
+					{StartKey: currentKey, EndKey: rangeEnd},
+				},
+			})
+			if err != nil {
+				return nil, err
+			}
+			if resp.GetRegionError() != nil {
+				return resp.GetRegionError(), nil
+			}
+			if resp.GetError() != "" {
+				return nil, errFromString(resp.GetError())
+			}
+			checksum ^= resp.GetChecksum()
+			totalKvs += resp.GetTotalKvs()
+			totalBytes += resp.GetTotalBytes()
+			return nil, nil
 		})
 		if err != nil {
-			return nil, err
+			return 0, 0, 0, err
 		}
-		if resp.GetRegionError() != nil {
-			return resp.GetRegionError(), nil
+
+		if len(regionEnd) == 0 {
+			break
 		}
-		if resp.GetError() != "" {
-			return nil, errFromString(resp.GetError())
+		if len(endKey) > 0 && bytes.Compare(regionEnd, endKey) >= 0 {
+			break
 		}
-		checksum = resp.GetChecksum()
-		totalKvs = resp.GetTotalKvs()
-		totalBytes = resp.GetTotalBytes()
-		return nil, nil
-	})
-	return checksum, totalKvs, totalBytes, err
+		currentKey = regionEnd
+	}
+	return checksum, totalKvs, totalBytes, nil
 }
 
 // Close is a no-op for RawKVClient; the parent Client manages lifecycle.

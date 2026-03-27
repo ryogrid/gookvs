@@ -35,9 +35,10 @@ type TxnHandle struct {
 	startTS    txntypes.TimeStamp
 	opts       TxnOptions
 	membuf     map[string]mutationEntry
-	lockKeys   [][]byte // pessimistic lock keys
-	committed  bool
-	rolledBack bool
+	lockKeys      [][]byte // pessimistic lock keys
+	cachedPrimary []byte   // deterministic primary key (cached)
+	committed     bool
+	rolledBack    bool
 }
 
 // newTxnHandle creates a new TxnHandle.
@@ -194,40 +195,51 @@ func (t *TxnHandle) BatchGet(ctx context.Context, keys [][]byte) ([]KvPair, erro
 	return nil, fmt.Errorf("batch get: lock resolution retries exhausted")
 }
 
-// kvBatchGet performs a KvBatchGet RPC.
+// kvBatchGet performs KvBatchGet RPCs, grouping keys by region.
 func (t *TxnHandle) kvBatchGet(ctx context.Context, keys [][]byte) ([]KvPair, *kvrpcpb.LockInfo, error) {
-	// Use the first key for region routing; the server handles multi-key reads.
-	var pairs []KvPair
-	var lockInfo *kvrpcpb.LockInfo
+	groups, err := t.client.cache.GroupKeysByRegion(ctx, keys)
+	if err != nil {
+		return nil, nil, fmt.Errorf("group keys by region: %w", err)
+	}
 
-	err := t.client.sender.SendToRegion(ctx, keys[0], func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
-		resp, err := client.KvBatchGet(ctx, &kvrpcpb.BatchGetRequest{
-			Context: buildContext(info),
-			Keys:    keys,
-			Version: uint64(t.startTS),
+	var allPairs []KvPair
+	for _, group := range groups {
+		var pairs []KvPair
+		var lockInfo *kvrpcpb.LockInfo
+
+		err := t.client.sender.SendToRegion(ctx, group.Keys[0], func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+			resp, err := client.KvBatchGet(ctx, &kvrpcpb.BatchGetRequest{
+				Context: buildContext(info),
+				Keys:    group.Keys,
+				Version: uint64(t.startTS),
+			})
+			if err != nil {
+				return nil, err
+			}
+			if resp.GetRegionError() != nil {
+				return resp.GetRegionError(), nil
+			}
+			if resp.GetError() != nil {
+				if resp.GetError().GetLocked() != nil {
+					lockInfo = resp.GetError().GetLocked()
+					return nil, nil
+				}
+				return nil, fmt.Errorf("batch get error: %s", resp.GetError().String())
+			}
+			for _, p := range resp.GetPairs() {
+				pairs = append(pairs, KvPair{Key: p.GetKey(), Value: p.GetValue()})
+			}
+			return nil, nil
 		})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if resp.GetRegionError() != nil {
-			return resp.GetRegionError(), nil
+		if lockInfo != nil {
+			return nil, lockInfo, nil
 		}
-		if resp.GetError() != nil {
-			if resp.GetError().GetLocked() != nil {
-				lockInfo = resp.GetError().GetLocked()
-				return nil, nil
-			}
-			return nil, fmt.Errorf("batch get error: %s", resp.GetError().String())
-		}
-		for _, p := range resp.GetPairs() {
-			pairs = append(pairs, KvPair{Key: p.GetKey(), Value: p.GetValue()})
-		}
-		return nil, nil
-	})
-	if err != nil {
-		return nil, nil, err
+		allPairs = append(allPairs, pairs...)
 	}
-	return pairs, lockInfo, nil
+	return allPairs, nil, nil
 }
 
 // Set buffers a put mutation. In pessimistic mode, it also acquires a
@@ -311,14 +323,26 @@ func (t *TxnHandle) acquirePessimisticLock(ctx context.Context, key []byte) erro
 	})
 }
 
-// primaryKey returns the primary key for the transaction.
+// primaryKey returns the primary key for the transaction (deterministic).
 // Must be called with t.mu held.
 func (t *TxnHandle) primaryKey() []byte {
-	// Use the first key in the mutation buffer as primary.
-	for k := range t.membuf {
-		return []byte(k)
+	if t.cachedPrimary != nil {
+		return t.cachedPrimary
 	}
-	return nil
+	// Pick the lexicographically smallest key for determinism.
+	var minKey string
+	first := true
+	for k := range t.membuf {
+		if first || k < minKey {
+			minKey = k
+			first = true
+		}
+		first = false
+	}
+	if minKey != "" {
+		t.cachedPrimary = []byte(minKey)
+	}
+	return t.cachedPrimary
 }
 
 // Commit commits the transaction using the two-phase commit protocol.

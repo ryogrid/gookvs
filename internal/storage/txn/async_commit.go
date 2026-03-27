@@ -40,15 +40,23 @@ func PrewriteAsyncCommit(txn *mvcc.MvccTxn, reader *mvcc.MvccReader, props Async
 		return ErrKeyIsLocked
 	}
 
-	// 2. Check for write conflicts.
-	write, commitTS, err := reader.SeekWrite(key, txntypes.TSMax)
-	if err != nil {
-		return err
-	}
-	if write != nil && commitTS > props.StartTS {
+	// 2. Check for write conflicts (loop to skip Rollback/Lock records).
+	seekTS := txntypes.TSMax
+	for i := 0; i < mvcc.SeekBound*2; i++ {
+		write, commitTS, err := reader.SeekWrite(key, seekTS)
+		if err != nil {
+			return err
+		}
+		if write == nil {
+			break
+		}
+		if commitTS <= props.StartTS {
+			break
+		}
 		if write.WriteType != txntypes.WriteTypeRollback && write.WriteType != txntypes.WriteTypeLock {
 			return ErrWriteConflict
 		}
+		seekTS = commitTS.Prev()
 	}
 
 	// 3. Build the lock.

@@ -129,18 +129,6 @@ func (s *RegionRequestSender) handleRegionError(ctx context.Context, info *Regio
 	return false
 }
 
-// isRetryableRegionError returns true if the region error can be retried.
-func isRetryableRegionError(err *errorpb.Error) bool {
-	if err == nil {
-		return false
-	}
-	return err.GetNotLeader() != nil ||
-		err.GetRegionNotFound() != nil ||
-		err.GetEpochNotMatch() != nil ||
-		err.GetStoreNotMatch() != nil ||
-		err.GetKeyNotInRegion() != nil
-}
-
 // getOrDial returns a cached connection or dials a new one.
 func (s *RegionRequestSender) getOrDial(addr string) (*grpc.ClientConn, error) {
 	s.mu.RLock()

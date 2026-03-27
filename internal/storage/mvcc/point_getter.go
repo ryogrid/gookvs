@@ -78,7 +78,7 @@ func (pg *PointGetter) Get(key Key) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if lock != nil && lock.StartTS <= pg.ts {
+		if lock != nil && lock.StartTS <= pg.ts && lock.LockType != txntypes.LockTypePessimistic {
 			if !pg.bypassLocks[lock.StartTS] {
 				return nil, &LockError{Key: key, Lock: lock}
 			}

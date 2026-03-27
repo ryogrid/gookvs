@@ -62,11 +62,11 @@ func NewScanner(cfg ScannerConfig) *Scanner {
 		}
 	} else {
 		// Backward scan: swap bounds.
-		if cfg.UpperBound != nil {
+		if cfg.LowerBound != nil {
 			writeOpts.LowerBound = EncodeKey(cfg.LowerBound, txntypes.TSMax)
 			lockOpts.LowerBound = EncodeLockKey(cfg.LowerBound)
 		}
-		if cfg.LowerBound != nil {
+		if cfg.UpperBound != nil {
 			// For backward scan, the "upper" is the start position.
 			writeOpts.UpperBound = EncodeKey(cfg.UpperBound, 0)
 			lockOpts.UpperBound = EncodeLockKey(cfg.UpperBound)

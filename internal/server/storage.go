@@ -478,8 +478,18 @@ func (s *Storage) CleanupModifies(key []byte, startTS txntypes.TimeStamp) (txnty
 
 	primaryStatus, err := txn.CheckTxnStatus(reader, primaryKey, startTS)
 	if err != nil {
-		// Primary check failed — force-remove the lock.
-		mvccTxn.UnlockKey(key, keyLock.LockType == txntypes.LockTypePessimistic)
+		// Primary check failed — remove the lock and write a rollback record
+		// to prevent a late-arriving commit from succeeding.
+		isPessimistic := keyLock.LockType == txntypes.LockTypePessimistic
+		mvccTxn.UnlockKey(key, isPessimistic)
+		if keyLock.ShortValue == nil && keyLock.LockType == txntypes.LockTypePut {
+			mvccTxn.DeleteValue(key, startTS)
+		}
+		rollbackWrite := &txntypes.Write{
+			WriteType: txntypes.WriteTypeRollback,
+			StartTS:   startTS,
+		}
+		mvccTxn.PutWrite(key, startTS, rollbackWrite)
 		return 0, mvccTxn.Modifies, nil, guard
 	}
 
