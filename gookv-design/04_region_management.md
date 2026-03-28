@@ -1480,16 +1480,37 @@ if err == router.ErrMailboxFull {
 
 ### Loopback Optimization
 
-When a Raft message's target peer is on the same store, the coordinator delivers it directly through the router instead of going through gRPC:
+When a Raft message's target peer is on the same store, `sendRaftMessage()` in `internal/server/coordinator.go` delivers it directly through the router instead of going through gRPC.
+
+The target region ID is resolved via the router's peer-to-region mapping (`Router.FindRegionByPeerID`), falling back to the source region ID if the mapping is not found. This is essential after a region split: the target peer may now belong to a different region than the source peer, so using the source region ID would route the message to the wrong mailbox.
 
 ```go
 if toStoreID == sc.storeID {
-    // Direct delivery via router (no gRPC overhead)
+    // Find the target region ID for this peer. After a split, the target
+    // peer may belong to a different region than the source.
+    targetRegionID := regionID // fallback to source region
+    if rid, ok := sc.router.FindRegionByPeerID(msg.To); ok {
+        targetRegionID = rid
+    }
+
     peerMsg := raftstore.PeerMsg{Type: raftstore.PeerMsgTypeRaftMessage, Data: msg}
-    sc.router.Send(regionID, peerMsg)
+    if err := sc.router.Send(targetRegionID, peerMsg); err == router.ErrMailboxFull {
+        for i := 0; i < 3; i++ {
+            time.Sleep(time.Millisecond)
+            if err = sc.router.Send(targetRegionID, peerMsg); err != router.ErrMailboxFull {
+                break
+            }
+        }
+    }
     return
 }
 ```
+
+The peer-to-region mapping is maintained in the router via `RegisterPeer(peerID, regionID)` and `UnregisterPeer(peerID)`, called at three lifecycle points:
+
+1. **Bootstrap**: When a peer is first created during store bootstrap.
+2. **CreatePeer**: When a new peer is created (e.g., the child region peer after a split, or a peer created in response to a Raft message for an unknown region).
+3. **DestroyPeer**: When a peer is removed via configuration change or region merge.
 
 This is critical for `ReadIndex` (ReadOnlySafe mode), which requires heartbeat responses from local follower peers. Without loopback, these responses would need to traverse gRPC even when source and target are in the same process.
 

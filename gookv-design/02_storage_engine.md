@@ -557,7 +557,9 @@ type WriteBatch interface {
     Clear()
     SetSavePoint()
     RollbackToSavePoint() error
+    PopSavePoint() error
     Commit() error
+    CommitNoSync() error
 }
 ```
 
@@ -574,7 +576,9 @@ type WriteBatch interface {
 | `Clear()` | Discard all buffered operations |
 | `SetSavePoint()` | Mark the current state for potential rollback |
 | `RollbackToSavePoint()` | Undo all operations since the last save point |
-| `Commit()` | Atomically apply all buffered operations to disk |
+| `PopSavePoint()` | Discard the last save point without rolling back |
+| `Commit()` | Atomically apply all buffered operations to disk with fsync |
+| `CommitNoSync()` | Atomically apply all buffered operations without fsync. Used when durability is guaranteed by another mechanism (e.g., Raft log) or recoverability by re-running the operation (e.g., GC) |
 
 ### 6.4 Implementation
 
@@ -600,12 +604,17 @@ Key implementation details:
 - **Thread safety**: All mutation methods acquire `mu` before modifying the
   batch. The `sync.Mutex` prevents data races when multiple goroutines share
   a batch (rare but possible).
-- **Synchronous commit**: `Commit()` calls `batch.Commit(pebble.Sync)`,
-  ensuring durability. When the method returns, the data is on disk.
+- **Sync vs NoSync commit**: `Commit()` calls `batch.Commit(pebble.Sync)`,
+  ensuring durability -- used by Raft log persistence (`SaveReady`).
+  `CommitNoSync()` calls `batch.Commit(pebble.NoSync)` -- used by the apply
+  path (`Storage.ApplyModifies`) where the Raft log guarantees durability, and
+  by `GCWorker.applyModifies` where GC writes are recoverable by re-running GC
+  after crash.
 - **Save points**: `SetSavePoint()` captures the batch state by calling
   `batch.Repr()` to serialize the entire batch contents. `RollbackToSavePoint()`
   creates a new Pebble batch, calls `newBatch.SetRepr(savedRepr)` to restore
-  the serialized state, and discards the old batch.
+  the serialized state, and discards the old batch. `PopSavePoint()` discards
+  the last save point without rolling back.
 - **Value copying**: All `Put` operations copy the key and value into the
   batch's internal buffer. Callers can reuse their slices immediately after
   calling `Put`.
@@ -630,8 +639,13 @@ sequenceDiagram
 
     Note over Storage: All or nothing
 
-    Storage->>WB: Commit()
-    WB->>Pebble: batch.Commit(pebble.Sync)
+    alt Raft log persistence (SaveReady)
+        Storage->>WB: Commit()
+        WB->>Pebble: batch.Commit(pebble.Sync)
+    else Apply path (Storage.ApplyModifies) / GC
+        Storage->>WB: CommitNoSync()
+        WB->>Pebble: batch.Commit(pebble.NoSync)
+    end
     Pebble-->>WB: nil
     WB-->>Storage: nil (success)
 ```
@@ -1708,13 +1722,20 @@ returning. This is necessary because Pebble may reuse its internal buffers on
 subsequent operations. The copy adds allocation overhead but prevents subtle
 bugs where a caller holds a reference to a buffer that gets overwritten.
 
-### 18.2 Synchronous Writes
+### 18.2 Write Durability Strategy
 
-All `Put`, `Delete`, and `WriteBatch.Commit` operations use `pebble.Sync`,
-meaning the WAL is flushed to disk before the operation returns. This provides
-strong durability but impacts write latency. In cluster mode, this is
-acceptable because Raft already provides durability through replication -- a
-single node's crash is tolerable.
+Direct engine methods (`Put`, `Delete`) and `WriteBatch.Commit()` use
+`pebble.Sync`, meaning the WAL is flushed to disk before the operation
+returns. This is used for Raft log persistence (`SaveReady`) where crash
+durability is required.
+
+`WriteBatch.CommitNoSync()` uses `pebble.NoSync`, skipping the fsync. This is
+used by the apply path (`Storage.ApplyModifies`) and the GC worker
+(`GCWorker.applyModifies`). For the apply path, durability is already
+guaranteed by the Raft log -- on crash, unapplied entries are replayed from
+the persisted log. For GC, writes are recoverable by simply re-running GC
+after crash. Avoiding fsync on these write paths significantly reduces write
+latency and I/O amplification.
 
 ### 18.3 Key Prefix Overhead
 
@@ -1750,6 +1771,10 @@ gookv. Its key design decisions are:
    avoiding an extra CF_DEFAULT read in the common case.
 7. **Atomic WriteBatch** that ensures multi-CF operations (like commit: write
    to CF_WRITE + delete from CF_LOCK) are all-or-nothing.
+8. **Sync/NoSync split** on `WriteBatch` commit: `Commit()` (fsync) for Raft
+   log persistence where crash durability is required; `CommitNoSync()` (no
+   fsync) for the apply path and GC writes where durability is guaranteed by
+   the Raft log or recoverability by re-running the operation.
 
 These decisions are not arbitrary -- they are inherited from TiKV's proven
 design, adapted to Go's strengths (pure Go, no CGo, goroutine-friendly).

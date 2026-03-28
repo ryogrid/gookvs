@@ -337,7 +337,17 @@ type Peer struct {
     applyFunc        func(uint64, []raftpb.Entry)  // committed entry application
 
     // Proposal tracking
-    pendingProposals map[uint64]func([]byte, error)  // log index -> completion callback
+    nextProposalID   uint64              // per-peer monotonic counter for proposal IDs
+    currentTerm      uint64              // cached Raft term, updated from HardState in handleReady
+    pendingProposals map[uint64]proposalEntry  // proposalID -> entry (callback, term, timestamp)
+
+    // I/O coalescing
+    raftLogWriter    *RaftLogWriter      // batches Raft log persistence across regions (nil = legacy)
+
+    // Async apply
+    applyWorkerPool  *ApplyWorkerPool    // processes committed entries asynchronously (nil = legacy)
+    applyInFlight    bool                // true when an async apply task is outstanding
+    pendingApplyTasks []*ApplyTask       // buffered apply tasks when apply is in-flight
 
     // Log compaction
     raftLogSizeHint  uint64              // estimated bytes in the Raft log
@@ -356,7 +366,7 @@ type Peer struct {
     nextReadID       atomic.Uint64            // unique ID generator for read requests
 
     // Leader lease
-    leaseExpiry      time.Time            // when the lease expires
+    leaseExpiryNanos atomic.Int64         // Unix nanoseconds; accessed from multiple goroutines
     leaseValid       atomic.Bool          // whether the lease is currently valid
 
     // State flags
@@ -382,7 +392,13 @@ classDiagram
         +Mailbox chan PeerMsg
         -sendFunc func([]raftpb.Message)
         -applyFunc func(uint64, []raftpb.Entry)
-        -pendingProposals map
+        -nextProposalID uint64
+        -currentTerm uint64
+        -pendingProposals map[uint64]proposalEntry
+        -raftLogWriter *RaftLogWriter
+        -applyWorkerPool *ApplyWorkerPool
+        -applyInFlight bool
+        -pendingApplyTasks []*ApplyTask
         -pendingReads map
         +Run(ctx)
         +Propose(data) error
@@ -391,6 +407,11 @@ classDiagram
         -handleMessage(msg)
         -propose(cmd)
         -handleReady()
+        -failAllPendingProposals(err)
+        -sweepStaleProposals(maxAge)
+        -applyInline(entries)
+        -submitToApplyWorker(entries)
+        -onApplyResult(result)
         -onRaftLogGCTick()
         -onSplitCheckTick()
         -handleReadIndexRequest(req)
@@ -503,7 +524,7 @@ type PeerMsg struct {
 | `PeerMsgTypeApplyResult` | 3 | `*ApplyResult` | Process results from the apply worker via `onApplyResult()` |
 | `PeerMsgTypeSignificant` | 4 | `*SignificantMsg` | High-priority control: Unreachable, SnapshotStatus, MergeResult |
 | `PeerMsgTypeStart` | 5 | (none) | Peer initialization signal (defined but not currently handled) |
-| `PeerMsgTypeDestroy` | 6 | (none) | Stop the peer and close the mailbox |
+| `PeerMsgTypeDestroy` | 6 | (none) | Set `stopped = true` (mailbox is NOT closed to avoid panics from concurrent senders) |
 | `PeerMsgTypeCasual` | 7 | (none) | Low-priority, droppable messages (defined but not handled) |
 | `PeerMsgTypeSchedule` | 8 | `*ScheduleMsg` | PD scheduling: TransferLeader, ChangePeer, Merge |
 | `PeerMsgTypeReadIndex` | 9 | `*ReadIndexRequest` | Linearizable read index request from coordinator |
@@ -519,8 +540,9 @@ type RaftCommand struct {
 ```
 
 A `RaftCommand` wraps a client request (serialized as protobuf) with a callback
-that is invoked when the request is committed and applied. The `Callback` is
-stored in `pendingProposals` by the expected log index.
+that is invoked when the request is committed and applied. The `Callback`
+receives a `*RaftCmdResponse` (nil on success, or an error response built by
+`errorResponse()`). It is stored in `pendingProposals` keyed by `proposalID`.
 
 ### 7.4 ReadIndexRequest
 
@@ -531,11 +553,34 @@ type ReadIndexRequest struct {
 }
 ```
 
-### 7.5 Other Data Structs
+### 7.5 proposalEntry
+
+```go
+type proposalEntry struct {
+    callback func(*raft_cmdpb.RaftCmdResponse)
+    term     uint64
+    proposed time.Time
+}
+```
+
+Tracks an in-flight proposal's callback, the Raft term when proposed, and the
+wall-clock time for stale proposal sweeping.
+
+### 7.6 errorResponse Helper
+
+```go
+func errorResponse(err error) *raft_cmdpb.RaftCmdResponse
+```
+
+Builds a `RaftCmdResponse` with the error message in the header's `Error` field.
+Used by `propose()`, `failAllPendingProposals()`, and `applyInline()` to
+deliver error results to proposal callbacks.
+
+### 7.7 Other Data Structs
 
 | Struct | Fields | Purpose |
 |--------|--------|---------|
-| `ApplyResult` | `RegionID`, `Results []ExecResult` | Results from applying committed entries |
+| `ApplyResult` | `RegionID`, `AppliedIndex`, `Results []ExecResult` | Results from applying committed entries (includes applied index for async path) |
 | `ExecResult` | `Type ExecResultType`, `Data interface{}` | Single execution result |
 | `SplitRegionResult` | `Derived *metapb.Region`, `Regions []*metapb.Region` | Split operation output |
 | `CompactLogRequest` | `CompactIndex`, `CompactTerm` | Parameters for log compaction |
@@ -578,7 +623,7 @@ flowchart TD
     Bootstrap --> CreatePeer
     Restart --> CreatePeer
 
-    CreatePeer["Create Peer struct<br/>Mailbox = make(chan, 256)<br/>pendingProposals = map<br/>pendingReads = map"]
+    CreatePeer["Create Peer struct<br/>Mailbox = make(chan, 256)<br/>nextProposalID = 1<br/>pendingProposals = map<br/>pendingReads = map"]
 ```
 
 The `raft.Config` passed to `raft.NewRawNode` is configured with:
@@ -619,6 +664,8 @@ peer.SetPDTaskCh(pdTaskCh)                   // PD heartbeat tasks
 peer.SetSplitCheckCh(splitCheckCh)           // split check tasks
 peer.SetSplitResultCh(splitResultCh)         // split results
 peer.SetSnapTaskCh(snapTaskCh)               // snapshot generation tasks
+peer.SetRaftLogWriter(raftLogWriter)         // I/O coalescing (optional)
+peer.SetApplyWorkerPool(applyPool)           // async apply (optional)
 
 router.Register(regionID, peer.Mailbox)      // register with router
 go peer.Run(ctx)                             // start event loop goroutine
@@ -688,6 +735,9 @@ func (p *Peer) Run(ctx context.Context) {
         drained:
         }
 
+        if p.stopped.Load() {
+            return  // Exit if PeerMsgTypeDestroy set stopped flag
+        }
         p.handleReady()  // Process Raft Ready after EVERY event
     }
 }
@@ -755,7 +805,8 @@ func (p *Peer) handleMessage(msg PeerMsg) {
 
     case PeerMsgTypeDestroy:
         p.stopped.Store(true)
-        close(p.Mailbox)
+        // Don't close Mailbox — external goroutines may still send to it.
+        // The Run() loop will exit via the stopped flag check.
 
     case PeerMsgTypeReadIndex:
         req := msg.Data.(*ReadIndexRequest)
@@ -806,15 +857,21 @@ flowchart TD
     UpdateLeader --> CheckNewLeader{"Became leader?"}
     CheckNewLeader -->|"Yes"| NotifyPD["sendRegionHeartbeatToPD()<br/>Extend leader lease"]
     CheckNewLeader -->|"No"| CheckStepDown{"Stepped down?"}
-    CheckStepDown -->|"Yes"| InvalidateLease["Invalidate lease<br/>Clear pending reads"]
-    CheckStepDown -->|"No"| Persist
-    NotifyPD --> Persist
-    InvalidateLease --> Persist
-    CheckSoftState -->|"No"| Persist
+    CheckStepDown -->|"Yes"| InvalidateLease["Invalidate lease<br/>failAllPendingProposals<br/>Clear pending reads"]
+    CheckStepDown -->|"No"| CacheTerm
+    NotifyPD --> CacheTerm
+    InvalidateLease --> CacheTerm
+    CheckSoftState -->|"No"| CacheTerm
 
-    Persist["storage.SaveReady(rd)<br/>Write HardState + Entries to CF_RAFT"]
+    CacheTerm["Cache currentTerm from<br/>rd.HardState (if non-empty)"]
 
-    Persist --> CheckSnap{"rd.Snapshot non-empty?"}
+    CacheTerm --> Persist{"raftLogWriter != nil?"}
+    Persist -->|"Yes"| BatchPath["BuildWriteTask(rd)<br/>Submit to RaftLogWriter<br/>Wait on task.Done<br/>ApplyWriteTaskPostPersist"]
+    Persist -->|"No"| LegacyPath["storage.SaveReady(rd)<br/>Write HardState + Entries to CF_RAFT"]
+
+    BatchPath --> CheckSnap
+    LegacyPath --> CheckSnap
+    CheckSnap{"rd.Snapshot non-empty?"}
     CheckSnap -->|"Yes"| ApplySnap["storage.ApplySnapshot(rd.Snapshot)<br/>Apply received snapshot data"]
     CheckSnap -->|"No"| SendMsgs
     ApplySnap --> SendMsgs
@@ -825,12 +882,13 @@ flowchart TD
     Send --> CheckCommitted
 
     CheckCommitted{"Committed entries?"}
-    CheckCommitted -->|"Yes"| ProcessAdmin["Process admin entries first:<br/>ConfChange -> applyConfChangeEntry<br/>SplitAdmin -> applySplitAdminEntry"]
-    ProcessAdmin --> ApplyEntries["applyFunc(regionID, entries)<br/>Apply ALL entries to state machine"]
-    ApplyEntries --> InvokeCallbacks["Invoke pendingProposals callbacks<br/>for each committed entry index"]
-    InvokeCallbacks --> UpdateApplied["Update applied index"]
+    CheckCommitted -->|"Yes"| ProcessAdmin["Process admin entries inline:<br/>ConfChange -> applyConfChangeEntry<br/>SplitAdmin -> applySplitAdminEntry"]
+    ProcessAdmin --> CheckAsync{"applyWorkerPool != nil?"}
+    CheckAsync -->|"Yes"| AsyncApply["submitToApplyWorker(entries)<br/>Filter to data entries only<br/>(non-admin, len>8)<br/>Extract callbacks from pendingProposals"]
+    CheckAsync -->|"No"| InlineApply["applyInline(entries)<br/>Filter to data entries, call applyFunc<br/>Match callbacks by proposalID<br/>Update applied index + persist"]
+    AsyncApply --> ProcessReads
+    InlineApply --> ProcessReads
     CheckCommitted -->|"No"| ProcessReads
-    UpdateApplied --> ProcessReads
 
     ProcessReads{"ReadStates present?"}
     ProcessReads -->|"Yes"| ExtendLease["Extend leader lease<br/>(quorum confirmed)"]
@@ -869,13 +927,14 @@ func (p *Peer) handleReady() {
             p.sendRegionHeartbeatToPD()
             electionTimeout := time.Duration(p.cfg.RaftElectionTimeoutTicks) *
                 p.cfg.RaftBaseTickInterval
-            p.leaseExpiry = time.Now().Add(electionTimeout * 4 / 5)
+            p.leaseExpiryNanos.Store(time.Now().Add(electionTimeout * 4 / 5).UnixNano())
             p.leaseValid.Store(true)
         }
 
-        // On stepping down: invalidate lease, fail pending reads.
+        // On stepping down: invalidate lease, fail pending proposals and reads.
         if !p.isLeader.Load() && wasLeader {
             p.leaseValid.Store(false)
+            p.failAllPendingProposals(fmt.Errorf("leader stepped down"))
         }
         if !p.isLeader.Load() && len(p.pendingReads) > 0 {
             for key, pr := range p.pendingReads {
@@ -885,9 +944,23 @@ func (p *Peer) handleReady() {
         }
     }
 
-    // Step 4: Persist entries and hard state to CF_RAFT.
-    if err := p.storage.SaveReady(rd); err != nil {
-        return // Fatal: persistence failure
+    // Step 3b: Cache current term for use in propose() without calling Status().
+    if !raft.IsEmptyHardState(rd.HardState) {
+        p.currentTerm = rd.HardState.Term
+    }
+
+    // Step 4: Persist entries and hard state.
+    if p.raftLogWriter != nil {
+        // Batch write path: submit to shared writer for I/O coalescing.
+        task, _ := p.storage.BuildWriteTask(rd)
+        p.raftLogWriter.Submit(task)
+        <-task.Done  // wait for batch persistence
+        p.storage.ApplyWriteTaskPostPersist(task)
+    } else {
+        // Legacy path: inline SaveReady with per-region fsync.
+        if err := p.storage.SaveReady(rd); err != nil {
+            return
+        }
     }
 
     // Step 5: Apply snapshot if received.
@@ -904,31 +977,21 @@ func (p *Peer) handleReady() {
 
     // Step 7: Apply committed entries.
     if len(rd.CommittedEntries) > 0 {
-        // 7a: Process admin commands FIRST (before data entries).
+        // 7a: Process admin commands inline FIRST (before data entries).
         for _, e := range rd.CommittedEntries {
             if e.Type == raftpb.EntryConfChange || ... {
                 p.applyConfChangeEntry(e)
-            } else if IsSplitAdmin(e.Data) {
+            } else if e.Type == raftpb.EntryNormal && IsSplitAdmin(e.Data) {
                 p.applySplitAdminEntry(&e)
             }
         }
 
-        // 7b: Forward ALL entries to apply worker.
-        if p.applyFunc != nil {
-            p.applyFunc(p.regionID, rd.CommittedEntries)
+        // 7b: Send filtered data entries to apply path.
+        if p.applyWorkerPool != nil {
+            p.submitToApplyWorker(rd.CommittedEntries)
+        } else {
+            p.applyInline(rd.CommittedEntries)
         }
-
-        // 7c: Invoke callbacks for committed proposals.
-        for _, e := range rd.CommittedEntries {
-            if cb, ok := p.pendingProposals[e.Index]; ok {
-                cb(e.Data, nil)
-                delete(p.pendingProposals, e.Index)
-            }
-        }
-
-        // 7d: Update applied index.
-        lastEntry := rd.CommittedEntries[len(rd.CommittedEntries)-1]
-        p.storage.SetAppliedIndex(lastEntry.Index)
     }
 
     // Step 8: Process ReadIndex results.
@@ -936,7 +999,7 @@ func (p *Peer) handleReady() {
         // Extend lease (quorum round-trip just succeeded).
         electionTimeout := time.Duration(p.cfg.RaftElectionTimeoutTicks) *
             p.cfg.RaftBaseTickInterval
-        p.leaseExpiry = time.Now().Add(electionTimeout * 4 / 5)
+        p.leaseExpiryNanos.Store(time.Now().Add(electionTimeout * 4 / 5).UnixNano())
         p.leaseValid.Store(true)
     }
     for _, rs := range rd.ReadStates {
@@ -965,17 +1028,18 @@ func (p *Peer) handleReady() {
 }
 ```
 
-### 10.4 Admin Entry Ordering
+### 10.4 Admin Entry Filtering
 
-A critical detail: admin commands (ConfChange, SplitAdmin) are processed in the
-**first loop** over committed entries, before `applyFunc` is called. This
-ensures that region metadata is updated before data entries are applied. For
-example, a split changes the region's key range -- data entries must be applied
-with the updated range.
+A critical detail: admin commands (ConfChange, SplitAdmin, CompactLog) are
+processed **inline** in the first loop over committed entries, before data
+entries are sent to `applyFunc`. This ensures that region metadata is updated
+before data entries are applied.
 
-When `applyFunc` receives the entries, admin entries (SplitAdmin, CompactLog)
-are harmlessly skipped because they fail protobuf unmarshal (they use custom
-binary formats, not protobuf).
+Only **data entries** are forwarded to the apply path (whether inline or
+async). The filtering condition is:
+`EntryNormal && !IsSplitAdmin(data) && !IsCompactLog(data) && len(data) > 8`.
+The `len(data) > 8` check ensures the entry has the 8-byte proposal ID prefix
+(entries without it, such as no-op entries from leader election, are skipped).
 
 ---
 
@@ -1002,15 +1066,16 @@ sequenceDiagram
 
     Peer->>Peer: handleMessage(RaftCommand)
     Peer->>Peer: propose(cmd)
-    Peer->>RawNode: rawNode.Propose(data)
-    Peer->>Peer: pendingProposals[lastIdx+1] = callback
+    Note over Peer: Generate proposalID, prepend 8-byte ID to data
+    Peer->>RawNode: rawNode.Propose(tagged)
+    Peer->>Peer: pendingProposals[proposalID] = proposalEntry{callback, term, now}
 
     Note over Peer: handleReady() runs
 
     Peer->>RawNode: HasReady() -> true
     Peer->>RawNode: Ready() -> rd
 
-    Peer->>Storage: SaveReady(rd)<br/>Persist entries + HardState
+    Peer->>Storage: Persist entries + HardState<br/>(SaveReady or BuildWriteTask+RaftLogWriter)
 
     Peer->>Transport: sendFunc(rd.Messages)<br/>AppendEntries to followers
 
@@ -1022,10 +1087,11 @@ sequenceDiagram
 
     Peer->>RawNode: Ready() -> rd2<br/>CommittedEntries includes our entry
 
-    Peer->>Peer: applyFunc(regionID, entries)
+    Peer->>Peer: Filter data entries, match by proposalID<br/>from first 8 bytes of entry data
+    Peer->>Peer: applyFunc(regionID, dataEntries)
     Note over Peer: Storage.ApplyModifies() writes to Pebble
 
-    Peer->>Peer: pendingProposals[idx] callback
+    Peer->>Peer: Invoke callback (with term check)
     Peer-->>Coord: Callback invoked
     Coord-->>Client: nil (success)
 ```
@@ -1055,53 +1121,76 @@ func (p *Peer) propose(cmd *RaftCommand) {
         return
     }
 
+    proposalID := p.nextProposalID
+    p.nextProposalID++
+
     data, err := cmd.Request.Marshal()
     if err != nil {
+        if cmd.Callback != nil {
+            cmd.Callback(errorResponse(err))
+        }
         return
     }
 
-    if err := p.rawNode.Propose(data); err != nil {
-        // IMPORTANT: Do NOT call callback on failure.
-        // Let ProposeModifies timeout and return error.
+    // Prepend 8-byte proposal ID to data.
+    tagged := make([]byte, 8+len(data))
+    binary.BigEndian.PutUint64(tagged[:8], proposalID)
+    copy(tagged[8:], data)
+
+    if err := p.rawNode.Propose(tagged); err != nil {
+        if cmd.Callback != nil {
+            cmd.Callback(errorResponse(err))
+        }
         return
     }
 
-    // Track the proposal callback.
-    lastIdx, _ := p.storage.LastIndex()
-    expectedIdx := lastIdx + 1
     if cmd.Callback != nil {
-        p.pendingProposals[expectedIdx] = func(_ []byte, _ error) {
-            cmd.Callback(nil)
+        p.pendingProposals[proposalID] = proposalEntry{
+            callback: cmd.Callback,
+            term:     p.currentTerm,
+            proposed: time.Now(),
         }
     }
 }
 ```
 
-### 12.1 Critical Design Decision: No Callback on Propose Failure
+### 12.1 Proposal ID Tagging
 
-When `rawNode.Propose()` fails (for example, because the node is no longer
-the leader), the `propose()` function does **not** call the callback. This is
-intentional.
+Each proposal is assigned a monotonically increasing `proposalID` (starting
+from 1). The ID is prepended as 8 big-endian bytes to the entry data before
+calling `rawNode.Propose()`. When committed entries arrive in `handleReady`,
+the proposal ID is extracted from the first 8 bytes of each entry's data to
+match it against `pendingProposals`.
 
-If the callback were called with `nil` (success), `ProposeModifies` would
-report success even though the entry never entered the Raft log -- a silent
-data loss.
+This design replaces the earlier approach of predicting the log index
+(`lastIdx + 1`). The proposal ID approach is robust against index prediction
+errors that could occur if entries are appended by other paths (e.g., no-op
+entries from leader election, admin commands from other goroutines).
 
-If the callback were called with an error, `ProposeModifies` might return
-before the timeout, but the error handling would be ambiguous (is this a
-transient error? Should the client retry?).
+### 12.2 Callback on Failure
 
-Instead, the proposal simply times out. The caller (`ProposeModifies`) has a
-timeout parameter and returns a timeout error, which the gRPC handler converts
-to a `NotLeader` region error. The client then refreshes its region cache and
-retries with the new leader.
+When `rawNode.Propose()` fails or marshaling fails, the callback is invoked
+immediately with an `errorResponse`. The `errorResponse()` helper
+(`msg.go`) builds a `RaftCmdResponse` with the error in the header. This
+allows the caller (`ProposeModifies`) to detect the failure immediately rather
+than timing out.
 
-### 12.2 Index Prediction
+### 12.3 Term Tracking
 
-The callback is stored in `pendingProposals` at `lastIdx + 1` -- the expected
-index of the proposed entry. This is a prediction: the actual index might differ
-if another proposal was appended concurrently. However, since each `Peer` runs
-in a single goroutine, proposals are sequential, and the prediction is reliable.
+The `proposalEntry` records the Raft term at proposal time (`p.currentTerm`).
+When matching committed entries, if the committed entry's term differs from the
+recorded term, the callback receives a "term mismatch" error. This detects
+the case where a proposal was proposed in one term but a different entry was
+committed at that position in a later term (e.g., after a leader change).
+
+### 12.4 Proposal Lifecycle Management
+
+Two methods manage stale proposals:
+
+- **`failAllPendingProposals(err)`**: Called on leader stepdown. Invokes all
+  pending callbacks with the given error and clears the map.
+- **`sweepStaleProposals(maxAge)`**: Fails proposals older than `maxAge`,
+  preventing memory leaks from proposals that were never committed.
 
 ---
 
@@ -1275,13 +1364,14 @@ which the leader can serve reads without a ReadIndex round-trip.
 The lease works as follows:
 
 1. When the leader confirms quorum (via ReadIndex ReadStates or on becoming
-   leader), it sets `leaseExpiry` to `now + 80% * election_timeout`.
+   leader), it sets `leaseExpiryNanos` to `now + 80% * election_timeout` (stored
+   as Unix nanoseconds via `atomic.Int64` for safe concurrent access).
 2. The 80% factor is conservative: the lease expires before followers would
    start an election (which happens at 100-200% of election_timeout due to
    randomization).
 3. During the lease window, reads can proceed immediately without ReadIndex.
 
-**Current status**: The lease is tracked (`leaseExpiry`, `leaseValid`) but the
+**Current status**: The lease is tracked (`leaseExpiryNanos`, `leaseValid`) but the
 fast path is disabled. The coordinator always uses the full ReadIndex protocol.
 This is because the lease confirms leadership but does not guarantee that all
 committed entries have been applied -- a read during the lease window could see
@@ -1346,7 +1436,7 @@ type PeerStorage struct {
 
 | Method | Behavior |
 |--------|----------|
-| `InitialState()` | Returns the in-memory `hardState` and an empty `ConfState` |
+| `InitialState()` | Returns the in-memory `hardState` and a `ConfState` derived from region peers (if `region` is set, each peer ID is added to `cs.Voters`) |
 | `Entries(lo, hi, maxSize)` | Serves from cache if range is covered; falls back to per-index engine reads; respects `maxSize` byte cap |
 | `Term(i)` | Returns truncated term for `TruncatedIndex`; otherwise checks cache, then engine |
 | `LastIndex()` | Returns last cache entry index, or `persistedLastIndex` if cache is empty |
@@ -1387,6 +1477,8 @@ When `Entries(lo, hi, maxSize)` is called:
    from the cache directly. This is the fast path.
 2. Otherwise, fall back to `readEntriesFromEngine(lo, hi)`, which reads entries
    one at a time from CF_RAFT using `engine.Get(CFRaft, RaftLogKey(regionID, idx))`.
+   If the first entry is not found, reading stops (compacted). If a subsequent
+   entry is missing (gap in the log), an error is returned.
 
 The `appendToCache` method handles overlap when new entries arrive:
 - If new entries start at or before the cache's first index, the cache is
@@ -1395,9 +1487,10 @@ The `appendToCache` method handles overlap when new entries arrive:
   appended.
 - If the total exceeds 1024 entries, the oldest are discarded.
 
-### 15.4 SaveReady
+### 15.4 SaveReady (Legacy Path)
 
-`SaveReady(rd raft.Ready)` persists a Ready batch atomically:
+`SaveReady(rd raft.Ready)` persists a Ready batch atomically. This is the
+legacy path used when `raftLogWriter` is nil:
 
 ```mermaid
 sequenceDiagram
@@ -1425,6 +1518,20 @@ sequenceDiagram
     PS->>PS: Update persistedLastIndex
 ```
 
+### 15.4b BuildWriteTask / ApplyWriteTaskPostPersist (Batch Path)
+
+When `raftLogWriter` is configured, persistence is split into two phases:
+
+1. **`BuildWriteTask(rd)`** serializes entries and hard state into `WriteOp`
+   structs without writing to the engine. Returns a `WriteTask` with a `Done`
+   channel.
+
+2. The peer submits the `WriteTask` to the `RaftLogWriter`, which batches
+   multiple regions' tasks into a single `WriteBatch` + fsync.
+
+3. **`ApplyWriteTaskPostPersist(task)`** updates the in-memory cache and
+   `persistedLastIndex` after receiving confirmation from `task.Done`.
+
 Key layout in CF_RAFT:
 
 | Key | Value |
@@ -1443,15 +1550,15 @@ flowchart TD
 
     Start --> ReadHS["Read HardState from<br/>RaftStateKey(regionID)<br/>in CF_RAFT"]
 
-    ReadHS --> ReadAS["Read ApplyState from<br/>ApplyStateKey(regionID)<br/>in CF_RAFT"]
-
-    ReadAS --> ScanEntries["Scan entries in<br/>RaftLogKeyRange(regionID)<br/>using CF_RAFT iterator"]
+    ReadHS --> ScanEntries["Scan entries in<br/>RaftLogKeyRange(regionID)<br/>using CF_RAFT iterator"]
 
     ScanEntries --> Unmarshal["Unmarshal each entry<br/>Track max index as<br/>persistedLastIndex"]
 
     Unmarshal --> CacheRecent["Keep last 1024 entries<br/>in memory cache"]
 
-    CacheRecent --> Done["Recovery complete"]
+    CacheRecent --> ReadAS["Read ApplyState from<br/>ApplyStateKey(regionID)<br/>in CF_RAFT<br/>(24-byte big-endian encoding)"]
+
+    ReadAS --> Done["Recovery complete"]
 ```
 
 ### 15.6 HasPersistedRaftState
@@ -1842,3 +1949,17 @@ multiple nodes. Its key design decisions are:
 7. **Snapshot throttling**: Concurrent outbound snapshots are limited to 3,
    preventing resource exhaustion when many regions need to be transferred
    simultaneously.
+
+8. **Proposal ID tagging**: Each proposal is tagged with a monotonic ID
+   (prepended as 8 bytes), enabling reliable callback matching regardless of
+   log index changes from leader elections or concurrent admin commands.
+
+9. **RaftLogWriter (I/O coalescing)**: An optional shared writer goroutine
+   batches `WriteTask`s from multiple peer goroutines into a single
+   `WriteBatch` + fsync, reducing the number of fsyncs from N (one per
+   region) to 1 per batch cycle.
+
+10. **ApplyWorkerPool (async apply)**: An optional goroutine pool processes
+    committed data entries asynchronously. Admin entries are still processed
+    inline, while data entries are filtered and submitted as `ApplyTask`s.
+    Results flow back to the peer via its mailbox as `ApplyResult` messages.

@@ -442,19 +442,19 @@ Provides the full Raw KV API with transparent cross-region routing.
 
 | Method | Description |
 |---|---|
-| `Scan(ctx, startKey, endKey, limit)` | Cross-region scan with limit |
-| `DeleteRange(ctx, startKey, endKey)` | Delete all keys in range |
+| `Scan(ctx, startKey, endKey, limit)` | Cross-region scan with limit. Recomputes `regionEnd`/`scanEnd` inside the `SendToRegion` callback so retries after cache invalidation use fresh region boundaries. |
+| `DeleteRange(ctx, startKey, endKey)` | Delete all keys in range, iterating across region boundaries (clamps range per region, advances to next region until covered) |
 
 **Atomic / utility operations:**
 
 | Method | Description |
 |---|---|
 | `CompareAndSwap(ctx, key, value, prevValue, prevNotExist)` | Atomic CAS. Returns `(succeeded, previousValue, error)` |
-| `Checksum(ctx, startKey, endKey)` | Returns `(checksum, totalKvs, totalBytes, error)` |
+| `Checksum(ctx, startKey, endKey)` | Cross-region checksum: iterates across regions, XORing per-region checksums and summing `totalKvs`/`totalBytes`. Returns `(checksum, totalKvs, totalBytes, error)` |
 
 ### 6.5 RegionCache
 
-Maintains a sorted `[]*RegionInfo` slice (binary search on `StartKey`) plus a `map[uint64]int` index by region ID.
+Maintains a sorted `[]*RegionInfo` slice (binary search on `StartKey`) plus a `map[uint64]int` index by region ID. On insertion (`insertLocked`), overlapping stale regions are evicted using the `regionsOverlap` helper before the new region is inserted into the sorted slice. This ensures that a pre-split region (e.g., `[a, z)`) is removed when a post-split region (e.g., `[a, m)`) is fetched from PD.
 
 | Method | Description |
 |---|---|
@@ -569,23 +569,24 @@ type TxnOption func(*TxnOptions)
 
 ```go
 type TxnHandle struct {
-    mu         sync.Mutex
-    client     *TxnKVClient
-    startTS    txntypes.TimeStamp
-    opts       TxnOptions
-    membuf     map[string]mutationEntry  // key → {op, value}
-    lockKeys   [][]byte                  // pessimistic lock keys
-    committed  bool
-    rolledBack bool
+    mu            sync.Mutex
+    client        *TxnKVClient
+    startTS       txntypes.TimeStamp
+    opts          TxnOptions
+    membuf        map[string]mutationEntry  // key → {op, value}
+    lockKeys      [][]byte                  // pessimistic lock keys
+    cachedPrimary []byte                    // deterministic primary key (cached)
+    committed     bool
+    rolledBack    bool
 }
 ```
 
 | Method | Description |
 |---|---|
 | `Get(ctx, key)` | Reads from `membuf` first, then issues `KvGet` RPC. Retries up to 20 times on lock conflicts using `LockResolver`, with a 200ms pause between retries to allow Raft proposals to be applied. Error messages include diagnostic info (lockVersion, primary key). Returns `(value, error)`. |
-| `BatchGet(ctx, keys)` | Multi-key read with membuf-first strategy. Returns `([]KvPair, error)`. |
-| `Set(ctx, key, value)` | Buffers a Put mutation. In pessimistic mode, acquires a pessimistic lock via `KvPessimisticLock` RPC. |
-| `Delete(ctx, key)` | Buffers a Delete mutation. In pessimistic mode, acquires a pessimistic lock. |
+| `BatchGet(ctx, keys)` | Multi-key read with membuf-first strategy. Remote keys are grouped by region via `GroupKeysByRegion`, and a per-region `KvBatchGet` RPC is sent to each. Returns `([]KvPair, error)`. |
+| `Set(ctx, key, value)` | Buffers a Put mutation. In pessimistic mode, acquires a pessimistic lock via `KvPessimisticLock` RPC with `PrimaryLock` set to the lexicographically smallest key (deterministic, cached in `cachedPrimary`). |
+| `Delete(ctx, key)` | Buffers a Delete mutation. In pessimistic mode, acquires a pessimistic lock (same primary key selection). |
 | `Commit(ctx)` | Creates a `twoPhaseCommitter` and executes the 2PC protocol. Returns early if `membuf` is empty. |
 | `Rollback(ctx)` | Aborts the transaction. In pessimistic mode, sends `KVPessimisticRollback` for pessimistic lock keys AND `KvBatchRollback` for mutation buffer keys (to clean up any prewrite locks from a partial commit). In optimistic mode, sends `KvBatchRollback` grouped by region. Idempotent. |
 | `StartTS()` | Returns the transaction's start timestamp. |
@@ -602,8 +603,9 @@ type LockResolver struct {
     cache    *RegionCache
     pdClient pdclient.Client
 
-    mu        sync.Mutex
-    resolving map[lockKey]chan struct{}  // dedup map: {primary, startTS} → wait channel
+    mu           sync.Mutex
+    resolving    map[lockKey]chan struct{}  // dedup map: {primary, startTS} → wait channel
+    resolveCount int                        // total resolutions since last map reset
 }
 ```
 
@@ -619,7 +621,7 @@ type LockResolver struct {
 4. Call `checkTxnStatus(ctx, primaryKey, lockTS)` — sends `KvCheckTxnStatus` RPC to the primary key's region with `RollbackIfNotExist = true`.
 5. **Primary still locked check:** If the primary is still locked (`LockTtl > 0` and `CommitVersion == 0`), return nil without resolving — the transaction may still commit. The caller's retry loop will encounter the lock again on the next attempt.
 6. Call `resolveLock(ctx, lock, commitTS)` — sends `KvResolveLock` RPC to the locked key's region. If `commitTS > 0`, the lock is committed; if `commitTS == 0`, it is rolled back.
-7. Close the channel and remove from `resolving` to wake waiters.
+7. Close the channel and remove from `resolving` to wake waiters. A `resolveCount` counter is incremented; when the map is empty and the counter reaches 1000, the map is recreated with `make()` to release old backing memory.
 
 ### 6.12 twoPhaseCommitter
 
@@ -639,7 +641,7 @@ type twoPhaseCommitter struct {
 
 **`execute(ctx)` flow:**
 
-1. **`selectPrimary()`** — sorts mutations by key, selects the first key as primary.
+1. **`selectPrimary()`** — sorts mutations by key, selects the lexicographically first key as primary. This is consistent with `TxnHandle.primaryKey()`, which also selects the lexicographic minimum and caches it in `cachedPrimary`.
 2. **`prewrite(ctx)`** — groups mutations by region via `groupMutationsByRegion()`. Prewrites the primary region synchronously, then prewrites secondary regions in parallel using `errgroup`. Each `prewriteRegion` sends a `KvPrewrite` RPC with `PrimaryLock`, `StartVersion`, `LockTtl`, and `TxnSize`. If `Try1PC` is set and all mutations fit in one region, sets `TryOnePc = true`. If `UseAsyncCommit` is set, populates `Secondaries` list.
 3. On prewrite failure: calls `rollback()` in background and returns the error.
 4. **`getCommitTS`** — allocates a new timestamp from PD via `pdClient.GetTS()`.

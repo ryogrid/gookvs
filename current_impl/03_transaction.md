@@ -242,7 +242,7 @@ type PointGetter struct {
 
 `Get(key)` proceeds in three steps:
 
-1. **Lock check (SI only):** Calls `reader.LoadLock(key)`. If a lock exists with `StartTS <= ts` and is not in `bypassLocks`, returns `&LockError{Key: key, Lock: lock}`. The `LockError` struct (defined in `point_getter.go`) carries the conflicting key and lock metadata. `errors.Is(err, ErrKeyIsLocked)` still works via `LockError.Is()`. Under RC isolation, this step is skipped entirely.
+1. **Lock check (SI only):** Calls `reader.LoadLock(key)`. If a lock exists with `StartTS <= ts`, is not `LockTypePessimistic`, and is not in `bypassLocks`, returns `&LockError{Key: key, Lock: lock}`. Pessimistic locks (`LockTypePessimistic`) are skipped because they are invisible to readers -- they represent a lock-before-write reservation, not an actual data modification. This matches the Scanner's behavior. The `LockError` struct (defined in `point_getter.go`) carries the conflicting key and lock metadata. `errors.Is(err, ErrKeyIsLocked)` still works via `LockError.Is()`. Under RC isolation, this step is skipped entirely.
 
 2. **Find visible write:** Calls `reader.GetWrite(key, ts)` to find the latest data-changing write (Put) visible at `ts`. If no write is found (or it was a Delete), returns `(nil, nil)`.
 
@@ -665,6 +665,24 @@ where `lockPhysicalTime = startTS >> 18` and `callerPhysicalTime = callerStartTS
 
 When rolling back an expired lock, the function distinguishes between pessimistic and optimistic locks via `lock.LockType == LockTypePessimistic` and passes this to `UnlockKey`.
 
+### CleanupModifies
+
+**File:** `internal/server/storage.go`
+
+```go
+func (s *Storage) CleanupModifies(key []byte, startTS txntypes.TimeStamp) (txntypes.TimeStamp, []mvcc.Modify, error, *LatchGuard)
+```
+
+`CleanupModifies` resolves a lock on a (typically secondary) key by checking the primary key's transaction status via `CheckTxnStatus`. It returns modifications instead of applying them directly, so the caller can propose them via Raft in cluster mode.
+
+**Algorithm:**
+
+1. If no lock exists for `startTS` on the key, calls `CheckTxnStatus` and returns the commit timestamp (if any).
+2. If a lock exists, reads the `Primary` field from the lock and calls `CheckTxnStatus` on the primary key.
+3. If the primary status check **fails** (error), the function writes a **rollback record** on the key and removes the lock. This prevents a late-arriving commit from succeeding after the lock was cleaned up. Without this rollback record, a race condition could allow a slow commit to land after cleanup, violating transaction atomicity.
+4. If the primary is committed (`CommitTS != 0`), calls `ResolveLock` to commit the secondary.
+5. If the primary is rolled back, not found, or still locked, removes the lock and writes a rollback record.
+
 ### Helper Functions
 
 - `mutationOpToLockType(op)`: Maps `MutationOpPut -> LockTypePut`, `MutationOpDelete -> LockTypeDelete`, `MutationOpLock -> LockTypeLock`.
@@ -699,7 +717,7 @@ type AsyncCommitPrewriteProps struct {
 func PrewriteAsyncCommit(txn, reader, props, mutation) error
 ```
 
-Follows the same conflict-check logic as regular `Prewrite`, then adds async-commit-specific fields to the lock:
+Follows the same conflict-check logic as regular `Prewrite` -- looping through up to `SeekBound*2` (64) write records to skip past Rollback and Lock records before concluding there is no write conflict -- then adds async-commit-specific fields to the lock:
 
 - `lock.UseAsyncCommit = true`
 - `lock.Secondaries = props.Secondaries` (only on the primary key)

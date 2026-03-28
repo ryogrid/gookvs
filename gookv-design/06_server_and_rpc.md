@@ -150,6 +150,19 @@ func (s *Server) Stop() {
 }
 ```
 
+### Configuration Validation (`internal/config/`)
+
+The `Config.Validate()` method enforces:
+
+- **`StatusAddr` non-empty**: The HTTP status server address must be set.
+- **PD endpoints optional**: Empty PD endpoints are valid (standalone mode, no Raft/cluster).
+- **`--store-id=0` with `--initial-cluster`**: The `main()` function exits with a fatal error when `--store-id` is 0 and `--initial-cluster` is specified, since a non-zero store ID is required in cluster mode.
+- **`parseInitialCluster` fatal errors**: Malformed entries (missing `=`, bad ID, empty address) cause `log.Fatalf` instead of silent skipping.
+
+### ReadableSize Parser
+
+`ReadableSize.UnmarshalText` uses `strconv.ParseUint` with base-10, 64-bit validation to parse the numeric portion of size strings (e.g., `"256MB"`).
+
 ---
 
 ## gRPC Service: TiKV API Compatibility
@@ -181,9 +194,9 @@ The `UnimplementedTikvServer` embedding provides safe defaults for unimplemented
 | **Lock Management** | `KvCheckTxnStatus` | Transaction status with cleanup |
 | | `KvResolveLock` | Resolve locks by commit/rollback |
 | | `KvScanLock` | Scan for locks below a version |
-| | `KvTxnHeartBeat` | Extend lock TTL |
+| | `KvTxnHeartBeat` | Extend lock TTL (Raft-routed in cluster mode via `TxnHeartBeatModifies` + `ProposeModifies`) |
 | **Pessimistic** | `KvPessimisticLock` | Acquire pessimistic locks |
-| | `KVPessimisticRollback` | Remove pessimistic locks |
+| | `KVPessimisticRollback` | Remove pessimistic locks (Raft-routed in cluster mode via `PessimisticRollbackModifies` + `ProposeModifies`) |
 | **Async Commit** | `KvCheckSecondaryLocks` | Check secondary lock status |
 | **Raw KV** | `RawGet` | Direct key read (no MVCC) |
 | | `RawPut` | Direct key write |
@@ -775,6 +788,8 @@ graph LR
         KvPrewriteAC["KvPrewrite<br/>(async commit)"]
         KvCommit["KvCommit"]
         KvPrewrite1PC["KvPrewrite<br/>(1PC)"]
+        KvPessRollback["KVPessimisticRollback"]
+        KvTxnHB["KvTxnHeartBeat"]
     end
 
     subgraph "Multi-Region Grouping"
@@ -787,12 +802,16 @@ graph LR
     KvPrewriteAC --> ProposeModifies
     KvCommit --> ProposeModifies
     KvPrewrite1PC --> ProposeModifies
+    KvPessRollback --> ProposeModifies
+    KvTxnHB --> ProposeModifies
 
     KvBatchRollback --> GroupBy["groupModifiesByRegion()"]
     KvPessimisticLock --> GroupBy
     KvResolveLock --> GroupBy
     GroupBy --> ProposeModifies
 ```
+
+`KVPessimisticRollback` and `KvTxnHeartBeat` now use the same dual-mode pattern as other write RPCs: in cluster mode, they call `PessimisticRollbackModifies` / `TxnHeartBeatModifies` to compute modifications, then propose via `ProposeModifies` to the region from the request context. Both also call `validateRegionContext` before processing.
 
 Some RPCs operate on keys that may span multiple regions. These use `groupModifiesByRegion` to split modifications by region and propose each group separately:
 
@@ -1228,6 +1247,10 @@ func (rs *RawStorage) CompareAndSwap(cf string, key, value, prevValue []byte, pr
 }
 ```
 
+### Region Validation for Raw KV
+
+All Raw KV handlers call `validateRegionContext` before processing. This includes write handlers like `RawPut` (validates with the request key) and `RawDelete` (validates with the request key), not just read handlers.
+
 ### Cluster Mode for Raw KV
 
 In cluster mode, Raw KV write RPCs use `RawStorage.PutModify` and `RawStorage.DeleteModify` to create `Modify` objects that are proposed through Raft:
@@ -1254,8 +1277,12 @@ type ReadPool struct {
     ewmaSlice  atomic.Int64  // EWMA of task execution time (nanoseconds)
     queueDepth atomic.Int64  // Current tasks queued
     alpha      float64       // EWMA smoothing factor (0.3)
+    stopCh     chan struct{}
+    wg         sync.WaitGroup
 }
 ```
+
+**Lifecycle**: `Stop()` closes the `stopCh` channel to signal workers, then calls `wg.Wait()` to block until all workers have drained their pending tasks and exited. Each worker drains remaining tasks from `taskCh` before returning, ensuring no in-flight work is lost.
 
 The pool estimates wait time and rejects requests that would exceed a client-specified threshold:
 
@@ -1611,7 +1638,44 @@ The store identity is written once during bootstrap and verified on every subseq
 
 ### RaftClient
 
-The `RaftClient` (defined in `internal/server/transport/transport.go`) manages gRPC connections to other stores for Raft message delivery:
+The `RaftClient` (defined in `internal/server/transport/transport.go`) manages gRPC connections and persistent Raft streams to other stores:
+
+```go
+type RaftClient struct {
+    mu          sync.RWMutex
+    connections map[uint64]*connPool    // storeID -> connection pool
+    streams     map[uint64]*raftStream  // storeID -> persistent stream
+    resolver    StoreResolver
+    batchSize   int
+    dialTimeout time.Duration
+    poolSize    int // configured connection pool size per store
+    streamBuf   int // send channel buffer size for streams (default 4096)
+}
+```
+
+Each store has a **long-lived `raftStream`** that maintains a persistent gRPC `Raft` streaming RPC. The stream is created lazily on first `Send()` and reused for all subsequent messages. A dedicated **send goroutine** reads from a buffered channel (`sendCh`) and writes to the gRPC stream. If a send error occurs, the stream is marked closed and automatically recreated on the next `Send()`.
+
+```go
+type raftStream struct {
+    storeID uint64
+    conn    *grpc.ClientConn
+    stream  tikvpb.Tikv_RaftClient
+    sendCh  chan *raft_serverpb.RaftMessage  // buffered (4096)
+    ctx     context.Context
+    cancel  context.CancelFunc
+    closed  atomic.Bool
+}
+```
+
+The connection pool uses **atomic round-robin** (`nextIdx`) to select connections instead of always using index 0:
+
+```go
+func (p *connPool) get(dialTimeout time.Duration) (*grpc.ClientConn, error) {
+    idx := int(p.nextIdx % uint64(p.size))
+    p.nextIdx++
+    // ...
+}
+```
 
 ```go
 type StoreResolver interface {

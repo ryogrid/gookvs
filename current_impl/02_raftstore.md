@@ -14,9 +14,11 @@ Source files:
 
 | File | Purpose |
 |------|---------|
-| `internal/raftstore/peer.go` | Peer struct, lifecycle, event loop, Ready processing |
-| `internal/raftstore/storage.go` | PeerStorage (raft.Storage impl), persistence, recovery |
-| `internal/raftstore/msg.go` | Message/tick/result type definitions and constants |
+| `internal/raftstore/peer.go` | Peer struct, lifecycle, event loop, Ready processing, proposal tracking |
+| `internal/raftstore/storage.go` | PeerStorage (raft.Storage impl), persistence, recovery, `BuildWriteTask`/`ApplyWriteTaskPostPersist` |
+| `internal/raftstore/msg.go` | Message/tick/result type definitions, `proposalEntry`, `errorResponse()`, `IsCompactLog()` |
+| `internal/raftstore/raft_log_writer.go` | `RaftLogWriter`: batches `WriteTask`s from multiple peers into single WriteBatch + fsync |
+| `internal/raftstore/apply_worker.go` | `ApplyWorkerPool`: processes `ApplyTask`s in background goroutine pool |
 | `internal/raftstore/router/router.go` | sync.Map-based message routing |
 | `internal/raftstore/convert.go` | eraftpb <-> raftpb protobuf conversion |
 | `internal/raftstore/snapshot.go` | Snapshot generation, serialization, transfer, and application; `SnapWorker` background processing |
@@ -51,7 +53,16 @@ type Peer struct {
     Mailbox          chan PeerMsg                    // buffered channel for incoming messages
     sendFunc         func([]raftpb.Message)          // outbound Raft message delivery
     applyFunc        func(regionID uint64, entries []raftpb.Entry)  // committed entry application
-    pendingProposals map[uint64]func([]byte, error)  // index -> callback
+
+    nextProposalID   uint64                         // per-peer monotonic counter for proposal IDs
+    currentTerm      uint64                         // cached Raft term, updated from HardState in handleReady
+    pendingProposals map[uint64]proposalEntry        // proposalID -> entry (callback, term, timestamp)
+
+    raftLogWriter    *RaftLogWriter                  // batches Raft log persistence across regions (nil = legacy)
+
+    applyWorkerPool  *ApplyWorkerPool                // processes committed entries asynchronously (nil = legacy)
+    applyInFlight    bool                            // true when an async apply task is outstanding
+    pendingApplyTasks []*ApplyTask                   // buffered apply tasks when apply is in-flight
 
     raftLogSizeHint  uint64                         // estimated Raft log size for GC decisions
     lastCompactedIdx uint64                         // last index sent to RaftLogGCWorker
@@ -61,7 +72,7 @@ type Peer struct {
 
     pendingReads     map[string]*pendingRead         // ReadIndex requests awaiting apply
     nextReadID       atomic.Uint64                   // unique request contexts for ReadIndex
-    leaseExpiry      time.Time                       // leader lease timestamp (80% of election timeout)
+    leaseExpiryNanos atomic.Int64                    // Unix nanoseconds; accessed from multiple goroutines
     leaseValid       atomic.Bool                     // leader lease validity flag
     splitResultCh    chan<- *SplitRegionResult        // split results to coordinator (leader only)
 
@@ -71,7 +82,7 @@ type Peer struct {
 }
 ```
 
-`Peer` is the central type. It owns the Raft state machine (`rawNode`), persistent storage (`storage`), and the mailbox channel. Two injectable function fields — `sendFunc` and `applyFunc` — decouple the peer from transport and state-machine concerns. The `raftLogSizeHint` and `lastCompactedIdx` fields track Raft log growth for compaction decisions. The `logGCWorkerCh` and `pdTaskCh` channels connect the peer to background workers for log GC and PD heartbeat reporting, respectively.
+`Peer` is the central type. It owns the Raft state machine (`rawNode`), persistent storage (`storage`), and the mailbox channel. Two injectable function fields -- `sendFunc` and `applyFunc` -- decouple the peer from transport and state-machine concerns. Proposal tracking uses monotonic `nextProposalID` with `pendingProposals` mapping to `proposalEntry` (callback, term, timestamp). The optional `raftLogWriter` enables I/O coalescing across regions, and the optional `applyWorkerPool` enables async entry application. The `raftLogSizeHint` and `lastCompactedIdx` fields track Raft log growth for compaction decisions. The `logGCWorkerCh` and `pdTaskCh` channels connect the peer to background workers for log GC and PD heartbeat reporting, respectively.
 
 ### 2.2 PeerConfig
 
@@ -149,7 +160,13 @@ classDiagram
         +Mailbox chan PeerMsg
         -sendFunc func([]raftpb.Message)
         -applyFunc func(uint64, []raftpb.Entry)
-        -pendingProposals map[uint64]func
+        -nextProposalID uint64
+        -currentTerm uint64
+        -pendingProposals map[uint64]proposalEntry
+        -raftLogWriter *RaftLogWriter
+        -applyWorkerPool *ApplyWorkerPool
+        -applyInFlight bool
+        -pendingApplyTasks []*ApplyTask
         -raftLogSizeHint uint64
         -lastCompactedIdx uint64
         -logGCWorkerCh chan RaftLogGCTask
@@ -163,9 +180,15 @@ classDiagram
         +Status() raft.Status
         +SetPDTaskCh(ch chan interface)
         +SetLogGCWorkerCh(ch chan RaftLogGCTask)
+        +SetRaftLogWriter(w *RaftLogWriter)
+        +SetApplyWorkerPool(p *ApplyWorkerPool)
         -handleMessage(msg PeerMsg)
         -propose(cmd *RaftCommand)
         -handleReady()
+        -failAllPendingProposals(err error)
+        -sweepStaleProposals(maxAge time.Duration)
+        -applyInline(entries []raftpb.Entry)
+        -submitToApplyWorker(entries []raftpb.Entry)
         -onApplyResult(result *ApplyResult)
         -onRaftLogGCTick()
         -onReadyCompactLog(compactIdx, compactTerm uint64)
@@ -191,7 +214,10 @@ classDiagram
         +FirstIndex() (uint64, error)
         +Snapshot() (Snapshot, error)
         +SaveReady(rd raft.Ready) error
+        +BuildWriteTask(rd raft.Ready) (*WriteTask, error)
+        +ApplyWriteTaskPostPersist(task *WriteTask)
         +RecoverFromEngine() error
+        +PersistApplyState() error
         -appendToCache(entries []Entry)
         -readEntriesFromEngine(lo, hi uint64) ([]Entry, error)
     }
@@ -264,21 +290,31 @@ func (p *Peer) Run(ctx context.Context) {
     for {
         select {
         case <-ctx.Done():           // shutdown
+            p.stopped.Store(true)
+            return
         case <-ticker.C:             // Raft tick
             p.rawNode.Tick()
+        case <-gcTickerCh:           // log GC check (10s)
+            p.onRaftLogGCTick()
+        case <-splitCheckTickerCh:   // split check (10s)
+            p.onSplitCheckTick()
         case <-pdHeartbeatTickerCh:  // periodic PD region heartbeat
             if p.isLeader.Load() && p.pdTaskCh != nil {
                 p.sendRegionHeartbeatToPD()
             }
-        case msg := <-p.Mailbox:     // incoming message
+        case msg, ok := <-p.Mailbox: // incoming message
+            if !ok { p.stopped.Store(true); return }
             p.handleMessage(msg)
+            // Drain up to 63 more queued messages before handleReady
+            for i := 0; i < 63; i++ { ... }
         }
+        if p.stopped.Load() { return }  // exit if PeerMsgTypeDestroy set stopped
         p.handleReady()  // process Raft Ready after every event
     }
 }
 ```
 
-The loop processes Raft ticks, incoming messages, and an optional periodic PD heartbeat. Every event is followed by a `handleReady()` call to drain any pending Raft state changes. The `pdHeartbeatTickerCh` case sends periodic region heartbeats to PD when `PdHeartbeatTickInterval > 0` (default 60s). This ensures PD's scheduler can run continuously (region balance, move tracking), not just on leadership changes.
+The loop processes Raft ticks, log GC ticks, split check ticks, incoming messages, and an optional periodic PD heartbeat. Every event is followed by a `handleReady()` call to drain any pending Raft state changes. The `stopped` flag is checked after each event to handle `PeerMsgTypeDestroy` without closing the mailbox. Incoming messages are batch-drained (up to 64 per cycle) to reduce `handleReady()` overhead. The `pdHeartbeatTickerCh` case sends periodic region heartbeats to PD when `PdHeartbeatTickInterval > 0` (default 60s).
 
 ### 3.3 Message Handling (`handleMessage`)
 
@@ -287,27 +323,31 @@ The loop processes Raft ticks, incoming messages, and an optional periodic PD he
 | `RaftMessage` | Unwrap `*raftpb.Message`, call `rawNode.Step()` |
 | `RaftCommand` | Unwrap `*RaftCommand`, call `propose()` |
 | `Tick` | Call `rawNode.Tick()` (additional tick beyond the timer) |
-| `ApplyResult` | Unwrap `*ApplyResult`, call `onApplyResult()` which processes `ExecResultTypeCompactLog` via `onReadyCompactLog()` and invokes pending proposal callbacks |
+| `ApplyResult` | Unwrap `*ApplyResult`, call `onApplyResult()` — updates applied index (monotonicity guard), persists `ApplyState`, sweeps pending reads, clears `applyInFlight` flag, submits next queued task, processes `ExecResultTypeCompactLog` via `onReadyCompactLog()` |
 | `Significant` | Unwrap `*SignificantMsg`, call `handleSignificantMessage()` — dispatches `Unreachable` (→ `rawNode.ReportUnreachable`), `SnapshotStatus` (→ `rawNode.ReportSnapshot`), and `MergeResult` (→ `stopped = true`) |
 | `Schedule` | Unwrap `*ScheduleMsg`, call `handleScheduleMessage()` — only executes if this peer is the leader; routes `TransferLeader`, `ChangePeer`, `Merge` |
-| `Destroy` | Set `stopped = true`, close the Mailbox channel |
+| `Destroy` | Set `stopped = true` (mailbox is NOT closed to avoid panics from concurrent senders; the `Run()` loop exits via the `stopped` flag check after each event) |
 | Others | Silently ignored |
 
 ### 3.4 Ready Processing (`handleReady`)
 
 This is the core Raft integration point. It runs after every event in the loop:
 
-1. **Guard**: `rawNode.HasReady()` — return early if nothing to do.
-2. **Get Ready**: `rd := rawNode.Ready()` — a batch of state changes.
-3. **Update leader**: If `rd.SoftState` is non-nil, update `isLeader` based on whether `SoftState.Lead == peerID`. If this peer transitions from non-leader to leader, `sendRegionHeartbeatToPD()` is called to notify PD of the leadership change.
-4. **Persist**: `storage.SaveReady(rd)` — write hard state and new entries to `CF_RAFT` via a `WriteBatch`.
-4b. **Apply snapshot**: If `rd.Snapshot` is non-empty, call `storage.ApplySnapshot(rd.Snapshot)` to apply the received snapshot data to the storage engine (clears existing range, verifies checksums, writes key-value pairs).
+1. **Guard**: `rawNode.HasReady()` -- return early if nothing to do.
+2. **Get Ready**: `rd := rawNode.Ready()` -- a batch of state changes.
+3. **Update leader**: If `rd.SoftState` is non-nil, update `isLeader` based on whether `SoftState.Lead == peerID`. On becoming leader: call `sendRegionHeartbeatToPD()` and extend leader lease. On stepping down: invalidate lease, call `failAllPendingProposals()`, and cancel all pending reads.
+3b. **Cache term**: If `rd.HardState` is non-empty, cache `currentTerm = rd.HardState.Term` for use in `propose()`.
+4. **Persist** (conditional path):
+   - If `raftLogWriter != nil`: call `storage.BuildWriteTask(rd)`, submit to `RaftLogWriter`, wait on `task.Done`, then call `storage.ApplyWriteTaskPostPersist(task)`.
+   - Else (legacy): call `storage.SaveReady(rd)` -- write hard state and new entries to `CF_RAFT` via a `WriteBatch`.
+4b. **Apply snapshot**: If `rd.Snapshot` is non-empty, call `storage.ApplySnapshot(rd.Snapshot)` to apply the received snapshot data (passes region start/end keys to `ApplySnapshotData`).
 5. **Send messages**: If `sendFunc` is set and `rd.Messages` is non-empty, deliver outbound Raft messages.
 6. **Apply committed entries**:
-   - Process `ConfChange` / `ConfChangeV2` entries by calling `rawNode.ApplyConfChange()`.
-   - Forward all committed entries to `applyFunc` for state machine application.
-   - Invoke and clean up pending proposal callbacks for committed entry indices.
-7. **Advance**: `rawNode.Advance(rd)` — signal to etcd/raft that the Ready has been processed.
+   - Process admin entries inline first: `ConfChange`/`ConfChangeV2` via `applyConfChangeEntry()`, `SplitAdmin` via `applySplitAdminEntry()`. (CompactLog entries are filtered out in the apply path but not processed inline.)
+   - Conditional apply path:
+     - If `applyWorkerPool != nil`: call `submitToApplyWorker()` -- filters to data entries only (`EntryNormal && !IsSplitAdmin && !IsCompactLog && len>8`), extracts callbacks from `pendingProposals`, submits `ApplyTask`.
+     - Else (legacy): call `applyInline()` -- filters data entries, calls `applyFunc`, matches callbacks by extracting proposalID from first 8 bytes of entry data (with term check), updates applied index, persists `ApplyState`.
+7. **Advance**: `rawNode.Advance(rd)` -- signal to etcd/raft that the Ready has been processed.
 
 ---
 
@@ -319,22 +359,28 @@ This is the core Raft integration point. It runs after every event in the loop:
 
 | Method | Behavior |
 |--------|----------|
-| `InitialState()` | Returns the in-memory `hardState` and an empty `ConfState` |
+| `InitialState()` | Returns the in-memory `hardState` and a `ConfState` derived from region peers (if `region` is set, each peer ID is added to `cs.Voters`; otherwise empty) |
 | `Entries(lo, hi, maxSize)` | Serves from cache if range is covered; falls back to per-index engine reads; applies `limitSize` byte cap |
 | `Term(i)` | Returns truncated term for `TruncatedIndex`; otherwise checks cache, then engine |
 | `LastIndex()` | Returns last cache entry index, or `persistedLastIndex` if cache is empty |
 | `FirstIndex()` | Returns `TruncatedIndex + 1` |
 | `Snapshot()` | Returns an empty snapshot with metadata set to `TruncatedIndex`/`TruncatedTerm` |
 
-### 4.2 Persistence — `SaveReady()`
+### 4.2 Persistence — `SaveReady()` (Legacy) and `BuildWriteTask()`/`ApplyWriteTaskPostPersist()` (Batch)
 
-`SaveReady` persists a `raft.Ready` batch atomically:
+**Legacy path** (`SaveReady`): Persists a `raft.Ready` batch atomically:
 
 1. Create a `WriteBatch` from the engine.
 2. If hard state is non-empty, marshal and write to `keys.RaftStateKey(regionID)` in `CF_RAFT`.
 3. For each new entry, marshal and write to `keys.RaftLogKey(regionID, index)` in `CF_RAFT`.
 4. Commit the `WriteBatch` atomically.
 5. Update the in-memory entry cache (`appendToCache`) and `persistedLastIndex`.
+
+**Batch path** (when `raftLogWriter` is configured): Persistence is split into two phases:
+
+1. **`BuildWriteTask(rd)`** serializes entries and hard state into `WriteOp` structs (CF, Key, Value) without writing to the engine. Returns a `WriteTask` containing `Ops`, `Entries` (for cache update), `HardState` (for in-memory update), and a `Done` channel.
+2. The peer submits the `WriteTask` to the `RaftLogWriter` via `Submit()` and waits on `task.Done`.
+3. **`ApplyWriteTaskPostPersist(task)`** updates the in-memory hard state, entry cache, and `persistedLastIndex` from the task's stored fields.
 
 ### 4.3 Recovery — `RecoverFromEngine()`
 
@@ -344,6 +390,7 @@ Called on restart (non-bootstrap path):
 2. Scan all entries in `keys.RaftLogKeyRange(regionID)` using an iterator over `CF_RAFT`.
 3. Unmarshal each entry, track the maximum index as `persistedLastIndex`.
 4. Keep the last 1024 entries in the in-memory cache.
+5. Read `ApplyState` from `keys.ApplyStateKey(regionID)` in `CF_RAFT` (24-byte big-endian encoding: 8 bytes each for `AppliedIndex`, `TruncatedIndex`, `TruncatedTerm`). If not found, the default `ApplyState` from `NewPeerStorage` is retained.
 
 ### 4.3.1 `HasPersistedRaftState(engine, regionID)`
 
@@ -363,7 +410,7 @@ This avoids engine reads for the common case where Raft needs recent log entries
 
 ### 4.5 Engine Fallback — `readEntriesFromEngine()`
 
-For entries outside the cache, reads are done one index at a time via `engine.Get(CF_RAFT, RaftLogKey(regionID, idx))`. Reading stops on `ErrNotFound` (gap in the log).
+For entries outside the cache, reads are done one index at a time via `engine.Get(CF_RAFT, RaftLogKey(regionID, idx))`. If the first requested entry is not found, reading stops (compacted). If a subsequent entry is missing (gap in the log), an error is returned instead of silently stopping -- this ensures gap detection for consistency.
 
 ### 4.6 Initialization Constants
 
@@ -481,12 +528,20 @@ All three `SignificantMsgType` values are fully handled in `Peer.handleSignifica
 |--------|--------|---------|
 | `PeerMsg` | `Type PeerMsgType`, `Data interface{}` | Envelope for all peer messages |
 | `RaftCommand` | `Request *raft_cmdpb.RaftCmdRequest`, `Callback func(*RaftCmdResponse)` | Client request + response callback |
-| `ApplyResult` | `RegionID uint64`, `Results []ExecResult` | Apply worker output |
+| `proposalEntry` | `callback func(*RaftCmdResponse)`, `term uint64`, `proposed time.Time` | Tracks in-flight proposal callback with term and timestamp |
+| `ApplyResult` | `RegionID uint64`, `AppliedIndex uint64`, `Results []ExecResult` | Apply worker output (includes applied index for async path) |
 | `ExecResult` | `Type ExecResultType`, `Data interface{}` | Single execution result |
 | `SplitRegionResult` | `Derived *metapb.Region`, `Regions []*metapb.Region` | Split operation output |
 | `StoreMsg` | `Type StoreMsgType`, `Data interface{}` | Store-level message envelope |
 | `SignificantMsg` | `Type`, `RegionID`, `ToPeerID`, `Status` | High-priority control message |
 | `ScheduleMsg` | `Type ScheduleMsgType`, `TransferLeader *pdpb.TransferLeader`, `ChangePeer *pdpb.ChangePeer`, `Merge *pdpb.Merge` | PD scheduling command delivered to a peer |
+
+**Helper functions in `msg.go`:**
+
+| Function | Purpose |
+|----------|---------|
+| `errorResponse(err error) *RaftCmdResponse` | Builds a `RaftCmdResponse` with the error in the header's `Error` field |
+| `IsCompactLog(data []byte) bool` | Returns true if entry data starts with tag byte `0x01` |
 
 **ScheduleMsgType constants:**
 
@@ -515,21 +570,24 @@ sequenceDiagram
     Router->>Peer: Mailbox <- msg (non-blocking)
     Peer->>Peer: handleMessage(msg)
     Peer->>Peer: propose(cmd)
-    Peer->>RawNode: rawNode.Propose(data)
-    Peer->>Peer: register pendingProposals[expectedIdx] = callback
+    Note over Peer: Generate proposalID, prepend 8-byte ID to data
+    Peer->>RawNode: rawNode.Propose(tagged)
+    Peer->>Peer: register pendingProposals[proposalID] = proposalEntry{callback, term, now}
 
     Note over Peer: Raft replicates entry to followers via Ready
 
     Peer->>Peer: handleReady()
     Peer->>RawNode: rawNode.HasReady() -> true
     Peer->>RawNode: rawNode.Ready() -> rd
-    Peer->>PeerStorage: SaveReady(rd) [persist HardState + Entries to CF_RAFT]
+    Peer->>PeerStorage: Persist [SaveReady or BuildWriteTask+RaftLogWriter]
     Peer->>Router: sendFunc(rd.Messages) [send to followers]
 
     Note over Peer: After quorum ack, entry appears in rd.CommittedEntries
 
-    Peer->>ApplyWorker: applyFunc(regionID, committedEntries)
-    Peer->>Client: pendingProposals[index] callback invoked
+    Peer->>Peer: Filter admin entries (inline), then data entries
+    Peer->>ApplyWorker: applyFunc(regionID, dataEntries)
+    Peer->>Peer: Match callback by proposalID from first 8 bytes (with term check)
+    Peer->>Client: callback invoked
     Peer->>RawNode: rawNode.Advance(rd)
 ```
 
@@ -593,10 +651,12 @@ The snapshot subsystem handles Raft snapshot generation, serialization, transfer
 
 **Serialization** — `MarshalSnapshotData` / `UnmarshalSnapshotData` convert `SnapshotData` to/from a binary format using `encoding/gob`.
 
-**Application** — `ApplySnapshotData(engine, data)` applies a received snapshot:
-1. Clears the existing key range via `DeleteRange` on all three data CFs.
+**Application** — `ApplySnapshotData(engine, data, startKey, endKey)` applies a received snapshot:
+1. Clears the existing key range `[startKey, endKey)` via `DeleteRange` on all three data CFs.
 2. Verifies the CRC32 checksum of each CF file.
 3. Writes all key-value pairs via a `WriteBatch`.
+
+The `startKey`/`endKey` are the region's key range boundaries, passed from `PeerStorage.ApplySnapshot()` which obtains them from `s.region`.
 
 **Background Worker** — `SnapWorker` runs a goroutine that consumes `GenSnapTask` from its task channel. Each task calls `GenerateSnapshotData` and sends the result (or error) back via `GenSnapTask.ResultCh`.
 
@@ -716,7 +776,7 @@ sequenceDiagram
 3. Updates the original region's `EndKey` and bumps `RegionEpoch.Version`.
 4. Returns a `SplitRegionResult` with the derived parent and new child regions.
 
-**handleReady Integration** — In the committed entries processing loop, split admin entries are detected alongside ConfChange entries. The split executes BEFORE `applyFunc` is called, ensuring region metadata is updated before data entries are applied. All entries (including split admin) flow to `applyFunc`; split admin entries are harmlessly skipped at protobuf unmarshal.
+**handleReady Integration** — In the committed entries processing loop, split admin entries are detected alongside ConfChange entries and processed inline. The split executes BEFORE data entries are sent to the apply path (whether inline or async). Only data entries (`EntryNormal && !IsSplitAdmin && !IsCompactLog && len>8`) are forwarded to `applyFunc`; admin entries are filtered out before reaching the apply worker.
 
 **Follower Behavior** — `applySplitAdminEntry` runs on all replicas (leader and follower). Child regions on followers are created via `maybeCreatePeerForMessage` when the leader's child region sends Raft messages.
 
@@ -821,6 +881,52 @@ Source: `internal/raftstore/store_worker.go`
 
 This is used after a peer is removed via conf change or region merge.
 
+### 8.7 RaftLogWriter (I/O Coalescing)
+
+Source: `internal/raftstore/raft_log_writer.go`
+
+`RaftLogWriter` batches `WriteTask` submissions from multiple peer goroutines into a single `WriteBatch` + fsync per cycle, reducing the number of fsyncs from N (one per region) to 1 per batch cycle.
+
+**Core Types:**
+
+| Type | Fields | Purpose |
+|------|--------|---------|
+| `WriteOp` | `CF string`, `Key []byte`, `Value []byte` | Single key-value write for Raft log persistence |
+| `WriteTask` | `RegionID`, `Ops []WriteOp`, `Done chan error`, `Entries []raftpb.Entry`, `HardState *raftpb.HardState` | One region's Raft log changes for batch persistence |
+| `RaftLogWriter` | `engine`, `taskCh chan *WriteTask`, `stopCh`, `wg` | Shared writer goroutine |
+
+**Processing Loop** — `run()` waits for a task on `taskCh`, then `processBatch()` drains all additionally queued tasks, builds a single `WriteBatch` from all tasks' `Ops`, and commits with a single fsync. All tasks in the batch receive the same error (or nil) on their `Done` channel. On panic, `failRemaining()` drains and fails all pending tasks.
+
+**PeerStorage Integration:**
+
+1. `BuildWriteTask(rd)` — Serializes `rd.HardState` and `rd.Entries` into `WriteOp` structs. Stores `Entries` and `HardState` in the task for post-persist in-memory updates.
+2. `ApplyWriteTaskPostPersist(task)` — Called by the peer after `task.Done` is signaled. Updates in-memory `hardState`, `appendToCache(entries)`, and `persistedLastIndex`.
+
+**Peer Integration** — In `handleReady()`, if `p.raftLogWriter != nil`, the peer calls `BuildWriteTask`, `Submit`, waits on `Done`, then `ApplyWriteTaskPostPersist`. Otherwise, the legacy `SaveReady` path is used.
+
+### 8.8 ApplyWorkerPool (Async Apply)
+
+Source: `internal/raftstore/apply_worker.go`
+
+`ApplyWorkerPool` processes committed data entries asynchronously in a goroutine pool, decoupling Raft log commit from state machine application.
+
+**Core Types:**
+
+| Type | Fields | Purpose |
+|------|--------|---------|
+| `ApplyTask` | `RegionID`, `Entries []raftpb.Entry`, `ApplyFunc`, `Callbacks map[uint64]proposalEntry`, `CurrentTerm`, `ResultCh chan<- PeerMsg`, `LastCommittedIndex uint64` | Committed data entries + metadata for one region |
+| `ApplyWorkerPool` | `workers int`, `taskCh`, `stopCh`, `stopped`, `wg` | Fixed-size goroutine pool (default 4 workers) |
+
+**Task Processing** (`processTask`):
+1. Call `ApplyFunc(regionID, entries)` to write data entries to the KV engine.
+2. Invoke proposal callbacks: extract `proposalID` from first 8 bytes of each entry, look up in `Callbacks`, call with nil on success or `errorResponse` on term mismatch.
+3. Set `appliedIndex = LastCommittedIndex` and send `ApplyResult` back to peer via `ResultCh` (the peer's mailbox).
+
+**Peer Integration:**
+
+- `submitToApplyWorker(committedEntries)`: Filters data entries (`EntryNormal && !IsSplitAdmin && !IsCompactLog && len>8`), extracts callbacks from `pendingProposals`, builds `ApplyTask`. For admin-only batches (no data entries), updates applied index inline and persists ApplyState. Uses `applyInFlight` flag to enforce per-region FIFO: if an apply is in-flight, the task is buffered in `pendingApplyTasks`.
+- `onApplyResult(result)`: Monotonically advances applied index via `SetAppliedIndex`, persists `ApplyState`, sweeps `pendingReads`, clears `applyInFlight`, and submits the next queued task from `pendingApplyTasks`.
+
 ---
 
 ## 9. Implementation Status
@@ -829,21 +935,25 @@ This is used after a peer is removed via conf change or region merge.
 
 - **Peer lifecycle** — `NewPeer` with bootstrap and restart paths; proper `raft.Config` construction with `CheckQuorum` and `PreVote`.
 - **Event loop** — `Peer.Run()` with `select` on context cancellation, ticker, and mailbox; `handleReady()` called after every event.
-- **Ready processing** — Full pipeline: leader status update, PD heartbeat on leader transition, `SaveReady` persistence, outbound message delivery, conf change application, committed entry forwarding, proposal callback invocation, `Advance`.
+- **Ready processing** — Full pipeline: leader status update (with `failAllPendingProposals` on stepdown), PD heartbeat on leader transition, `currentTerm` caching from HardState, conditional persistence (SaveReady or BuildWriteTask+RaftLogWriter), admin entry inline processing, conditional apply (applyInline or submitToApplyWorker), `Advance`. Guarded by `stopped` flag check.
 - **PeerStorage with CF_RAFT persistence** — Atomic `WriteBatch` writes for hard state and entries; key scheme via `keys.RaftStateKey` and `keys.RaftLogKey`.
-- **PeerStorage recovery** — `RecoverFromEngine()` restores hard state and scans log entries from the engine on restart.
+- **PeerStorage recovery** — `RecoverFromEngine()` restores hard state, scans log entries, and recovers `ApplyState` from the engine on restart. `InitialState()` derives `ConfState` from region peers. `readEntriesFromEngine()` returns an error on gap detection.
 - **Entry cache** — In-memory cache of last 1024 entries with overlap-aware append logic.
 - **Router with sync.Map dispatch** — Non-blocking sends, broadcast, store-level channel, error sentinels for not-found and full mailboxes.
 - **Protobuf conversion** — `EraftpbToRaftpb` / `RaftpbToEraftpb` for transport interop.
-- **Proposal tracking** — `pendingProposals` map with index-based callback lookup and cleanup on commit.
+- **Proposal tracking** — `pendingProposals` maps `proposalID` to `proposalEntry` (callback, term, timestamp). `propose()` generates monotonic `nextProposalID`, prepends 8-byte ID to entry data. `handleReady` matches callbacks by extracting proposalID from first 8 bytes of committed entry data, with term-mismatch detection. `failAllPendingProposals()` on leader stepdown, `sweepStaleProposals()` for timeout cleanup. `errorResponse()` helper builds error responses.
 - **ConfChange processing** — `applyConfChangeEntry` parses and applies ConfChange/ConfChangeV2 entries; `processConfChange` updates region metadata (peer list, epoch); `ProposeConfChange` proposes membership changes; self-removal detection.
 - **Snapshot generation and application** — `SnapWorker` generates snapshots in the background; `PeerStorage.ApplySnapshot` applies received snapshots with checksum verification; `SnapState` FSM tracks progress.
 - **Region split (Raft admin command)** — `SplitCheckWorker` detects oversized regions via CF scanning. Splits are proposed as Raft admin commands (tag byte `0x02`) and executed during `handleReady` in the committed entries loop. `ExecSplitAdmin` calls `ExecBatchSplit` and updates parent region metadata atomically within the Raft apply path. Child regions are bootstrapped by the coordinator after receiving the split result via `splitResultCh`.
 - **Raft log compaction** — `onRaftLogGCTick` evaluates size/count thresholds; `execCompactLog` advances `TruncatedIndex`; `RaftLogGCWorker` deletes old entries in the background.
 - **Region merge** — `ExecPrepareMerge` / `ExecCommitMerge` / `ExecRollbackMerge` implement the three-phase merge protocol with epoch management.
 - **PD heartbeat** — `sendRegionHeartbeatToPD()` sends region leader info to PD via `pdTaskCh` on leadership change.
-- **Apply result processing** — `onApplyResult()` processes `ExecResultTypeCompactLog` via `onReadyCompactLog()` and invokes pending proposal callbacks.
+- **Apply result processing** — `onApplyResult()` updates `AppliedIndex` (with monotonicity guard), persists `ApplyState`, sweeps pending reads, clears `applyInFlight` flag, and submits next queued task from `pendingApplyTasks`. Processes `ExecResultTypeCompactLog` via `onReadyCompactLog()`.
 - **Region data cleanup** — `CleanupRegionData` removes all Raft state for destroyed regions.
+- **RaftLogWriter (I/O coalescing)** — `raft_log_writer.go`: `RaftLogWriter` batches `WriteTask`s from multiple peer goroutines into a single `WriteBatch` + fsync. `storage.go`: `BuildWriteTask()` + `ApplyWriteTaskPostPersist()` split `SaveReady` into build/submit/post-persist phases. `peer.go`: conditional path -- `raftLogWriter != nil` submits `WriteTask`, else legacy `SaveReady`.
+- **ApplyWorkerPool (async apply)** — `apply_worker.go`: `ApplyWorkerPool` processes `ApplyTask`s in a goroutine pool (default 4 workers). `peer.go`: `submitToApplyWorker()` filters data entries, extracts callbacks, and submits `ApplyTask`; `applyInline()` is the legacy synchronous path. `onApplyResult()` handles async results: `SetAppliedIndex`, `PersistApplyState`, sweep `pendingReads`. `LastCommittedIndex` in `ApplyTask` ensures applied index advances past admin-only batches. `applyInFlight` flag + `pendingApplyTasks` buffer enforce per-region FIFO ordering.
+- **Leader lease as atomic.Int64** — `leaseExpiryNanos` stored as `atomic.Int64` (Unix nanoseconds) for safe concurrent access from multiple goroutines, replacing the unprotected `time.Time` field.
+- **Mailbox not closed on Destroy** — `PeerMsgTypeDestroy` sets `stopped = true` without closing the mailbox channel, preventing panics from concurrent senders. The `Run()` loop exits via the `stopped` flag check after each event.
 
 - **Store goroutine** — `RunStoreWorker` (in `StoreCoordinator`) is started in `main.go`. It listens on `router.StoreCh()` and handles `CreatePeer`, `DestroyPeer`, and `RaftMessage` (for unknown regions). `HandleRaftMessage` falls back to `storeCh` on `ErrRegionNotFound`, enabling dynamic peer creation. The `maybeCreatePeerForMessage` function queries PD via `pdClient.GetRegionByID()` for full region metadata when creating child peers (falling back to minimal metadata from the message if PD is unavailable).
 - **Significant messages** — All three `SignificantMsgType` values are fully handled in `handleSignificantMessage()`: `Unreachable` → `rawNode.ReportUnreachable`, `SnapshotStatus` → `rawNode.ReportSnapshot`, `MergeResult` → `stopped = true`.

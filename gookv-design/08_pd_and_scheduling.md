@@ -206,11 +206,12 @@ type TSOAllocator struct {
 ```
 
 `Allocate(count int)` returns a batch of `count` timestamps:
-1. Read the current wall-clock time in milliseconds.
-2. If the physical time has advanced, reset logical to 0 and update physical.
-3. If the physical time has NOT advanced (same millisecond), increment logical.
-4. Add `count` to logical and return the resulting timestamp.
-5. If logical exceeds 2^18, wait for the next millisecond.
+1. Validate that `count > 0` (returns error if `count <= 0`).
+2. Read the current wall-clock time in milliseconds.
+3. If the physical time has advanced, reset logical to 0 and update physical.
+4. If the physical time has NOT advanced (same millisecond), increment logical.
+5. Add `count` to logical and return the resulting timestamp.
+6. If logical exceeds 2^18, advance physical to `max(physical+1, now_ms)` (re-reads the wall clock to avoid creating timestamps behind real time when the clock has advanced) and reset logical to `count`.
 
 ### 5.4 TSOBuffer (Raft Mode)
 
@@ -504,7 +505,7 @@ The response contains `SplitID` entries, each with `NewRegionId` and `NewPeerIds
 func (s *PDServer) ReportBatchSplit(ctx context.Context, req *pdpb.ReportBatchSplitRequest) (*pdpb.ReportBatchSplitResponse, error)
 ```
 
-Called by the KV store after the split is complete. PD registers the new regions via `PutRegion`.
+Called by the KV store after the split is complete. PD registers the new regions via `PutRegion`, setting the first peer of each region as the leader. In Raft mode, each region is proposed as a `CmdPutRegion` command with the `Leader` field set.
 
 ### 9.4 Split Flow
 
@@ -627,15 +628,17 @@ flowchart TD
 ### 10.6 scheduleExcessReplicaShedding: Removing Extra Replicas
 
 ```go
-func (s *Scheduler) scheduleExcessReplicaShedding(regionID uint64, region *metapb.Region) *ScheduleCommand
+func (s *Scheduler) scheduleExcessReplicaShedding(regionID uint64, region *metapb.Region, leader *metapb.Peer) *ScheduleCommand
 ```
 
 After adding a new replica (e.g., during region balance), the region temporarily has more peers than `maxPeerCount`. This strategy removes the excess peer on the store with the highest region count.
 
+The `leader` parameter is used to **exclude the leader peer from removal candidates**. Removing the leader would disrupt the region's availability.
+
 Algorithm:
 1. If `len(peers) <= maxPeerCount`, return nil.
 2. Get region count per store.
-3. Find the peer on the store with the most regions.
+3. Find the peer on the store with the most regions, **skipping the leader peer**.
 4. Return a `RemoveNode` ChangePeer command for that peer.
 
 ### 10.7 scheduleRegionBalance: Moving Regions Between Stores
@@ -834,13 +837,15 @@ type PDRaftPeer struct {
     Mailbox chan PDRaftMsg
 
     sendFunc         func([]raftpb.Message)
-    pendingProposals map[uint64]func([]byte, error)
+    pendingProposals []func([]byte, error)  // FIFO slice; propose() appends, handleReady() dequeues
     applyFunc        func(PDCommand) ([]byte, error)
     applySnapshotFunc func([]byte) error
     leaderChangeFunc  func(bool)
     // ...
 }
 ```
+
+`pendingProposals` uses a FIFO slice instead of a `map[uint64]` keyed by index. Every call to `propose()` appends one entry (nil or non-nil callback). During `handleReady()`, committed entries dequeue from the front with `pendingProposals[0]` / `pendingProposals = pendingProposals[1:]`. Nil callbacks (e.g., from fire-and-forget `CmdCompactLog`) are appended to maintain FIFO alignment but discarded during dequeue.
 
 The event loop (`Run`) processes:
 - **Raft ticks** (100ms interval): drives leader election and heartbeats.
@@ -878,7 +883,7 @@ All PD state mutations are encoded as `PDCommand` entries in the Raft log. There
 
 | Constant | Value | Purpose | Target Component |
 |----------|-------|---------|-----------------|
-| `CmdSetBootstrapped` | 1 | Mark cluster as bootstrapped | MetadataStore |
+| `CmdSetBootstrapped` | 1 | Atomic bootstrap: mark cluster bootstrapped + register Store + Region | MetadataStore |
 | `CmdPutStore` | 2 | Register or update a store | MetadataStore |
 | `CmdPutRegion` | 3 | Store or update region metadata | MetadataStore |
 | `CmdUpdateStoreStats` | 4 | Update store health statistics | MetadataStore |
@@ -912,6 +917,10 @@ func (s *PDServer) applyCommand(cmd PDCommand) ([]byte, error) {
     switch cmd.Type {
     case CmdSetBootstrapped:
         s.meta.SetBootstrapped(*cmd.Bootstrapped)
+        // Atomic bootstrap: Store and Region fields are included in the
+        // same CmdSetBootstrapped proposal to avoid partially-bootstrapped state.
+        if cmd.Store != nil { s.meta.PutStore(cmd.Store) }
+        if cmd.Region != nil { s.meta.PutRegion(cmd.Region, cmd.Leader) }
         return nil, nil
     case CmdPutStore:
         s.meta.PutStore(cmd.Store)
@@ -946,18 +955,21 @@ When a PD follower falls too far behind, the leader sends a snapshot containing 
 
 ```go
 type PDSnapshot struct {
-    Bootstrapped bool
-    Stores       map[uint64]*metapb.Store
-    Regions      map[uint64]*metapb.Region
-    Leaders      map[uint64]*metapb.Peer
-    StoreStats   map[uint64]*pdpb.StoreStats
-    StoreStates  map[uint64]StoreState
-    NextID       uint64
-    TSOState     TSOSnapshotState
-    GCSafePoint  uint64
-    PendingMoves map[uint64]*PendingMove
+    Bootstrapped       bool
+    Stores             map[uint64]*metapb.Store
+    Regions            map[uint64]*metapb.Region
+    Leaders            map[uint64]*metapb.Peer
+    StoreStats         map[uint64]*pdpb.StoreStats
+    StoreStates        map[uint64]StoreState
+    NextID             uint64
+    TSOState           TSOSnapshotState
+    GCSafePoint        uint64
+    PendingMoves       map[uint64]*PendingMove
+    StoreLastHeartbeat map[uint64]int64  // Unix nanoseconds (time.Time → int64)
 }
 ```
+
+`StoreLastHeartbeat` stores Unix nanosecond timestamps (as `int64`) so that `time.Time` values survive JSON round-trips. `GenerateSnapshot` converts `time.Time` to `int64` via `UnixNano()`, and `ApplySnapshot` converts back via `time.Unix(0, v)`.
 
 `GenerateSnapshot` acquires read locks on all sub-components, deep-copies their state into a `PDSnapshot` struct, and JSON-encodes it.
 
@@ -1035,7 +1047,7 @@ func (s *PDServer) getLeaderClient() (pdpb.PDClient, error) {
     }
     // Leader changed: close old connection, dial new leader
     addr := s.raftCfg.ClientAddrs[leaderID]
-    conn, _ := grpc.Dial(addr, ...)
+    conn, _ := grpc.NewClient(addr, ...)
     s.cachedLeaderConn = conn
     s.cachedLeaderID = leaderID
     return pdpb.NewPDClient(conn), nil
@@ -1247,14 +1259,14 @@ The GC safe point tracks the oldest timestamp that any active transaction might 
 
 ```go
 type GCSafePointManager struct {
-    mu        sync.Mutex
+    mu        sync.RWMutex
     safePoint uint64
 }
 ```
 
-`UpdateSafePoint(newSP uint64) uint64`: Advances the safe point forward only (max of current and new). Returns the resulting safe point.
+`UpdateSafePoint(newSP uint64) uint64`: Advances the safe point forward only (max of current and new). Returns the resulting safe point. Uses `mu.Lock()`.
 
-`GetSafePoint() uint64`: Returns the current safe point.
+`GetSafePoint() uint64`: Returns the current safe point. Uses `mu.RLock()` for read-only access.
 
 ### 15.3 Integration with KV Stores
 

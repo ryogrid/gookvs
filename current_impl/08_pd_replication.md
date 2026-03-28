@@ -87,7 +87,7 @@ graph TB
 
 | Constant | Value | Payload Fields | Target Sub-component |
 |----------|-------|---------------|---------------------|
-| `CmdSetBootstrapped` | 1 | `Bootstrapped *bool` | `MetadataStore` |
+| `CmdSetBootstrapped` | 1 | `Bootstrapped *bool`, `Store *metapb.Store`, `Region *metapb.Region` | `MetadataStore` |
 | `CmdPutStore` | 2 | `Store *metapb.Store` | `MetadataStore` |
 | `CmdPutRegion` | 3 | `Region *metapb.Region`, `Leader *metapb.Peer` | `MetadataStore` |
 | `CmdUpdateStoreStats` | 4 | `StoreID uint64`, `StoreStats *pdpb.StoreStats` | `MetadataStore` |
@@ -233,7 +233,7 @@ type PDRaftPeer struct {
     Mailbox chan PDRaftMsg
 
     sendFunc          func([]raftpb.Message)
-    pendingProposals  map[uint64]func([]byte, error)
+    pendingProposals  []func([]byte, error)  // FIFO slice; propose() appends, handleReady() dequeues
     applyFunc         func(PDCommand) ([]byte, error)
     applySnapshotFunc func([]byte) error
     leaderChangeFunc  func(isLeader bool)
@@ -287,7 +287,7 @@ After every `select` case, `handleReady()` is called to process any pending Raft
 5. **Apply committed entries**: For each committed entry:
    - Skip empty entries (leader election no-ops).
    - Skip `EntryConfChange` / `EntryConfChangeV2` entries.
-   - Unmarshal `PDCommand`, call `applyFunc`, invoke pending proposal callback.
+   - Unmarshal `PDCommand`, call `applyFunc`, dequeue the next pending callback from the front of the FIFO slice (`pendingProposals[0]` / `pendingProposals = pendingProposals[1:]`). Nil callbacks are discarded.
    - Update `AppliedIndex` to the last committed entry.
 6. **Advance**: Call `rawNode.Advance(rd)`.
 
@@ -312,7 +312,7 @@ Leader-only. Evaluates whether the Raft log should be compacted:
 3. If `excessCount < RaftLogGCCountLimit` (10000), skip.
 4. Compute `compactIdx = AppliedIndex - RaftLogGCThreshold` (50).
 5. Skip if `compactIdx <= lastCompactedIdx`.
-6. Look up the term at `compactIdx`, propose `CmdCompactLog` (fire-and-forget).
+6. Look up the term at `compactIdx`, route `CmdCompactLog` through `propose()` with nil callback (fire-and-forget). Routing through `propose()` instead of calling `rawNode.Propose()` directly keeps the FIFO pendingProposals queue aligned.
 
 ## 7. Apply (`apply.go`)
 
@@ -324,7 +324,7 @@ Applies a single `PDCommand` to the server's in-memory state. The function conta
 
 | Command | Apply Logic | Returns Result? |
 |---------|------------|-----------------|
-| `CmdSetBootstrapped` | `s.meta.SetBootstrapped(*cmd.Bootstrapped)` | No |
+| `CmdSetBootstrapped` | `s.meta.SetBootstrapped(*cmd.Bootstrapped)` + `PutStore(cmd.Store)` + `PutRegion(cmd.Region, cmd.Leader)` if present (atomic bootstrap) | No |
 | `CmdPutStore` | `s.meta.PutStore(cmd.Store)` | No |
 | `CmdPutRegion` | `s.meta.PutRegion(cmd.Region, cmd.Leader)` | No |
 | `CmdUpdateStoreStats` | `s.meta.UpdateStoreStats(cmd.StoreID, cmd.StoreStats)` | No |
@@ -349,16 +349,17 @@ For `CmdCompactLog`, the apply function:
 
 ```go
 type PDSnapshot struct {
-    Bootstrapped bool                        `json:"bootstrapped"`
-    Stores       map[uint64]*metapb.Store    `json:"stores"`
-    Regions      map[uint64]*metapb.Region   `json:"regions"`
-    Leaders      map[uint64]*metapb.Peer     `json:"leaders"`
-    StoreStats   map[uint64]*pdpb.StoreStats `json:"store_stats"`
-    StoreStates  map[uint64]StoreState       `json:"store_states"`
-    NextID       uint64                      `json:"next_id"`
-    TSOState     TSOSnapshotState            `json:"tso_state"`
-    GCSafePoint  uint64                      `json:"gc_safe_point"`
-    PendingMoves map[uint64]*PendingMove     `json:"pending_moves"`
+    Bootstrapped       bool                        `json:"bootstrapped"`
+    Stores             map[uint64]*metapb.Store    `json:"stores"`
+    Regions            map[uint64]*metapb.Region   `json:"regions"`
+    Leaders            map[uint64]*metapb.Peer     `json:"leaders"`
+    StoreStats         map[uint64]*pdpb.StoreStats `json:"store_stats"`
+    StoreStates        map[uint64]StoreState       `json:"store_states"`
+    NextID             uint64                      `json:"next_id"`
+    TSOState           TSOSnapshotState            `json:"tso_state"`
+    GCSafePoint        uint64                      `json:"gc_safe_point"`
+    PendingMoves       map[uint64]*PendingMove     `json:"pending_moves"`
+    StoreLastHeartbeat map[uint64]int64            `json:"store_last_heartbeat"`
 }
 
 type TSOSnapshotState struct {
@@ -366,6 +367,8 @@ type TSOSnapshotState struct {
     Logical  int64 `json:"logical"`
 }
 ```
+
+`StoreLastHeartbeat` stores Unix nanosecond timestamps (as `int64`) so that `time.Time` values survive JSON round-trips. `GenerateSnapshot` converts `time.Time` to `int64` via `UnixNano()`, and `ApplySnapshot` converts back via `time.Unix(0, v)`.
 
 ### GenerateSnapshot
 
@@ -375,7 +378,7 @@ func (s *PDServer) GenerateSnapshot() ([]byte, error)
 
 Captures all mutable PD state by acquiring read locks on each sub-component in sequence:
 
-1. **MetadataStore** (`s.meta.mu.RLock()`): Deep-copies `bootstrapped`, `stores`, `regions`, `leaders`, `storeStats`, `storeStates`.
+1. **MetadataStore** (`s.meta.mu.RLock()`): Deep-copies `bootstrapped`, `stores`, `regions`, `leaders`, `storeStats`, `storeStates`, and `storeLastHeartbeat` (converting `time.Time` to `int64` Unix nanos).
 2. **TSOAllocator** (`s.tso.mu.Lock()`): Copies `physical` and `logical`.
 3. **IDAllocator** (`s.idAlloc.mu.Lock()`): Copies `nextID`.
 4. **GCSafePointManager** (`s.gcMgr.mu.Lock()`): Copies `safePoint`.
@@ -389,7 +392,7 @@ Returns JSON-encoded `PDSnapshot`.
 func (s *PDServer) ApplySnapshot(data []byte) error
 ```
 
-Replaces the PD server's in-memory state with the snapshot data. Acquires write locks on each sub-component and replaces map fields, nil-checking to ensure maps are initialized.
+Replaces the PD server's in-memory state with the snapshot data. Acquires write locks on each sub-component and replaces map fields, nil-checking to ensure maps are initialized. Converts `StoreLastHeartbeat` `int64` values back to `time.Time` via `time.Unix(0, v)`.
 
 ## 9. Transport (`transport.go`)
 
@@ -419,7 +422,7 @@ func (t *PDTransport) Send(peerID uint64, msg raftpb.Message) error
 
 Uses a double-checked locking pattern:
 1. **Fast path**: `RLock` + map lookup.
-2. **Slow path**: `Lock` + double-check + `grpc.DialContext` with 5-second timeout, insecure credentials, and keepalive parameters (`Time=60s`, `Timeout=10s`, `PermitWithoutStream=false`).
+2. **Slow path**: `Lock` + double-check + `grpc.NewClient` with insecure credentials and keepalive parameters (`Time=60s`, `Timeout=10s`, `PermitWithoutStream=false`).
 
 ### WireTransport on PDRaftPeer
 
@@ -477,7 +480,7 @@ Maintains a cached gRPC connection to the current Raft leader:
 1. Locks `s.leaderConnMu`.
 2. Gets `leaderID` from `s.raftPeer.LeaderID()`. Returns `codes.Unavailable` if 0.
 3. Reuses cached connection if `s.cachedLeaderID == leaderID`.
-4. On leader change: closes old connection, looks up the leader's client address from `s.raftCfg.ClientAddrs`, dials new connection.
+4. On leader change: closes old connection, looks up the leader's client address from `s.raftCfg.ClientAddrs`, creates new connection via `grpc.NewClient`.
 
 ### Unary Forwarders
 
@@ -611,7 +614,7 @@ flowchart TD
     I --> J{compactIdx <= lastCompactedIdx?}
     J -- Yes --> Z
     J -- No --> K[Look up term at compactIdx]
-    K --> L[Propose CmdCompactLog fire-and-forget]
+    K --> L[Route CmdCompactLog through propose with nil callback]
     L --> M[Update lastCompactedIdx]
 ```
 
@@ -705,7 +708,7 @@ All write RPC handlers follow the pattern shown in section 11. For example, `Boo
 
 1. If `raftPeer == nil` -> direct single-node execution.
 2. If `!raftPeer.IsLeader()` -> `forwardBootstrap(ctx, req)`.
-3. Otherwise (leader) -> validate, then `raftPeer.ProposeAndWait(ctx, cmd)`.
+3. Otherwise (leader) -> validate, then `raftPeer.ProposeAndWait(ctx, cmd)`. Bootstrap uses a single `CmdSetBootstrapped` proposal with `Store` and `Region` fields included for atomic bootstrap.
 
 ### Enhanced GetMembers
 

@@ -28,7 +28,7 @@ This document catalogs the differences between gookv and TiKV to help developers
 | **1PC Optimization** | Yes | Yes | Single-region only |
 | **Region Split** | Raft admin command | Raft admin command | See Section 3.3 |
 | **Region Merge** | Basic (ExecPrepareMerge/CommitMerge/RollbackMerge) | Full | gookv has the skeleton |
-| **Apply Layer** | Single `applyFunc` closure | Dedicated Apply FSM | See Section 3.4 |
+| **Apply Layer** | `ApplyWorkerPool` (async, goroutine pool) | Dedicated Apply FSM | See Section 3.4 |
 | **Scheduler** | One per store | Per-region scheduler | See Section 3.5 |
 | **Coprocessor** | Basic scan + aggregation | Full SQL pushdown | See Section 3.6 |
 | **Raft Transport** | Per-message gRPC stream | Persistent connection pool | See Section 3.7 |
@@ -217,18 +217,18 @@ TiKV has a sophisticated apply layer with its own state machine:
 
 In TiKV, the apply layer runs in a separate thread pool from the Raft state machine. Committed entries are sent from the Raft FSM to the Apply FSM via channels. This decouples Raft consensus (which needs low latency) from entry application (which involves disk I/O).
 
-#### 3.4.2 gookv: Single applyFunc Closure
+#### 3.4.2 gookv: ApplyWorkerPool (Async Apply)
 
-gookv uses a simple closure-based apply mechanism:
+gookv now uses an `ApplyWorkerPool` that decouples apply from the Raft event loop, similar in concept to TiKV's `ApplyFsm`:
 
 ```go
-// In StoreCoordinator
-peer.SetApplyFunc(func(regionID uint64, entries []raftpb.Entry) {
-    coord.applyEntries(regionID, entries)
-})
+// StoreCoordinator creates the pool at startup
+sc.applyWorkerPool = raftstore.NewApplyWorkerPool(4)
+// Each peer is wired to the shared pool
+peer.SetApplyWorkerPool(sc.applyWorkerPool)
 ```
 
-The `applyFunc` is called directly from the Peer's goroutine after `handleReady` processes committed entries. There is no separate apply thread pool or batching.
+After `handleReady` collects committed entries, the peer submits an `ApplyTask` to the pool. A background worker goroutine processes the task, calling the `applyFunc` closure and notifying the peer when done. This means the Raft tick loop is no longer blocked by slow `WriteBatch.Commit` operations.
 
 ```mermaid
 graph LR
@@ -238,15 +238,16 @@ graph LR
     end
 
     subgraph "gookv"
-        PG[Peer Goroutine] -->|direct call| AP[applyFunc]
+        PG[Peer Goroutine] -->|submit ApplyTask| AP[ApplyWorkerPool]
+        AP -->|notify done| PG
     end
 ```
 
-This simplification means:
-- **Pro**: Much simpler code (no inter-thread communication for apply).
-- **Pro**: No ordering issues between Raft and Apply threads.
-- **Con**: Entry application blocks the Raft tick loop. A slow `WriteBatch.Commit` will delay Raft heartbeats and proposals.
-- **Con**: No batching of applies across multiple regions (each peer applies independently).
+Compared to the original synchronous apply:
+- **Pro**: Raft tick loop is no longer blocked by entry application.
+- **Pro**: Multiple regions can apply concurrently via the shared worker pool (default 4 workers).
+- **Pro**: Simpler than TiKV's full batch system but captures the key benefit (async apply).
+- **Con**: Still no batching of applies across regions within a single worker (each task is independent).
 
 #### 3.4.3 One Goroutine Per Peer vs Batch System
 
@@ -634,6 +635,23 @@ Key mechanisms that ensure correctness:
 4. LatchGuard pattern for propose-time consistency
 5. Propose-time epoch validation
 
+### 5.6 Performance Optimizations Adopted from TiKV
+
+gookv has adopted several key performance patterns from TiKV, adapted to Go idioms:
+
+| Optimization | gookv Implementation | TiKV Equivalent |
+|-------------|---------------------|-----------------|
+| **NoSync apply path** | `WriteBatch.CommitNoSync()` for apply writes; Raft log guarantees durability via replay on crash | Same concept: apply writes skip fsync since the Raft log is the durability guarantee |
+| **RaftLogWriter I/O coalescing** | `RaftLogWriter` batches `WriteTask` submissions from multiple peer goroutines into a single `WriteBatch.Commit()` with one fsync | TiKV's `WriteRouter` / `StoreWriteRouter` coalesces Raft log writes across regions |
+| **ApplyWorkerPool (async apply)** | Shared goroutine pool (default 4 workers) processes `ApplyTask` entries asynchronously, decoupling apply from the Raft tick loop | TiKV's `ApplyFsm` / `ApplyBatchSystem` runs apply in a separate thread pool |
+| **Batch commitSecondaries by region** | `GroupKeysByRegion` groups secondary keys, then sends one `KvCommit` RPC per region group (with per-key fallback) | TiKV's client batches commit requests by region for efficiency |
+
+These optimizations represent the most impactful performance patterns from TiKV that can be cleanly expressed in Go without adding excessive complexity.
+
+### 5.7 Modern gRPC API (grpc.NewClient)
+
+gookv has adopted the modern `grpc.NewClient` API (gRPC v1.79.3) across core packages including `internal/pd/forward.go`, `internal/pd/transport.go`, `internal/server/transport/transport.go`, and `pkg/client/request_sender.go`. The deprecated `grpc.Dial` / `grpc.DialContext` has been replaced in these locations. The PD client (`pkg/pdclient/client.go`) still uses `grpc.DialContext` pending migration to a non-blocking connection pattern.
+
 ---
 
 ## 6. Detailed Comparison: Apply Path
@@ -671,21 +689,24 @@ Key characteristics:
 sequenceDiagram
     participant Client
     participant Peer as Peer Goroutine
+    participant Pool as ApplyWorkerPool
     participant Engine as Pebble
 
     Client->>Peer: Propose(data) via mailbox
     Peer->>Peer: rawNode.Propose()
     Peer->>Peer: Raft consensus (via handleReady)
-    Peer->>Peer: applyFunc(committedEntries)
-    Peer->>Engine: WriteBatch.Commit()
+    Peer->>Pool: Submit ApplyTask(committedEntries)
+    Pool->>Pool: applyFunc(committedEntries)
+    Pool->>Engine: WriteBatch.CommitNoSync()
+    Pool->>Peer: Notify done
     Peer->>Client: Callback with result
 ```
 
 Key characteristics:
-- Single goroutine handles both Raft and Apply
-- Synchronous: apply blocks the Raft tick loop
-- No batching across regions (each peer applies independently)
-- Simpler but potentially higher latency under load
+- Peer goroutine handles Raft; apply is offloaded to a shared worker pool
+- Asynchronous: apply does not block the Raft tick loop
+- Shared pool (default 4 workers) allows concurrent apply across regions
+- Uses `CommitNoSync()` for apply writes (Raft log guarantees durability via replay)
 
 ---
 
@@ -844,7 +865,7 @@ The reverse migration (TiKV to gookv) is also possible for supported features, s
 | Engine | Pebble | RocksDB | Pure Go, no CGo, simpler builds |
 | CF emulation | Key prefix | Native CFs | Single engine instance, simpler configuration |
 | Peer model | 1 goroutine/peer | Batch system | Idiomatic Go, simpler concurrency |
-| Apply | Inline closure | Dedicated thread pool | Simplicity over throughput |
+| Apply | ApplyWorkerPool (async) | Dedicated thread pool | Simpler pool, same async benefit |
 | Scheduler | Single function | Pluggable framework | Sufficient for small-scale deployments |
 | Coprocessor | Basic | Full SQL pushdown | Focus on KV API, not SQL |
 | PD | Own Raft group | etcd-based | Self-contained, no external deps |

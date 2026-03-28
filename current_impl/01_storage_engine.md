@@ -88,7 +88,9 @@ type WriteBatch interface {
     Clear()
     SetSavePoint()
     RollbackToSavePoint() error
+    PopSavePoint() error
     Commit() error
+    CommitNoSync() error
 }
 ```
 
@@ -102,7 +104,9 @@ type WriteBatch interface {
 | `Clear` | Reset the batch to empty. |
 | `SetSavePoint` | Record the current operation count as a restore point. |
 | `RollbackToSavePoint` | Roll back to the last save point (see limitation in Section 3). |
-| `Commit` | Atomically apply all buffered mutations (synchronous). |
+| `PopSavePoint` | Discard the last save point without rolling back. |
+| `Commit` | Atomically apply all buffered mutations with fsync (synchronous). |
+| `CommitNoSync` | Atomically apply all buffered mutations without fsync. Used when durability is guaranteed by another mechanism (e.g., Raft log). |
 
 ### 2.5 Iterator Interface
 
@@ -174,7 +178,9 @@ classDiagram
         +Clear()
         +SetSavePoint()
         +RollbackToSavePoint() error
+        +PopSavePoint() error
         +Commit() error
+        +CommitNoSync() error
     }
 
     class Iterator {
@@ -307,6 +313,7 @@ type savePointState struct {
 - `RollbackToSavePoint()` restores the batch to the last save point: it pops the `savePointState`, creates a new `pebble.Batch` via `db.NewBatch()`, calls `newBatch.SetRepr(sp.repr)` to restore the serialized state, closes the old batch, and restores `count`/`dataSize`. This provides true rollback semantics.
 - `PopSavePoint()` discards the last save point without rolling back — used when the caller decides to keep the operations added since the save point.
 - `Commit()` calls `batch.Commit(pebble.Sync)` for durable, synchronous application of all buffered mutations.
+- `CommitNoSync()` calls `batch.Commit(pebble.NoSync)` for atomic application without fsync. Used by `Storage.ApplyModifies` and `GCWorker.applyModifies` where durability is guaranteed by the Raft log or recoverability by re-running GC.
 
 ### 3.5 Iterator Implementation
 
@@ -426,13 +433,20 @@ sequenceDiagram
     participant Pebble as pebble.Batch
 
     Note over Caller,WB: (mutations accumulated via Put/Delete/DeleteRange)
-    Caller->>WB: Commit()
-    WB->>Pebble: batch.Commit(pebble.Sync)
-    Pebble-->>WB: error / nil
-    WB-->>Caller: error / nil
+    alt Commit() — durable
+        Caller->>WB: Commit()
+        WB->>Pebble: batch.Commit(pebble.Sync)
+        Pebble-->>WB: error / nil
+        WB-->>Caller: error / nil
+    else CommitNoSync() — no fsync
+        Caller->>WB: CommitNoSync()
+        WB->>Pebble: batch.Commit(pebble.NoSync)
+        Pebble-->>WB: error / nil
+        WB-->>Caller: error / nil
+    end
 ```
 
-All individual mutations in the batch are applied atomically. The commit is synchronous (`pebble.Sync`).
+All individual mutations in the batch are applied atomically. `Commit()` uses `pebble.Sync` for durable writes (e.g., Raft log persistence via `SaveReady`). `CommitNoSync()` uses `pebble.NoSync` for apply-path writes where durability is already guaranteed by the Raft log (e.g., `Storage.ApplyModifies`) or recoverability by re-running the operation (e.g., GC).
 
 ## 5. Dependencies
 
@@ -447,9 +461,10 @@ All individual mutations in the batch are applied atomically. The commit is sync
 
 | Consumer Package | Usage |
 |-----------------|-------|
-| `internal/raftstore` | Stores Raft log entries and state in the `CFRaft` CF; reads/writes via `KvEngine` and `WriteBatch` |
+| `internal/raftstore` | Stores Raft log entries and state in the `CFRaft` CF; reads/writes via `KvEngine` and `WriteBatch` (uses `Commit` with Sync for Raft log persistence) |
 | `internal/storage` | MVCC reader and transaction actions use `KvEngine`, `Snapshot`, and `Iterator` for multi-version data access |
-| `internal/server` | Creates and manages the `Engine` instance; passes it to raftstore and storage layers |
+| `internal/storage/gc` | `GCWorker` uses `KvEngine` and `WriteBatch.CommitNoSync` to remove obsolete MVCC versions |
+| `internal/server` | Creates and manages the `Engine` instance; `Storage.ApplyModifies` uses `WriteBatch.CommitNoSync`; passes engine to raftstore and storage layers |
 | `internal/coprocessor` | Reads data through the engine interface for coprocessor request handling |
 | `cmd/gookv-server` | Entry point that opens the engine |
 | `cmd/gookv-ctl` | Admin CLI that opens the engine for inspection |
@@ -468,7 +483,8 @@ All individual mutations in the batch are applied atomically. The commit is sync
 | `DeleteRange` | Synchronous range deletion `[start, end)` |
 | `NewSnapshot` | Point-in-time consistent read view via `pebble.Snapshot` |
 | `NewWriteBatch` | Atomic batch with thread-safe mutation counting |
-| `WriteBatch.Commit` | Synchronous atomic commit |
+| `WriteBatch.Commit` | Synchronous atomic commit with fsync |
+| `WriteBatch.CommitNoSync` | Atomic commit without fsync (for apply-path and GC writes) |
 | `NewIterator` | CF-bounded iteration with configurable lower/upper bounds |
 | `Iterator.SeekForPrev` | Workaround using `SeekGE` + `Prev` to emulate "last key <= target" |
 | `GetProperty` | Returns Pebble metrics as a formatted string |
@@ -479,6 +495,7 @@ All individual mutations in the batch are applied atomically. The commit is sync
 - **`SyncWAL`** calls `db.Flush()` rather than a true WAL sync. `Flush()` forces a memtable flush to SST files, which is a stronger (and more expensive) durability guarantee than WAL-only sync. This means `SyncWAL` is not semantically identical to RocksDB's `SyncWAL` -- it writes data to L0 SSTs rather than just ensuring the WAL is fsync'd.
 - **`GetProperty`** ignores the `cf` and `name` parameters and always returns the full Pebble metrics string. This is a simplified implementation compared to RocksDB's per-CF property queries.
 - **Value copying**: Both `Engine.Get` and `iterator.Value` allocate new slices and copy data before returning, preventing callers from holding references to Pebble's internal buffers.
+- **Sync vs NoSync split**: `Commit()` uses `pebble.Sync` and is used by Raft log persistence (`SaveReady`) where crash durability is required. `CommitNoSync()` uses `pebble.NoSync` and is used by the apply path (`Storage.ApplyModifies`) and GC (`GCWorker.applyModifies`), where durability is guaranteed by the Raft log or recoverability by re-running GC after crash.
 
 ### Conformance Tests
 

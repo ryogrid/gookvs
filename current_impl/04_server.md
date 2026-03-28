@@ -100,7 +100,9 @@ type Storage struct {
 | `PessimisticLock(keys, primary, startTS, forUpdateTS, lockTTL)` | Acquire pessimistic locks; returns errors per key |
 | `PessimisticLockModifies(keys, primary, startTS, forUpdateTS, lockTTL)` | Returns `[]mvcc.Modify` and errors per key (for Raft proposal) |
 | `PessimisticRollbackKeys(keys, startTS, forUpdateTS)` | Release pessimistic locks; returns errors per key |
+| `PessimisticRollbackModifies(keys, startTS, forUpdateTS)` | Returns `[]mvcc.Modify`, errors per key, and `LatchGuard` (for Raft proposal) |
 | `TxnHeartBeat(primaryKey, startTS, adviseLockTTL)` | Refresh lock TTL; returns updated TTL |
+| `TxnHeartBeatModifies(primaryKey, startTS, adviseLockTTL)` | Returns `(ttl, []mvcc.Modify, error, *LatchGuard)` (for Raft proposal) |
 | `ResolveLock(startTS, commitTS, keys)` | Commit or rollback all locks for a transaction |
 | `ResolveLockModifies(startTS, commitTS, keys)` | Returns `[]mvcc.Modify` for resolve (for Raft proposal) |
 | `PrewriteAsyncCommit(mutations, props)` | Async commit prewrite with direct apply |
@@ -239,13 +241,13 @@ The `Tikv` service declares the full TiKV-compatible API. Below is the implement
 | `KvCleanup` | `CleanupRequest` / `CleanupResponse` | Yes |
 | `KvCheckTxnStatus` | `CheckTxnStatusRequest` / `CheckTxnStatusResponse` | Yes |
 | `KvPessimisticLock` | `PessimisticLockRequest` / `PessimisticLockResponse` | Yes (dual-mode: cluster proposes via Raft, standalone applies locally) |
-| `KVPessimisticRollback` | `PessimisticRollbackRequest` / `PessimisticRollbackResponse` | Yes |
-| `KvTxnHeartBeat` | `TxnHeartBeatRequest` / `TxnHeartBeatResponse` | Yes |
+| `KVPessimisticRollback` | `PessimisticRollbackRequest` / `PessimisticRollbackResponse` | Yes (dual-mode: cluster uses `PessimisticRollbackModifies` + `ProposeModifies` via Raft; calls `validateRegionContext`) |
+| `KvTxnHeartBeat` | `TxnHeartBeatRequest` / `TxnHeartBeatResponse` | Yes (dual-mode: cluster uses `TxnHeartBeatModifies` + `ProposeModifies` via Raft; calls `validateRegionContext`) |
 | `KvCheckSecondaryLocks` | `CheckSecondaryLocksRequest` / `CheckSecondaryLocksResponse` | Yes (inspects locks on secondary keys for async commit resolution) |
 | `KvScanLock` | `ScanLockRequest` / `ScanLockResponse` | Yes (iterates CF_LOCK with StartTS <= maxVersion filter, respects limit) |
 | `KvResolveLock` | `ResolveLockRequest` / `ResolveLockResponse` | Yes (dual-mode: cluster proposes via Raft, standalone applies locally) |
 | `KvGC` | `GCRequest` / `GCResponse` | Yes (schedules GC task with safe point; updates PD safe point via `pdClient.UpdateGCSafePoint` if PD is configured) |
-| `KvDeleteRange` | `DeleteRangeRequest` / `DeleteRangeResponse` | Yes (creates `ModifyTypeDeleteRange` modifies for each data CF; proposes via Raft in cluster mode, applies directly in standalone) |
+| `KvDeleteRange` | `DeleteRangeRequest` / `DeleteRangeResponse` | Yes (creates `ModifyTypeDeleteRange` modifies for each data CF; uses `req.GetContext().GetRegionId()` for routing in cluster mode, applies directly in standalone) |
 
 ### 3.2 Raw RPCs
 
@@ -260,6 +262,8 @@ The `Tikv` service declares the full TiKV-compatible API. Below is the implement
 | `RawChecksum` | Yes (CRC64 XOR-based checksum over key ranges, filters expired entries) |
 
 All implemented Raw RPCs delegate to the `RawStorage` layer (see Section 5.6). Single-key operations (`RawGet`, `RawPut`, `RawDelete`, `RawScan`) and batch operations (`RawBatchGet`, `RawBatchPut`, `RawBatchDelete`) follow the same pattern: the handler extracts key/value/CF parameters from the request and calls the corresponding `RawStorage` method. `RawDeleteRange` deletes all keys in a given range.
+
+All Raw RPC handlers call `validateRegionContext` before processing, including `RawPut` and `RawDelete` (which validate with the request key).
 
 Write operations (`RawPut`, `RawDelete`, `RawBatchPut`, `RawBatchDelete`, `RawDeleteRange`) support the dual-mode pattern: in cluster mode the handler obtains `[]engine.Modify` from `RawStorage` (via `PutModify`/`DeleteModify`) and proposes them through Raft; in standalone mode the writes are applied directly.
 
@@ -311,7 +315,7 @@ KvGet(ctx, GetRequest) -> GetResponse
 
 ### 4.2 Region Validation (`validateRegionContext`)
 
-In cluster mode, all read-only Raw KV handlers call `validateRegionContext()` before processing. This method checks:
+In cluster mode, all Raw KV handlers (both reads and writes, including `RawPut` and `RawDelete`) call `validateRegionContext()` before processing. This method checks:
 1. The request's `Context.RegionId` matches a known peer managed by the coordinator.
 2. The requesting peer is the current leader of the region.
 3. The request keys fall within the region's `[StartKey, EndKey)` range.
@@ -406,6 +410,7 @@ Steps 1-4 are identical to the standalone path, but step 5 is skipped. Instead:
 - The method returns `[]mvcc.Modify` to the caller (the gRPC handler).
 - **For `KvPrewrite` (standard 2PC) and `KvCommit`:** The handler extracts the region ID from the request context (`req.GetContext().GetRegionId()`) and calls `coord.ProposeModifies(regionID, modifies, timeout)` directly to the single target region. This works because the client library groups mutations by region before sending each request.
 - **For `KvPrewrite` (async commit):** The handler uses the same `req.GetContext().GetRegionId()` extraction as standard 2PC, calling `coord.ProposeModifies(regionID, modifies, timeout)` directly. All async commit mutations in a single request are proposed to the primary key's region.
+- **For `KVPessimisticRollback` and `KvTxnHeartBeat`:** The handler calls `PessimisticRollbackModifies` / `TxnHeartBeatModifies`, then uses `req.GetContext().GetRegionId()` with direct `coord.ProposeModifies()`. Both call `validateRegionContext` before processing.
 - **For `KvBatchRollback`, `KvPessimisticLock`, and `KvResolveLock`:** The handler calls `proposeModifiesToRegionsWithRegionError(coord, modifies, timeout)` which groups modifications by region via `groupModifiesByRegion()` and proposes to each region's leader separately.
 - `ProposeModifies` accepts an optional `reqEpoch` parameter. When provided, it validates that the region's current epoch matches (both `Version` and `ConfVer`) before proposing — returning an "epoch not match" error if stale. It embeds the current epoch in the `RaftCmdRequest.Header` for apply-time reference. The request is serialized via `ModifiesToRequests`, wrapped in a `RaftCmdRequest`, and sent as a `PeerMsgTypeRaftCommand` to the peer's mailbox. All transactional RPC handlers pass `req.GetContext().GetRegionEpoch()` to `ProposeModifies`; RawKV handlers omit the epoch parameter.
 - The peer proposes the entry to Raft. After consensus, the `applyFunc` callback fires.
@@ -430,8 +435,10 @@ The following methods follow the same latch-acquire / snapshot / MvccTxn pattern
 
 - **PessimisticLock** -- acquires pessimistic locks for the given keys. Creates an `MvccTxn` at `startTS`, calls `txn.PessimisticLock` for each key with `forUpdateTS` and `lockTTL`, then applies the resulting modifications directly.
 - **PessimisticLockModifies** -- same logic but returns `[]mvcc.Modify` without writing, for use with `ProposeModifies` in cluster mode.
-- **PessimisticRollbackKeys** -- releases pessimistic locks for the given keys at `(startTS, forUpdateTS)`. Applies directly.
-- **TxnHeartBeat** -- refreshes the TTL of the lock on `primaryKey` at `startTS` to at least `adviseLockTTL`. Returns the resulting TTL. Does not use latches.
+- **PessimisticRollbackKeys** -- releases pessimistic locks for the given keys at `(startTS, forUpdateTS)`. Applies directly in standalone mode.
+- **PessimisticRollbackModifies** -- same logic but returns `[]mvcc.Modify` and a `LatchGuard` for use with `ProposeModifies` in cluster mode. The `KVPessimisticRollback` handler calls `validateRegionContext` and routes through Raft.
+- **TxnHeartBeat** -- refreshes the TTL of the lock on `primaryKey` at `startTS` to at least `adviseLockTTL`. Returns the resulting TTL. Applies directly in standalone mode.
+- **TxnHeartBeatModifies** -- same logic but returns `(ttl, []mvcc.Modify, error, *LatchGuard)` for use with `ProposeModifies` in cluster mode. The `KvTxnHeartBeat` handler calls `validateRegionContext` and routes through Raft.
 - **ResolveLock** -- commits or rolls back all locks belonging to a transaction (`startTS`). If `commitTS > 0` the locks are committed; otherwise they are rolled back. Applies directly.
 - **ResolveLockModifies** -- same logic but returns `[]mvcc.Modify` for Raft proposal.
 
@@ -508,7 +515,7 @@ Converts a `ProposeModifies` error into a structured region error by inspecting 
 - `"timeout"` → `NotLeader{RegionId}` (proposal timeout usually indicates the Raft group is non-functional; returning NotLeader triggers client retry with a different store)
 - `"epoch not match"` → `EpochNotMatch{}` (region epoch changed between RPC validation and Raft proposal, typically due to a concurrent split; client refreshes region cache and retries)
 
-Used by `proposeModifiesToRegionsWithRegionError`, the direct proposal paths in `KvPrewrite` (standard 2PC, 1PC), `KvCommit`, and Raw KV write handlers.
+Used by `proposeModifiesToRegionsWithRegionError`, the direct proposal paths in `KvPrewrite` (standard 2PC, 1PC), `KvCommit`, `KVPessimisticRollback`, `KvTxnHeartBeat`, and Raw KV write handlers.
 
 **Proposal routing strategy overview:**
 
@@ -519,6 +526,8 @@ flowchart LR
         KvPrewriteAC["KvPrewrite\n(async commit)"]
         KvCommit["KvCommit"]
         KvPrewrite1PC["KvPrewrite\n(1PC)"]
+        KvPessRollback["KVPessimisticRollback"]
+        KvTxnHB["KvTxnHeartBeat"]
     end
     subgraph "Multi-Region Grouping (groupModifiesByRegion)"
         KvBatchRollback["KvBatchRollback"]
@@ -530,6 +539,8 @@ flowchart LR
     KvPrewriteAC --> ProposeModifies
     KvCommit --> ProposeModifies
     KvPrewrite1PC --> ProposeModifies
+    KvPessRollback --> ProposeModifies
+    KvTxnHB --> ProposeModifies
 
     KvBatchRollback --> proposeModifiesToRegions
     KvPessimisticLock --> proposeModifiesToRegions
@@ -573,10 +584,27 @@ Converts an internal `Lock` and user key to a protobuf `kvrpcpb.LockInfo` with f
 ```go
 type RaftClient struct {
     mu          sync.RWMutex
-    connections map[uint64]*connPool  // storeID -> connection pool
+    connections map[uint64]*connPool    // storeID -> connection pool
+    streams     map[uint64]*raftStream  // storeID -> persistent stream
     resolver    StoreResolver
     batchSize   int
     dialTimeout time.Duration
+    poolSize    int // configured connection pool size per store
+    streamBuf   int // send channel buffer size for streams (default 4096)
+}
+```
+
+**Long-lived `raftStream`**: Each store has a persistent gRPC `Raft` streaming RPC. The stream is created lazily on first `Send()` via `getOrCreateStream()` and reused for all subsequent messages. A dedicated **send goroutine** (`sendLoop`) reads from a buffered channel (`sendCh`, capacity 4096) and writes to the gRPC stream. If a send error occurs, the stream is marked closed (`atomic.Bool`) and automatically recreated on the next `Send()`.
+
+```go
+type raftStream struct {
+    storeID uint64
+    conn    *grpc.ClientConn
+    stream  tikvpb.Tikv_RaftClient
+    sendCh  chan *raft_serverpb.RaftMessage  // buffered (4096)
+    ctx     context.Context
+    cancel  context.CancelFunc
+    closed  atomic.Bool
 }
 ```
 
@@ -596,7 +624,7 @@ type StoreResolver interface {
 
 | Method | Description |
 |---|---|
-| `Send(storeID, msg)` | Opens a `Raft` stream to the target store, sends a single `RaftMessage`, then closes. 5s timeout. |
+| `Send(storeID, msg)` | Enqueues a `RaftMessage` on the persistent stream's buffered send channel. The stream is lazily created and reused. Non-blocking unless the buffer is full. |
 | `BatchSend(storeID, msgs)` | Opens a `BatchRaft` stream. Sends messages in batches of `batchSize`. 10s timeout. |
 | `SendSnapshot(storeID, msg, data)` | Opens a `Snapshot` stream. Sends data in 1 MB chunks with the `RaftMessage` metadata in the first chunk. 5-minute timeout. |
 | `Close()` | Closes all connection pools. |
@@ -604,7 +632,19 @@ type StoreResolver interface {
 
 ### 6.3 Connection Pooling
 
-Each store gets a `connPool` with lazily-established gRPC connections. Connection options:
+Each store gets a `connPool` with lazily-established gRPC connections. The pool uses **atomic round-robin** (`nextIdx`) to select a connection index:
+
+```go
+type connPool struct {
+    mu      sync.Mutex
+    addr    string
+    conns   []*grpc.ClientConn
+    size    int
+    nextIdx uint64 // round-robin counter
+}
+```
+
+Connection options:
 - `insecure.NewCredentials()` (no TLS)
 - Keepalive: `Time=60s`, `Timeout=10s`, `PermitWithoutStream=false`
 - Max message sizes: 64 MB send/recv
@@ -668,9 +708,12 @@ A worker pool with EWMA-based busy detection.
 | `taskCh` | Buffered channel (`workers*16` capacity) |
 | `ewmaSlice` | EWMA of task execution time in nanoseconds (atomic, alpha=0.3) |
 | `queueDepth` | Current number of tasks in the queue (atomic) |
+| `stopCh` | Channel closed by `Stop()` to signal workers |
+| `wg` | `sync.WaitGroup` tracking all worker goroutines |
 
 - `Submit(task)` wraps the task with timing instrumentation and enqueues it.
 - `CheckBusy(ctx, thresholdMs)` estimates wait time as `ewma * depth / workers` and returns `ServerIsBusyError` if it exceeds the threshold.
+- `Stop()` closes `stopCh` and calls `wg.Wait()` to drain pending tasks before returning. Each worker drains remaining tasks from `taskCh` after `stopCh` is closed, ensuring no in-flight work is lost.
 
 ### 8.2 FlowController
 

@@ -15,7 +15,7 @@
 | `github.com/cockroachdb/pebble` v1.1.5 | Storage engine (pure Go, RocksDB-compatible) |
 | `go.etcd.io/etcd/raft/v3` v3.5.17 | Raft consensus (RawNode API) |
 | `github.com/pingcap/kvproto` | TiKV-compatible protobuf definitions (tikvpb, kvrpcpb, raft_serverpb, raft_cmdpb, eraftpb, metapb, pdpb) |
-| `google.golang.org/grpc` v1.59.0 | RPC framework for client-server and inter-node communication |
+| `google.golang.org/grpc` v1.79.3 | RPC framework for client-server and inter-node communication (uses `grpc.NewClient`) |
 | `github.com/prometheus/client_golang` v1.15.0 | Metrics exposition (Prometheus /metrics endpoint) |
 | `github.com/stretchr/testify` v1.11.1 | Test assertions |
 | `github.com/BurntSushi/toml` v1.6.0 | TOML config file parsing |
@@ -35,6 +35,7 @@
 | `pkg/txntypes` | Transaction type definitions: `TimeStamp` (hybrid logical clock, physical<<18 \| logical), `Lock` (with TiKV-compatible binary serialization), `Write` (commit/rollback records), `Mutation`, `LockType`, `WriteType`. |
 | `pkg/pdclient` | PD (Placement Driver) gRPC client interface: TSO allocation (`GetTS`), region lookup, store management, heartbeats, split requests, cluster bootstrap. Provides `Client` interface and `grpcClient` implementation with multi-endpoint failover and retry logic. |
 | `pkg/client` | Multi-region client library: `Client` (entry point, PD-backed), `RawKVClient` (full Raw KV API with transparent cross-region routing), `RegionCache` (sorted-slice binary-search key→region cache with PD fallback), `RegionRequestSender` (gRPC connection pool with region-error retry), `PDStoreResolver` (TTL-cached storeID→address resolver). |
+| `pkg/e2elib` | PostgreSQL TAP-style end-to-end test library. `GokvNode` / `GokvCluster` (manage gookv-server processes), `PDNode` / `PDCluster` (manage gookv-pd processes), `PortAllocator` (file-lock-based port allocation), helper functions (`NewStandaloneNode`, `PutAndVerify`, `WaitForSplit`, etc.). |
 
 ### Private Packages (`internal/`)
 
@@ -42,7 +43,7 @@
 |---|---|
 | `internal/engine/traits` | Storage engine interface abstractions: `KvEngine` (multi-CF get/put/delete/snapshot/iterator/write-batch), `Snapshot`, `WriteBatch`, `Iterator`, `IterOptions`. Analogous to TiKV's `engine_traits` crate. |
 | `internal/engine/rocks` | `KvEngine` implementation using Pebble. Column families emulated via single-byte key prefixing (default=0x00, lock=0x01, write=0x02, raft=0x03). Implements `Engine`, `snapshot`, `writeBatch`, `iterator`. |
-| `internal/raftstore` | Raft consensus and region management. Contains `Peer` (one goroutine per region replica, owns `raft.RawNode`), `PeerStorage` (implements `raft.Storage` with engine-backed persistence and in-memory entry cache), message types (`PeerMsg`, `StoreMsg`, `RaftCommand`, `ApplyResult`), and `eraftpb`/`raftpb` protobuf conversion. |
+| `internal/raftstore` | Raft consensus and region management. Contains `Peer` (one goroutine per region replica, owns `raft.RawNode`), `PeerStorage` (implements `raft.Storage` with engine-backed persistence and in-memory entry cache), `RaftLogWriter` (batches multiple regions' Raft log writes into a single `WriteBatch` + fsync; config: `EnableBatchRaftWrite`), `ApplyWorkerPool` (decouples committed entry application from the peer goroutine via a shared worker pool; config: `EnableApplyPipeline`), message types (`PeerMsg`, `StoreMsg`, `RaftCommand`, `ApplyResult`), and `eraftpb`/`raftpb` protobuf conversion. |
 | `internal/raftstore/router` | `sync.Map`-based message routing: maps region ID to peer mailbox channels. Non-blocking send with backpressure (`ErrMailboxFull`). Supports broadcast. |
 | `internal/raftstore/snap` | Snapshot generation, serialization, and application. `SnapWorker` processes background snapshot tasks. Note: implemented in `internal/raftstore/snapshot.go` (not a subdirectory). |
 | `internal/raftstore/split` | Region split checking and execution. `SplitCheckWorker` scans region sizes; `ExecBatchSplit` creates new regions. |
@@ -63,7 +64,7 @@
 | `internal/server/transport` | Inter-node Raft message transport over gRPC: `RaftClient` (connection pooling, `Send`/`BatchSend`/`SendSnapshot`), `MessageBatcher` (batch accumulation), `StoreResolver` interface. |
 | `internal/server/status` | HTTP diagnostics server: `/debug/pprof/*`, `/metrics` (Prometheus), `/config`, `/status`, `/health`. |
 | `internal/server/flow` | Flow control and backpressure: `ReadPool` (EWMA-based busy detection, worker pool), `FlowController` (probabilistic request dropping based on compaction pressure), `MemoryQuota` (lock-free scheduler memory enforcement). |
-| `internal/config` | TOML-based configuration system: `Config` (root), `ServerConfig`, `StorageConfig`, `PDConfig`, `RaftStoreConfig`, `CoprocessorConfig`, `PessimisticTxnConfig`. Supports `LoadFromFile`, `Validate`, `SaveToFile`, `Clone`, `Diff`. Custom types `Duration` and `ReadableSize`. |
+| `internal/config` | TOML-based configuration system: `Config` (root), `ServerConfig`, `StorageConfig`, `PDConfig`, `RaftStoreConfig` (includes `EnableBatchRaftWrite` and `EnableApplyPipeline`, both default `true`), `CoprocessorConfig`, `PessimisticTxnConfig`. Supports `LoadFromFile`, `Validate`, `SaveToFile`, `Clone`, `Diff`. Custom types `Duration` and `ReadableSize`. |
 | `internal/log` | Structured logging using `log/slog`: `LogDispatcher` (routes records to normal/slow/rocksdb/raft handlers), `SlowLogHandler` (threshold-based filtering), `LevelFilter` (runtime log level changes), `RotatingFileWriter` (lumberjack integration). |
 | `internal/coprocessor` | Push-down query execution framework: `TableScanExecutor` (MVCC-aware range scan), `SelectionExecutor` (RPN predicate filtering), `LimitExecutor`, `SimpleAggrExecutor` (COUNT/SUM/MIN/MAX/AVG), `HashAggrExecutor` (GROUP BY), `RPNExpression` (stack-based expression evaluator with comparison/logic/arithmetic ops), `ExecutorsRunner`, `Endpoint`. |
 
@@ -71,7 +72,7 @@
 
 | Package | Description |
 |---|---|
-| `cmd/gookv-server` | Main server entry point. Parses CLI flags, loads TOML config, opens Pebble engine, creates Storage and gRPC Server, optionally bootstraps Raft cluster mode, starts HTTP status server, handles graceful shutdown on SIGINT/SIGTERM. |
+| `cmd/gookv-server` | Main server entry point. Parses CLI flags, loads TOML config, opens Pebble engine, creates Storage and gRPC Server, optionally bootstraps Raft cluster mode (with `RaftLogWriter` and `ApplyWorkerPool` when enabled), starts HTTP status server, handles graceful shutdown on SIGINT/SIGTERM. Runs in standalone mode (no PD, no Raft) when no cluster flags are provided. |
 | `cmd/gookv-ctl` | Admin CLI. Subcommands: `scan` (range scan by CF), `get` (point read), `mvcc` (MVCC info as JSON), `dump` (raw hex dump with `--decode` and `--sst` for direct SST file parsing), `size` (per-CF key count and size), `compact` (LSM compaction with `CompactAll`/`CompactCF` and `--flush-only` flag), `region` (metadata inspection with `--id`, `--all`, `--limit`). Opens Pebble engine directly. |
 | `cmd/gookv-pd` | PD server entry point. Parses `--addr`, `--data-dir`, `--cluster-id` flags for single-node mode, plus `--pd-id`, `--initial-cluster`, `--peer-port`, `--client-cluster` for Raft-replicated cluster mode. |
 
@@ -119,6 +120,8 @@ graph TB
         ROUTER["Router<br/>(sync.Map,<br/>regionID -> mailbox)"]
         TRANSPORT["RaftClient<br/>(gRPC connection pool,<br/>message batching)"]
         PD_WORKER["PDWorker<br/>(Heartbeats,<br/>Split Reporting)"]
+        RAFT_LOG_WRITER["RaftLogWriter<br/>(Batched fsync<br/>across regions)"]
+        APPLY_POOL["ApplyWorkerPool<br/>(Async entry<br/>application)"]
     end
 
     subgraph "PD Layer"
@@ -167,6 +170,9 @@ graph TB
     COORD --> STORAGE
 
     PEER --> PEER_STORAGE
+    PEER --> RAFT_LOG_WRITER
+    PEER --> APPLY_POOL
+    RAFT_LOG_WRITER --> KV_ENGINE
     PEER_STORAGE --> KV_ENGINE
 
     ROUTER --> PEER
@@ -209,7 +215,7 @@ The server operates in one of two modes, determined by the `--store-id` and `--i
 
 ### Standalone Mode (default)
 
-When `--store-id` is not provided, the server runs without Raft consensus. All writes go directly to the local Pebble engine via `Storage.Prewrite()` / `Storage.Commit()`:
+When no cluster flags (`--store-id`, `--initial-cluster`, `--pd-endpoints`) are provided, the server runs without Raft consensus and without PD. The default PD endpoints are cleared automatically, so gookv-server starts fully self-contained. All writes go directly to the local Pebble engine via `Storage.Prewrite()` / `Storage.Commit()`:
 
 1. gRPC handler calls `Storage.Prewrite(mutations, ...)`.
 2. `Storage` acquires latches, takes an engine snapshot, creates `MvccTxn` + `MvccReader`.
@@ -237,7 +243,8 @@ A node can join an existing cluster with only `--pd-endpoints` (no `--initial-cl
 2. The handler calls `StoreCoordinator.ProposeModifies(regionID, modifies, timeout)`.
 3. `ProposeModifies` serializes modifications as `raft_cmdpb.RaftCmdRequest`, sends via the peer's mailbox.
 4. The `Peer` goroutine proposes the data through `raft.RawNode.Propose()`.
-5. After Raft consensus, all nodes (including the leader) apply committed entries via `StoreCoordinator.applyEntries()`, which calls `Storage.ApplyModifies()`.
+5. Raft log entries are persisted via `RaftLogWriter` (when `EnableBatchRaftWrite` is true), which batches multiple regions' writes into a single `WriteBatch` + fsync.
+6. After Raft consensus, committed entries are submitted to the `ApplyWorkerPool` (when `EnableApplyPipeline` is true), which applies them via `Storage.ApplyModifies()` using `CommitNoSync` -- durability is already guaranteed by the Raft log fsync.
 
 **Inter-node communication:**
 - Raft messages are sent via `RaftClient.Send()` (gRPC streaming using `tikvpb.Tikv/Raft`).
@@ -285,6 +292,8 @@ main()
   |       b. StaticStoreResolver(clusterMap)
   |       c. transport.NewRaftClient(resolver, config)
   |       d. router.New(256)
+  |       e0. If EnableBatchRaftWrite: NewRaftLogWriter(engine, 256)
+  |       e1. If EnableApplyPipeline: NewApplyWorkerPool(4)
   |       e. StoreCoordinator(storeID, engine, storage, router, client, peerCfg)
   |       f. srv.SetCoordinator(coord)
   |       g. Bootstrap region 1 with all peers
@@ -432,6 +441,8 @@ graph LR
         STORE_WORKER["raftstore.storeWorker"]
         SNAP["raftstore.SnapWorker"]
         SPLIT["split.SplitCheckWorker"]
+        RAFT_LOG_WRITER["raftstore.RaftLogWriter"]
+        APPLY_WORKER["raftstore.ApplyWorkerPool"]
     end
 
     subgraph "internal"
@@ -447,6 +458,7 @@ graph LR
         TXNTYPES["txntypes"]
         PDCLIENT["pdclient"]
         PKG_CLIENT["client<br/>(RawKVClient,<br/>RegionCache)"]
+        E2ELIB["e2elib<br/>(GokvNode, PDNode,<br/>GokvCluster, PDCluster,<br/>PortAllocator)"]
     end
 
     %% cmd dependencies
@@ -574,6 +586,10 @@ graph LR
     TXN_SCHED --> ACTIONS
 
     %% raftstore extended deps
+    RAFT_LOG_WRITER --> TRAITS
+    APPLY_WORKER --> PEER
+    PEER --> RAFT_LOG_WRITER
+    PEER --> APPLY_WORKER
     RAFTLOG_GC --> TRAITS
     RAFTLOG_GC --> KEYS
     CONF_CHANGE --> PEER
@@ -608,5 +624,11 @@ graph LR
 - **Latch-based command serialization**: Before any transactional operation, the `Storage` layer acquires latches on the affected keys. Latches use FNV-1a hashing to map keys to sorted slot indices, ensuring deadlock-free acquisition.
 
 - **Dual write path**: In standalone mode, MVCC modifications are applied directly via `WriteBatch`. In cluster mode, modifications are serialized as `raft_cmdpb.Request` entries, proposed through Raft, and applied on all replicas after consensus.
+
+- **CommitNoSync on apply**: `Storage.ApplyModifies()` uses `WriteBatch.CommitNoSync()` (Pebble `NoSync` option) because durability is guaranteed by the Raft log, which is persisted with a full fsync via `RaftLogWriter`. On crash recovery, unapplied entries are replayed from the persisted Raft log.
+
+- **RaftLogWriter**: Batches `WriteTask`s from multiple peer goroutines into a single `WriteBatch` + fsync call, amortizing disk I/O across regions. Enabled by `RaftStoreConfig.EnableBatchRaftWrite` (default `true`).
+
+- **ApplyWorkerPool**: Decouples committed entry application from the peer goroutine. A pool of worker goroutines (default 4) processes `ApplyTask`s, allowing peers to immediately handle the next Raft Ready cycle. Enabled by `RaftStoreConfig.EnableApplyPipeline` (default `true`).
 
 - **Binary compatibility**: Lock and Write serialization formats use the same tag-based binary encoding as TiKV, ensuring wire compatibility. Key encodings (memcomparable bytes, descending uint64) are also byte-identical.

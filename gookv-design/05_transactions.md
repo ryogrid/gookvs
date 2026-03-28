@@ -640,23 +640,37 @@ flowchart TB
     WriteCommit --> Done["Commit Success"]
 ```
 
+### Primary Key Selection
+
+The primary key is chosen **deterministically** by lexicographic sort. In `TxnHandle` (`pkg/client/txn.go`), the `primaryKey()` method selects the lexicographically smallest key from the mutation buffer and caches the result in `cachedPrimary`. In `twoPhaseCommitter` (`pkg/client/committer.go`), `selectPrimary()` sorts all mutations by key and picks the first. This determinism ensures that all code paths (prewrite, commit, rollback, pessimistic lock) agree on the same primary key, and that the primary is stable across retries.
+
 ### Primary-First Commit Order
 
-The client must commit the **primary key first**. Once the primary key's lock is replaced with a commit record, the transaction is considered committed. Secondary keys can be committed asynchronously -- if the client crashes, other transactions will discover the commit by checking the primary.
+The client must commit the **primary key first**. Once the primary key's lock is replaced with a commit record, the transaction is considered committed. Secondary keys are committed afterward -- if the client crashes, other transactions will discover the commit by checking the primary.
+
+**Batch secondary commit**: `commitSecondaries` in `pkg/client/committer.go` groups secondary keys by region via `GroupKeysByRegion` and sends one `KvCommit` RPC per region group in parallel. If a batch commit fails with `TxnLockNotFound` (e.g., because a lock was resolved by another transaction), it falls back to `commitSecondariesPerKey` which commits each key individually.
+
+**Ambiguous primary commit failure**: If `commitPrimary` returns an error, the client calls `isPrimaryCommitted` (which returns `(bool, error)`) to check the actual transaction status via `KvCheckTxnStatus`. This handles the case where the Raft proposal succeeded but the response was lost (e.g., timeout during leader change after split). If the check itself fails (returns an error), the client does **not** rollback -- the primary may already be committed, and a rollback would be unsafe.
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant R1 as Region 1 (Primary: A)
-    participant R2 as Region 2 (Secondary: B)
+    participant R2 as Region 2 (Secondary: B, C)
+    participant R3 as Region 3 (Secondary: D)
 
     Client->>R1: Commit(A, startTS=100, commitTS=150)
     R1-->>Client: OK
 
-    Note over Client: Transaction is NOW committed.<br/>Even if client crashes here,<br/>B's lock will be resolved later.
+    Note over Client: Transaction is NOW committed.<br/>Even if client crashes here,<br/>secondary locks will be resolved later.
 
-    Client->>R2: Commit(B, startTS=100, commitTS=150)
-    R2-->>Client: OK
+    par Batch commit per region
+        Client->>R2: KvCommit([B, C], startTS=100, commitTS=150)
+        R2-->>Client: OK
+    and
+        Client->>R3: KvCommit([D], startTS=100, commitTS=150)
+        R3-->>Client: OK
+    end
 ```
 
 ---
@@ -762,7 +776,7 @@ func (pg *PointGetter) Get(key Key) ([]byte, error) {
     // Step 1: Check for blocking locks (SI only)
     if pg.isolationLevel == IsolationLevelSI {
         lock, err := pg.reader.LoadLock(key)
-        if lock != nil && lock.StartTS <= pg.ts {
+        if lock != nil && lock.StartTS <= pg.ts && lock.LockType != txntypes.LockTypePessimistic {
             if !pg.bypassLocks[lock.StartTS] {
                 return nil, &LockError{Key: key, Lock: lock}
             }
@@ -1003,6 +1017,10 @@ func TxnHeartBeat(txn *mvcc.MvccTxn, reader *mvcc.MvccReader, primaryKey mvcc.Ke
 }
 ```
 
+### CleanupModifies
+
+`CleanupModifies` in `internal/server/storage.go` resolves a lock on a secondary key by checking the primary key's transaction status. If the primary is committed, it commits the secondary; if rolled back or not found, it rolls back the secondary. Critically, if the primary status check itself fails (e.g., network error or stale region), `CleanupModifies` writes a **rollback record** on the secondary key and removes the lock. This prevents a late-arriving commit from succeeding on that key -- without the rollback record, a slow commit could land after the lock was cleaned up, violating transaction atomicity.
+
 ### Lock Resolution Flow
 
 ```mermaid
@@ -1044,6 +1062,8 @@ In standard 2PC, the client must wait for the primary key's commit to complete b
 Async commit makes the transaction visible **when all prewrite locks are successfully written**, without waiting for the commit phase. The key insight: the primary lock stores all secondary keys, so any reader can determine the commit status by examining just the locks.
 
 ### How It Works
+
+`PrewriteAsyncCommit` uses the same conflict-check logic as regular `Prewrite`: it loops through up to `SeekBound*2` (64) write records to skip past Rollback and Lock records before concluding there is no write conflict. This ensures that async commit prewrites are not incorrectly blocked or incorrectly allowed due to interleaved non-data-changing write records.
 
 During prewrite, the primary key's lock contains the list of all secondary keys:
 

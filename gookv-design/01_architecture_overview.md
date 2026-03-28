@@ -278,6 +278,8 @@ graph TB
         PEER_STORAGE["PeerStorage<br/>(raft.Storage impl)"]
         ROUTER["Router<br/>(sync.Map routing)"]
         TRANSPORT["RaftClient<br/>(gRPC transport)"]
+        RAFT_LOG_WRITER["RaftLogWriter<br/>(Batched fsync across regions)"]
+        APPLY_POOL["ApplyWorkerPool<br/>(Async entry application)"]
     end
 
     subgraph "Engine Layer (internal/engine)"
@@ -318,6 +320,9 @@ graph TB
     COORD --> STORAGE
 
     PEER --> PEER_STORAGE
+    PEER --> RAFT_LOG_WRITER
+    PEER --> APPLY_POOL
+    RAFT_LOG_WRITER --> KV_ENGINE
     PEER_STORAGE --> KV_ENGINE
     ROUTER --> PEER
 
@@ -380,6 +385,14 @@ Replicates data across nodes using the Raft protocol. Each region replica runs
 as a `Peer` goroutine that owns an etcd `raft.RawNode`. The `StoreCoordinator`
 manages peer lifecycles, proposes writes through Raft, and handles split/merge
 operations.
+
+Two optional performance components decouple hot-path I/O from the peer
+goroutine (both enabled by default via `RaftStoreConfig`):
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| `RaftLogWriter` | `raft_log_writer.go` | Collects `WriteTask`s from multiple peers into a single `WriteBatch` + fsync, reducing disk IOPS. Config: `EnableBatchRaftWrite`. |
+| `ApplyWorkerPool` | `apply_worker.go` | Applies committed entries on a shared worker pool (default 4 goroutines) so the peer goroutine can immediately process the next Raft Ready. Config: `EnableApplyPipeline`. |
 
 #### Engine Layer (`internal/engine`)
 
@@ -482,7 +495,11 @@ sequenceDiagram
     Peer->>Peer: rawNode.Propose(data)
     Peer->>Followers: Raft replication
     Followers-->>Peer: Quorum ack
-    Peer->>Peer: Apply committed entries
+
+    Note over Peer: RaftLogWriter batches<br/>log persist + fsync
+
+    Peer->>Peer: Submit to ApplyWorkerPool
+    Note over Peer: ApplyWorkerPool applies<br/>entries via CommitNoSync
     Peer-->>Coord: Proposal callback
     Coord-->>Server: nil (success)
 
@@ -526,6 +543,7 @@ github.com/ryogrid/gookv/
 |   |-- txntypes/            # Transaction types (Lock, Write, Mutation, TimeStamp)
 |   |-- pdclient/            # PD gRPC client interface
 |   |-- client/              # Multi-region client library
+|   |-- e2elib/              # PostgreSQL TAP-style end-to-end test library
 |
 |-- internal/                # Private packages (not importable externally)
 |   |-- engine/
@@ -573,6 +591,7 @@ interfaces.
 | `pkg/txntypes`| Transaction data types with TiKV-compatible serialization | `TimeStamp`, `Lock`, `Write`, `Mutation`, `LockType`, `WriteType` |
 | `pkg/pdclient`| PD gRPC client interface with failover | `Client` (interface), `NewClient`, `GetTS`, `GetRegion`, `PutStore` |
 | `pkg/client`  | Multi-region client library | `Client`, `RawKVClient`, `TxnKVClient`, `RegionCache`, `PDStoreResolver` |
+| `pkg/e2elib`  | PostgreSQL TAP-style end-to-end test library | `GokvNode`, `GokvCluster`, `PDNode`, `PDCluster`, `PortAllocator`, `NewStandaloneNode` |
 
 ### 5.3 Private Packages (`internal/`)
 
@@ -583,7 +602,7 @@ modules from importing anything under `internal/`.
 |-------------------------------|---------|
 | `internal/engine/traits`      | `KvEngine`, `Snapshot`, `WriteBatch`, `Iterator` interface definitions |
 | `internal/engine/rocks`       | Pebble-backed `KvEngine` implementation with CF prefix emulation |
-| `internal/raftstore`          | `Peer` (Raft goroutine), `PeerStorage` (raft.Storage impl), message types |
+| `internal/raftstore`          | `Peer` (Raft goroutine), `PeerStorage` (raft.Storage impl), `RaftLogWriter` (batched fsync), `ApplyWorkerPool` (async apply), message types |
 | `internal/raftstore/router`   | `Router` -- sync.Map routing from region ID to peer mailbox channel |
 | `internal/raftstore/split`    | `SplitCheckWorker` -- background region size scanning and split execution |
 | `internal/storage/mvcc`       | `MvccTxn`, `MvccReader`, `PointGetter`, `Scanner`, MVCC key encoding |
@@ -828,11 +847,13 @@ gookv supports three operating modes, selected by command-line flags.
 
 ### 7.1 Standalone Mode
 
-**When**: No `--store-id` flag is provided.
+**When**: No cluster flags (`--store-id`, `--initial-cluster`, `--pd-endpoints`)
+are provided.
 
-In standalone mode, gookv runs as a single-node store without Raft. All reads
-and writes go directly to the local Pebble engine. The `StoreCoordinator` is
-nil, so no Raft proposal path is taken.
+In standalone mode, gookv runs as a single-node store without Raft and without
+PD. The default PD endpoints are cleared automatically when no config file and
+no cluster flags are given, so the server starts fully self-contained. The
+`StoreCoordinator` is nil, so no Raft proposal path is taken.
 
 ```mermaid
 graph LR
@@ -954,9 +975,9 @@ flowchart TD
 
     CreateStorage --> CreateServer["6. Create gRPC Server<br/>server.NewServer(cfg, storage, ...)<br/>Register tikvpb.TikvServer<br/>Enable reflection"]
 
-    CreateServer --> ModeCheck{"Cluster mode?<br/>store-id > 0"}
+    CreateServer --> ModeCheck{"Cluster mode?<br/>store-id or pd-endpoints"}
 
-    ModeCheck -->|"No (standalone)"| StartGRPC
+    ModeCheck -->|"No flags (standalone)"| StartGRPC
 
     ModeCheck -->|"Yes + initial-cluster"| Bootstrap["7a. Bootstrap Mode<br/>Parse cluster map<br/>StaticStoreResolver<br/>RaftClient + Router<br/>StoreCoordinator<br/>BootstrapRegion(region 1)<br/>Start Peer goroutine"]
 
@@ -1107,9 +1128,10 @@ gookv is built on a small number of carefully chosen dependencies:
 
 | | |
 |-|-|
-| **Module** | `google.golang.org/grpc` v1.59.0 |
+| **Module** | `google.golang.org/grpc` v1.79.3 |
 | **What it is** | Google's high-performance RPC framework |
 | **Why** | Required for TiKV API compatibility. Provides streaming RPCs for Raft message transport and batch command multiplexing. |
+| **API** | Uses `grpc.NewClient` (the `grpc.Dial` API was deprecated in v1.63). |
 | **Used by** | `internal/server` (server side), `internal/server/transport` (client connections to peers), `pkg/pdclient` (PD client), `pkg/client` (KV client) |
 
 ### 9.5 Other Dependencies
@@ -1219,10 +1241,10 @@ flowchart LR
         C3 --> C4["txn.Prewrite()"]
         C4 --> C5["Return []Modify"]
         C5 --> C6["coord.ProposeModifies()"]
-        C6 --> C7["Raft Consensus"]
-        C7 --> C8["applyFunc()"]
+        C6 --> C7["Raft Consensus<br/>(RaftLogWriter: batched fsync)"]
+        C7 --> C8["ApplyWorkerPool / applyFunc()"]
         C8 --> C9["Storage.ApplyModifies()"]
-        C9 --> C10["WriteBatch.Commit()"]
+        C9 --> C10["WriteBatch.CommitNoSync()"]
         C10 --> C11["Pebble Engine"]
     end
 ```
@@ -1232,7 +1254,7 @@ flowchart LR
 | Method suffix | `Prewrite()`, `Commit()` | `PrewriteModifies()`, `CommitModifies()` |
 | Modifications | Computed and applied in one call | Computed, returned, then proposed via Raft |
 | Latency | Single Pebble write | Raft round-trip + Pebble write |
-| Durability | Single-node Pebble sync | Majority replicated + Pebble sync |
+| Durability | Single-node Pebble sync | Majority replicated + Raft log fsync (apply uses `CommitNoSync`) |
 | Concurrency control | Latches only | Latches + Raft serialization |
 
 ### 11.2 Modify Serialization
@@ -1388,8 +1410,10 @@ type Config struct {
 
 | Field | Default | Purpose |
 |-------|---------|---------|
-| `SplitSize` | `"96MiB"` | Region size threshold for split |
-| `MaxSize` | `"144MiB"` | Maximum region size |
+| `RegionSplitSize` | `96 MiB` | Region size threshold for split |
+| `RegionMaxSize` | `144 MiB` | Maximum region size |
+| `EnableBatchRaftWrite` | `true` | Use `RaftLogWriter` to batch multiple regions' Raft log persistence into one fsync |
+| `EnableApplyPipeline` | `true` | Use `ApplyWorkerPool` to decouple entry application from the peer goroutine |
 
 ### 13.3 Config Operations
 
@@ -1496,6 +1520,8 @@ graph TB
         SnapW["SnapWorker"]
         StoreW["StoreWorker"]
         SplitH["SplitResultHandler"]
+        RLW["RaftLogWriter<br/>(1 goroutine,<br/>batched fsync)"]
+        APW["ApplyWorkerPool<br/>(N goroutines,<br/>async apply)"]
     end
 
     subgraph "HTTP Server"
@@ -1519,6 +1545,8 @@ graph TB
     Main --> SnapW
     Main --> StoreW
     Main --> SplitH
+    Main --> RLW
+    Main --> APW
 ```
 
 ### 16.2 Channel-Based Communication
@@ -1534,6 +1562,8 @@ Channels connect components without shared state:
 | `splitResultCh` | Peer goroutine | Coordinator | Split results |
 | `snapTaskCh` | PeerStorage | SnapWorker | Snapshot generation |
 | `router.storeCh` | Transport | StoreWorker | Store-level messages |
+| `RaftLogWriter.taskCh` | Peer goroutine | RaftLogWriter | Batched Raft log persist tasks |
+| `ApplyWorkerPool.taskCh` | Peer goroutine | ApplyWorkerPool | Committed entry application tasks |
 
 ### 16.3 Lock Usage
 

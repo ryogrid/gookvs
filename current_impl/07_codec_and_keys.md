@@ -95,6 +95,8 @@ Descending encoding is critical for timestamp encoding in MVCC keys: newer (larg
 
 This ensures `-2.0 < -1.0 < 0.0 < 1.0 < 2.0` under unsigned byte comparison. `DecodeFloat64` reverses the transformation.
 
+Note: The coprocessor (`internal/coprocessor/endpoint.go`) uses `math.Float64bits`/`math.Float64frombits` directly for IEEE 754 bit-level float encoding in RPN expressions and Datum serialization, without the memcomparable sign-flip transformation (since ordering is not required in value serialization).
+
 ### Variable-length integers
 
 | Function | Encoding |
@@ -399,7 +401,47 @@ The descending timestamp encoding means that for user key `"abc"`, a scan from `
 
 ---
 
-## 9. Dependencies
+## 9. Coprocessor Codec Usage (`internal/coprocessor/`)
+
+### Float64 Encoding in Endpoint
+
+The coprocessor endpoint (`internal/coprocessor/endpoint.go`) uses `math.Float64bits` and `math.Float64frombits` for IEEE 754 float-to-uint64 conversion when encoding/decoding Float64 constants in RPN expressions and Datum serialization. This replaces the earlier approach of reading the `I64` field.
+
+### RPN Expression All Constant Types
+
+`EncodeRPNExpression` handles all constant datum kinds:
+
+| Tag byte | Kind | Encoding |
+|----------|------|----------|
+| `0x02` | Int64 | 8-byte big-endian `uint64(I64)` |
+| `0x03` | String | 2-byte big-endian length prefix + UTF-8 bytes |
+| `0x04` | Uint64 | 8-byte big-endian `U64` |
+| `0x05` | Float64 | 8-byte big-endian `math.Float64bits(F64)` |
+| `0x06` | Bytes | 2-byte big-endian length prefix + raw bytes |
+| `0x07` | Null | No payload |
+
+`DecodeRPNExpression` reverses this encoding. Column references use tag `0x01` and function calls use tag `0x10`.
+
+### Datum.IsZeroValue
+
+`Datum.IsZeroValue()` (`internal/coprocessor/coprocessor.go`) provides kind-aware truthiness checking:
+
+- `KindInt64`: `I64 == 0`
+- `KindUint64`: `U64 == 0`
+- `KindFloat64`: `F64 == 0`
+- `KindString`: `Str == ""`
+- `KindBytes`: `len(Buf) == 0`
+- `KindNull`: always true (zero value)
+
+This is used by `SelectionExecutor` to filter rows: a row passes the selection predicate only if the evaluated expression result is non-null and non-zero.
+
+### ReadableSize Parser (`internal/config/`)
+
+`ReadableSize.UnmarshalText` parses human-readable size strings (e.g., `"256MB"`) using `strconv.ParseUint` with base-10, 64-bit validation for the numeric portion. Supported suffixes: `GB`, `MB`, `KB`, `B` (case-insensitive).
+
+---
+
+## 10. Dependencies
 
 ### `pkg/codec`
 
@@ -428,3 +470,8 @@ Used by:
 - `internal/engine` -- column family creation and management
 - `internal/storage/mvcc` -- selecting CF for reads/writes
 - `internal/raftstore` -- Raft CF operations
+
+### Codec patterns in non-codec packages
+
+- `internal/coprocessor/endpoint.go` -- `math.Float64bits`/`Float64frombits` for IEEE 754 float encoding in RPN expressions and Datum serialization; `encoding/binary.BigEndian` for fixed-width integer encoding
+- `internal/config/config.go` -- `strconv.ParseUint` for `ReadableSize` validation

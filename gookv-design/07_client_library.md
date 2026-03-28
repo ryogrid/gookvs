@@ -287,9 +287,10 @@ Both methods are thread-safe (they acquire the write lock).
 When a new `RegionInfo` is inserted (`insertLocked`):
 
 1. If the region ID already exists in `byID`, the existing entry is replaced in-place.
-2. Otherwise, the insertion point is found via binary search on `StartKey`.
-3. The slice is grown and elements are shifted to make room.
-4. The `byID` index is rebuilt from scratch (since indices change after insertion).
+2. Otherwise, any stale overlapping regions are evicted first. The helper function `regionsOverlap(aStart, aEnd, bStart, bEnd)` tests whether two key ranges overlap (treating an empty end key as +infinity). Each existing region whose range overlaps with the new region (and has a different region ID) is removed from the slice. This handles the case where a pre-split region covering `[a, z)` is still cached when a post-split region covering `[a, m)` arrives from PD.
+3. The insertion point is found via binary search on `StartKey`.
+4. The slice is grown and elements are shifted to make room.
+5. The `byID` index is rebuilt from scratch (since indices change after insertion).
 
 ---
 
@@ -546,14 +547,15 @@ flowchart LR
 
 ```go
 type TxnHandle struct {
-    mu         sync.Mutex
-    client     *TxnKVClient
-    startTS    txntypes.TimeStamp
-    opts       TxnOptions
-    membuf     map[string]mutationEntry  // local write buffer
-    lockKeys   [][]byte                   // pessimistic lock keys
-    committed  bool
-    rolledBack bool
+    mu            sync.Mutex
+    client        *TxnKVClient
+    startTS       txntypes.TimeStamp
+    opts          TxnOptions
+    membuf        map[string]mutationEntry  // local write buffer
+    lockKeys      [][]byte                  // pessimistic lock keys
+    cachedPrimary []byte                    // deterministic primary key (cached)
+    committed     bool
+    rolledBack    bool
 }
 
 type mutationEntry struct {
@@ -617,7 +619,7 @@ sequenceDiagram
 func (t *TxnHandle) BatchGet(ctx context.Context, keys [][]byte) ([]KvPair, error)
 ```
 
-BatchGet reads multiple keys. It first partitions keys into those found in `membuf` (returning their buffered values) and those needing server RPCs. Remote keys are sent via `KvBatchGet`. Lock resolution follows the same pattern as single `Get`, with up to 3 retries.
+BatchGet reads multiple keys. It first partitions keys into those found in `membuf` (returning their buffered values) and those needing server RPCs. Remote keys are grouped by region via `GroupKeysByRegion`, and a separate `KvBatchGet` RPC is sent to each region. Results from all regions are collected into a single slice. Lock resolution follows the same pattern as single `Get`, with up to 3 retries.
 
 ### 8.4 Set: Buffered Write
 
@@ -641,7 +643,7 @@ flowchart TD
 ```
 
 The pessimistic lock RPC sends a `PessimisticLockRequest` with:
-- `PrimaryLock` set to the first key in `membuf` (the primary key)
+- `PrimaryLock` set to the lexicographically smallest key in `membuf` (the primary key, cached in `cachedPrimary`)
 - `StartVersion` and `ForUpdateTs` both set to `startTS`
 - `LockTtl` set to the configured lock TTL
 
@@ -702,7 +704,7 @@ flowchart TD
 
 ### 8.8 Primary Key Selection
 
-The primary key is determined by `primaryKey()`, which returns the first key encountered when iterating over `membuf` (a Go map, so iteration order is randomized). During commit, the `twoPhaseCommitter` sorts all mutations by key and uses the lexicographically first key as the primary. This deterministic selection ensures all components agree on which key is the primary.
+The primary key is determined by `primaryKey()`, which selects the lexicographically smallest key from `membuf`. The result is cached in the `cachedPrimary` field so that repeated calls (e.g., during pessimistic lock acquisition and later during commit) return the same key without re-scanning the map. During commit, the `twoPhaseCommitter` also sorts all mutations by key and uses the first key as the primary, which is consistent with this selection.
 
 ---
 
@@ -890,8 +892,9 @@ type LockResolver struct {
     cache    *RegionCache
     pdClient pdclient.Client
 
-    mu        sync.Mutex
-    resolving map[lockKey]chan struct{}  // deduplication map
+    mu           sync.Mutex
+    resolving    map[lockKey]chan struct{}  // deduplication map
+    resolveCount int                        // total resolutions since last map reset
 }
 
 type lockKey struct {
@@ -905,6 +908,8 @@ type lockKey struct {
 Multiple goroutines may encounter the same stale lock simultaneously. Without deduplication, they would all independently check the transaction status and resolve the lock, wasting resources.
 
 The `resolving` map tracks which locks are currently being resolved. The key is a `{primary, startTS}` pair that uniquely identifies a transaction. The value is a `chan struct{}` that is closed when resolution completes.
+
+**Map cleanup**: After each resolution, a `resolveCount` counter is incremented. When the map is empty and the counter reaches 1000, the map is recreated with `make()` to release the old backing memory. This prevents the map from retaining memory from deleted entries indefinitely without churning on every single resolve.
 
 ```mermaid
 sequenceDiagram
@@ -1097,11 +1102,9 @@ func (c *RawKVClient) Scan(ctx context.Context, startKey, endKey []byte, limit i
 Scan transparently crosses region boundaries. The algorithm:
 
 1. Start with `currentKey = startKey`.
-2. Locate the region for `currentKey`.
-3. Calculate `scanEnd = min(regionEndKey, endKey)`.
-4. Send `RawScan` to the region with `remaining = limit - len(results)`.
-5. Append results.
-6. If more results are needed and there are more regions, set `currentKey = regionEndKey` and repeat.
+2. Send `RawScan` via `SendToRegion`. Inside the RPC callback, `regionEnd` and `scanEnd` are recomputed from the (possibly refreshed) `RegionInfo` argument so that after a region error and cache invalidation, the retry uses up-to-date region boundaries rather than stale ones captured before the call. The per-region scan end is `min(regionEndKey, endKey)`, and the scan limit is `remaining = limit - len(results)`.
+3. Append results.
+4. If more results are needed and there are more regions, set `currentKey = regionEndKey` and repeat.
 
 ```mermaid
 flowchart TD
@@ -1124,7 +1127,7 @@ flowchart TD
 func (c *RawKVClient) DeleteRange(ctx context.Context, startKey, endKey []byte) error
 ```
 
-Sends `RawDeleteRange` to the region owning the start key. Note: this does not cross region boundaries. For multi-region range deletes, the caller would need to loop.
+Deletes all keys in a range, transparently spanning region boundaries. The algorithm iterates across regions: for each region, it clamps the delete range to the region's key range (using `min(regionEndKey, endKey)` as the per-region end) and sends a `RawDeleteRange` RPC via `SendToRegion`. After each region, it advances `currentKey` to the region's end key and continues until the entire range is covered.
 
 #### CompareAndSwap
 
@@ -1146,7 +1149,7 @@ Returns `(succeed, previousValue, error)`.
 func (c *RawKVClient) Checksum(ctx context.Context, startKey, endKey []byte) (uint64, uint64, uint64, error)
 ```
 
-Computes a CRC64 checksum over a key range. Returns `(checksum, totalKvs, totalBytes, error)`. Used for data integrity verification.
+Computes a checksum over a key range, transparently spanning region boundaries. The algorithm iterates across regions (same pattern as `DeleteRange`): for each region, a `RawChecksum` RPC is sent with the clamped key range. Per-region checksums are combined with XOR, and `totalKvs`/`totalBytes` are summed. Returns `(checksum, totalKvs, totalBytes, error)`. Used for data integrity verification.
 
 ---
 
