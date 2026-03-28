@@ -539,6 +539,193 @@ gookv-ctl commands fall into two categories: **offline commands** (`scan`, `get`
 ./gookv-ctl store status --pd 127.0.0.1:2379 --store-id 1
 ```
 
+## Using the Interactive CLI (gookv-cli)
+
+`gookv-cli` is a PostgreSQL-style interactive client that connects to a running gookv cluster via PD. It supports raw KV operations, transactions, and administrative commands.
+
+### Connecting
+
+```bash
+# Connect to a cluster (REPL mode)
+./gookv-cli --pd 127.0.0.1:2379
+
+# Connect to a multi-PD cluster
+./gookv-cli --pd 127.0.0.1:2379,127.0.0.1:2381,127.0.0.1:2383
+
+# Execute commands in batch mode (-c flag)
+./gookv-cli --pd 127.0.0.1:2379 -c "PUT hello world; GET hello;"
+
+# Show version
+./gookv-cli --version
+```
+
+### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--pd` | `127.0.0.1:2379` | PD server address(es), comma-separated |
+| `-c` | | Execute statement(s) and exit |
+| `--version` | | Print version and exit |
+| `--hex` | | Start in hex display mode |
+
+### Statement Syntax
+
+- All commands end with `;` (semicolon)
+- Multiple statements on one line: `PUT k1 v1; PUT k2 v2;`
+- Statements can span multiple lines (prompt changes to `     > `)
+- Backslash meta commands (`\help`, `\timing`) do not need `;`
+
+### Raw KV Operations
+
+```bash
+$ ./gookv-cli --pd 127.0.0.1:2419 -c '
+  PUT hello world;
+  GET hello;
+  PUT key1 value1;
+  PUT key2 value2;
+  PUT key3 value3;
+  SCAN key1 key4 LIMIT 10;
+  DELETE key2;
+  GET key2;
+'
+```
+
+```
+OK
+"world"
+OK
+OK
+OK
++------+--------+
+| Key  | Value  |
++------+--------+
+| key1 | value1 |
+| key2 | value2 |
+| key3 | value3 |
++------+--------+
+(3 rows)
+OK
+(not found)
+```
+
+Available raw KV commands:
+
+| Command | Description |
+|---------|-------------|
+| `GET <key>` | Get a value |
+| `PUT <key> <value>` | Put a key-value pair |
+| `PUT <key> <value> TTL <sec>` | Put with TTL (seconds) |
+| `DELETE <key>` | Delete a key |
+| `TTL <key>` | Get remaining TTL |
+| `SCAN <start> <end> [LIMIT <n>]` | Scan a range (default limit: 100) |
+| `BGET <k1> <k2> ...` | Batch get |
+| `BPUT <k1> <v1> <k2> <v2> ...` | Batch put |
+| `BDELETE <k1> <k2> ...` | Batch delete |
+| `DELETE RANGE <start> <end>` | Delete a range |
+| `CAS <key> <new> <old> [NOT_EXIST]` | Compare and swap |
+| `CHECKSUM [<start> <end>]` | Compute range checksum |
+
+### Transactions
+
+```bash
+$ ./gookv-cli --pd 127.0.0.1:2419 -c '
+  BEGIN;
+  SET account:alice 1000;
+  SET account:bob 2000;
+  COMMIT;
+'
+```
+
+```
+Transaction started (optimistic, startTS=465226218258563073)
+OK
+OK
+OK (committed)
+```
+
+Available transaction commands:
+
+| Command | Description |
+|---------|-------------|
+| `BEGIN [PESSIMISTIC] [ASYNC_COMMIT] [ONE_PC] [LOCK_TTL <ms>]` | Start a transaction |
+| `SET <key> <value>` | Set within transaction |
+| `GET <key>` | Get within transaction |
+| `DELETE <key>` | Delete within transaction |
+| `BGET <k1> <k2> ...` | Batch get within transaction |
+| `COMMIT` | Commit the transaction |
+| `ROLLBACK` | Rollback the transaction |
+
+**Note**: `GET`, `SET`, `DELETE`, and `BGET` are context-sensitive — they operate on the raw KV layer outside a transaction and on the transaction buffer inside one.
+
+### Administrative Commands
+
+```bash
+# List all stores
+$ ./gookv-cli --pd 127.0.0.1:2419 -c "STORE LIST;"
++---------+-----------------+-------+
+| StoreID |     Address     | State |
++---------+-----------------+-------+
+|       1 | 127.0.0.1:20470 | Up    |
+|       2 | 127.0.0.1:20471 | Up    |
+|       3 | 127.0.0.1:20472 | Up    |
++---------+-----------------+-------+
+
+# Show cluster overview
+$ ./gookv-cli --pd 127.0.0.1:2419 -c "CLUSTER INFO;"
+Cluster ID: 1
+Stores: 3
+Regions: 1 total
+
+# Allocate a timestamp
+$ ./gookv-cli --pd 127.0.0.1:2419 -c "TSO;"
+Timestamp:  465226218246242305
+  physical: 1774697182641 (2026-03-28T11:26:22Z)
+  logical:  1
+
+# List regions
+$ ./gookv-cli --pd 127.0.0.1:2419 -c "REGION LIST LIMIT 5;"
++----------+----------+---------+-------+--------+
+| RegionID | StartKey | EndKey  | Peers | Leader |
++----------+----------+---------+-------+--------+
+|        1 | (empty)  | (empty) | 1,2,3 |      2 |
++----------+----------+---------+-------+--------+
+```
+
+Available administrative commands:
+
+| Command | Description |
+|---------|-------------|
+| `STORE LIST` | List all stores |
+| `STORE STATUS <id>` | Show store details |
+| `REGION <key>` | Find region for a key |
+| `REGION LIST [LIMIT <n>]` | List all regions |
+| `REGION ID <id>` | Find region by ID |
+| `CLUSTER INFO` | Show cluster topology |
+| `TSO` | Allocate and display a timestamp |
+| `GC SAFEPOINT` | Show GC safe point |
+| `STATUS [<addr>]` | Query server health |
+
+### Meta Commands (Backslash)
+
+These commands do not require a semicolon:
+
+| Command | Description |
+|---------|-------------|
+| `\help`, `\h`, `\?` | Show help |
+| `\quit`, `\q` | Exit |
+| `\timing on\|off`, `\t` | Toggle timing display |
+| `\format table\|plain\|hex` | Set output format |
+| `\pagesize <n>` | Set default SCAN limit |
+| `\x` | Cycle display mode (auto → hex → string) |
+
+Keyword aliases (require `;`): `HELP;`, `EXIT;`, `QUIT;`
+
+### Key/Value Encoding
+
+- Bare words: `hello` → UTF-8 bytes
+- Double-quoted strings: `"hello world"` → supports spaces and escapes (`\"`, `\\`, `\n`, `\t`)
+- Hex literals: `0xCAFE` or `x'CAFE'` → binary bytes
+
 ## Running Tests
 
 ```bash
