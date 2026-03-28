@@ -12,6 +12,7 @@ make build
 #   ./gookv-server
 #   ./gookv-ctl
 #   ./gookv-pd
+#   ./gookv-cli
 ```
 
 ## Running the Server
