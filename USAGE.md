@@ -16,6 +16,16 @@ make build
 
 ## Running the Server
 
+### Standalone Mode (No PD)
+
+```bash
+# Start a single node without PD — for development and testing.
+# No --store-id, --pd-endpoints, or --initial-cluster needed.
+./gookv-server --addr 127.0.0.1:20160 --data-dir /tmp/gookv-standalone
+```
+
+### With Configuration
+
 ```bash
 # Start with default configuration
 ./gookv-server --data-dir /tmp/gookv-data
@@ -322,6 +332,8 @@ region-max-size = "2KB"             # Low threshold to trigger split quickly
 region-split-size = "1KB"
 split-check-tick-interval = "2s"    # Check for oversized regions every 2s
 pd-heartbeat-tick-interval = "5s"   # Frequent heartbeats for demo responsiveness
+enable-batch-raft-write = true      # Cross-region I/O coalescing (default: true)
+enable-apply-pipeline = true        # Async apply worker pool (default: true)
 ```
 
 ### What Each Scenario Demonstrates
@@ -436,7 +448,7 @@ Structured output with phase banners (`--- Phase 1/4: ...`), numbered steps, and
 
 ## Transaction Integrity Demo
 
-Demonstrates ACID transaction integrity under concurrency: 1000 bank accounts with $100 each ($100,000 total) undergo random transfers from concurrent goroutines for 30 seconds across multiple regions. After all transfers complete, the demo verifies that the total balance is still exactly $100,000 — proving that no money is created or lost.
+Demonstrates ACID transaction integrity under high concurrency: 1000 bank accounts with $100 each ($100,000 total) undergo random transfers from 32 concurrent goroutines for 30 seconds across multiple regions. After all transfers complete, the demo verifies that the total balance is still exactly $100,000 — proving that no money is created or lost.
 
 ### Prerequisites
 
@@ -480,19 +492,9 @@ split-check-tick-interval = "2s"
 
 1. **Initialize 1000 Accounts (Phase 1)**: Seeds 1000 accounts with $100 each via batched transactions, verifies the total is $100,000 via a read-only transaction, then waits for the data to split across at least 3 regions. Prints the region layout showing how accounts are distributed.
 
-2. **Concurrent Transfers (Phase 2)**: Launches concurrent goroutines that each repeatedly pick two random accounts and transfer a random amount ($1 to min($50, sender balance)) using optimistic transactions. Runs for 30 seconds, printing progress every 10 seconds. Reports statistics: successful transfers, conflict retries, insufficient-funds skips, and total dollars moved.
+2. **Concurrent Transfers (Phase 2)**: Launches 32 concurrent goroutines that each repeatedly pick two random accounts and transfer a random amount ($1 to min($50, sender balance)) using optimistic transactions. Runs for 30 seconds, printing progress every 10 seconds. Reports statistics: successful transfers, conflict retries, insufficient-funds skips, and total dollars moved. Typically achieves 200+ transfers with $5000+ moved.
 
 3. **Verify Conservation (Phase 3)**: Reads all 1000 account balances in a single snapshot transaction. Asserts the total equals $100,000. Prints distribution statistics: min/max balance and a histogram ($0, $1-50, $51-100, $101-200, $201-500, $500+).
-
-### Known Limitation: Concurrency Level
-
-The demo currently runs with 2 concurrent transfer goroutines. At higher concurrency (4+ goroutines), a cross-region transaction isolation bug causes occasional balance discrepancies. The root cause is twofold:
-
-1. **Region routing after splits**: After region splits, the client's `RegionCache` and the server's `groupModifiesByRegion` compare raw user keys against MVCC-encoded region boundaries. Although a fix was applied (encoding the key before comparison in `LocateKey`), the server-side `KvCommit` for secondary keys in cross-region 2PC can still misroute Raft proposals, leaving orphan prewrite locks.
-
-2. **Orphan lock resolution**: When a committed transaction's secondary commit fails (due to the routing issue above), the prewrite lock remains. The lock resolver's `KvResolveLock` handler suffers from the same routing issue, preventing cleanup through Raft consensus.
-
-With 2 goroutines, contention is low enough that all transactions complete without these routing failures, reliably producing ~450+ transfers in 30 seconds. This is sufficient to demonstrate that gookv's Percolator-style 2PC correctly maintains the monetary invariant across multiple regions.
 
 ### Expected Output
 
@@ -543,8 +545,11 @@ gookv-ctl commands fall into two categories: **offline commands** (`scan`, `get`
 # Run unit and integration tests
 make test
 
-# Run end-to-end tests
+# Run internal end-to-end tests
 make test-e2e
+
+# Run external end-to-end tests (requires built binaries)
+make test-e2e-external
 
 # Run go vet
 make vet

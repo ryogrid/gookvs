@@ -22,6 +22,9 @@ gookv reproduces the core architecture of TiKV in Go:
 - **Region management** — region split (PD-coordinated, size-based with midpoint key), region merge (prepare/commit/rollback)
 - **Placement Driver (PD)** — TSO allocation, cluster metadata, store/region heartbeats, split scheduling, replica repair and leader balance scheduling, GC safe point centralization, multi-endpoint failover with retry, Raft-replicated multi-node PD cluster for high availability
 - **Dynamic node addition** — join mode for adding new KVS nodes to a running cluster via PD, with automatic region rebalancing (balance scheduler, excess replica shedding, 3-step move protocol)
+- **Performance optimizations** — RaftLogWriter (cross-region I/O coalescing, 1 fsync per batch), ApplyWorkerPool (async apply pipeline), NoSync apply (Raft log replay guarantees durability)
+- **Standalone mode** — single-node operation without PD for development and testing
+- **E2E test library** — `pkg/e2elib` provides PostgreSQL TAP-style test helpers (GokvNode, PDNode, GokvCluster, PDCluster, PortAllocator) with 75+ external-binary-based tests
 - **Coprocessor** — push-down execution with RPN expressions, table scan, selection, aggregation
 - **gRPC server** — TiKV-compatible RPC interface via `pingcap/kvproto`
 - **HTTP status server** — pprof, Prometheus metrics, health checks
@@ -44,6 +47,7 @@ pkg/                      # Public packages (importable by external code)
   txntypes/               # Lock, Write, Mutation structs with binary serialization
   pdclient/               # Placement Driver client (gRPC + mock, multi-endpoint failover)
   client/                 # Multi-region client library (RawKVClient, TxnKVClient, RegionCache, LockResolver)
+  e2elib/                 # E2E test library (GokvNode, PDNode, GokvCluster, PDCluster, PortAllocator)
 internal/                 # Private implementation packages
   config/                 # TOML config loading, validation, ReadableSize/Duration types
   log/                    # Structured logging, LogDispatcher, SlowLogHandler, file rotation
@@ -61,7 +65,9 @@ internal/                 # Private implementation packages
       pessimistic.go      # Pessimistic lock acquire, upgrade, rollback
     gc/                   # MVCC garbage collection worker (three-state machine)
   raftstore/              # Raft peer loop, PeerStorage, message types
-    router/               # Region-based message routing (sync.Map)
+    raft_log_writer.go    # Cross-region Raft log batch writer (I/O coalescing)
+    apply_worker.go       # Async apply worker pool (propose-apply pipeline)
+    router/               # Region-based message routing (sync.Map) + peer-to-region mapping
     split/                # Region split checker (size-based, midpoint key)
     raftlog_gc.go         # Raft log compaction (GC tick, background deletion)
     snapshot.go           # Raft snapshot generation, transfer, and application
@@ -79,8 +85,8 @@ internal/                 # Private implementation packages
     status/               # HTTP status server (pprof, metrics, health, config)
     flow/                 # Flow control, EWMA backpressure, memory quota
   coprocessor/            # Push-down execution: RPN, TableScan, Selection, Aggregation
-e2e/                      # End-to-end integration tests (cluster, PD, Raw KV, GC, etc.)
-tasks/                    # Project tracking (todo.md)
+e2e/                      # Internal e2e tests (Raft cluster, GC, region merge)
+e2e_external/             # External-binary e2e tests (75+ tests using pkg/e2elib)
 ```
 
 ## Dependencies
@@ -90,12 +96,12 @@ tasks/                    # Project tracking (todo.md)
 | `github.com/cockroachdb/pebble` v1.1.5 | Pure-Go KV store (no CGo), replaces RocksDB |
 | `github.com/pingcap/kvproto` | TiKV protocol buffer definitions (pre-generated Go code) |
 | `go.etcd.io/etcd/raft/v3` v3.5.17 | Raft consensus implementation |
-| `google.golang.org/grpc` v1.59.0 | gRPC framework |
+| `google.golang.org/grpc` v1.79.3 | gRPC framework (`grpc.NewClient` API) |
 | `github.com/stretchr/testify` v1.11.1 | Test assertions |
 | `github.com/BurntSushi/toml` v1.6.0 | TOML config parsing |
 | `gopkg.in/natefinch/lumberjack.v2` v2.2.1 | Log file rotation |
 
-Go version: 1.22.2
+Go version: 1.25.0
 Module path: `github.com/ryogrid/gookv`
 
 ## Usage
@@ -222,13 +228,14 @@ func main() {
 │ - Async      │  - TableScan   │  - PeerStorage                      │
 │   commit/1PC │  - Selection   │  - Router + Transport                │
 │ - Pessimistic│  - Aggregation │  - StoreCoordinator                  │
-│ - Scheduler  │                │  - Raft log compaction               │
-├──────────────┤                │  - Snapshot gen/transfer/apply       │
-│    MVCC      │                │  - Store worker (dynamic peers)      │
-│ - MvccReader │                │  - Conf change (Add/Remove)          │
-│ - PointGetter│                │  - Region split (PD-coordinated)     │
-│ - MvccTxn    │                │  - Region merge                      │
-│ - Scanner    │                │    (prepare/commit/rollback)         │
+│ - Scheduler  │                │  - RaftLogWriter (I/O coalescing)    │
+├──────────────┤                │  - ApplyWorkerPool (async apply)     │
+│    MVCC      │                │  - Raft log compaction               │
+│ - MvccReader │                │  - Snapshot gen/transfer/apply       │
+│ - PointGetter│                │  - Store worker (dynamic peers)      │
+│ - MvccTxn    │                │  - Conf change (Add/Remove)          │
+│ - Scanner    │                │  - Region split (PD-coordinated)     │
+│              │                │  - Region merge                      │
 ├──────────────┤                ├──────────────────────────────────────┤
 │   GC Worker  │                │       Placement Driver (PD)          │
 │ - 3-state GC │                │  - TSO allocator                     │
@@ -241,113 +248,27 @@ func main() {
 │              │                │  - Raft replication (multi-node HA)  │
 ├──────────────┴────────────────┴──────────────────────────────────────┤
 │                    Engine (traits.KvEngine)                           │
-│               Pebble backend with CF emulation                       │
-│               (default, lock, write, raft)                           │
+│       Pebble backend with CF emulation (default, lock, write, raft)  │
+│       Commit() = fsync (Raft log)  |  CommitNoSync() (apply path)    │
 ├──────────────────────────────────────────────────────────────────────┤
 │        Config (TOML)     │     Logging (slog + lumberjack)           │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-## Implemented User Stories
-
-| ID | Component | Status |
-|----|-----------|--------|
-| IMPL-001 | Proto generation (kvproto integration) | Done |
-| IMPL-002 | pkg/codec (memcomparable encoding) | Done |
-| IMPL-003 | pkg/keys (key encoding) | Done |
-| IMPL-004 | pkg/cfnames (column families) | Done |
-| IMPL-005 | pkg/txntypes (Lock, Write, Mutation) | Done |
-| IMPL-006 | internal/engine/traits (interfaces) | Done |
-| IMPL-007 | internal/engine/rocks (Pebble backend) | Done |
-| IMPL-008 | pkg/pdclient (PD client) | Done |
-| IMPL-009 | internal/raftstore (Raft consensus) | Done |
-| IMPL-010 | internal/storage/mvcc (MVCC) | Done |
-| IMPL-011 | internal/storage/txn (transactions) | Done |
-| IMPL-012 | internal/server (gRPC server) | Done |
-| IMPL-013 | internal/config (configuration system) | Done |
-| IMPL-014 | internal/log (logging and diagnostics) | Done |
-| IMPL-015 | internal/server/transport (Raft transport) | Done |
-| IMPL-016 | internal/server/status (HTTP status server) | Done |
-| IMPL-017 | internal/server/flow (flow control) | Done |
-| IMPL-018 | internal/coprocessor (push-down execution) | Done |
-| IMPL-019 | internal/storage/txn (async commit and 1PC) | Done |
-| IMPL-020 | internal/storage/txn (pessimistic transactions) | Done |
-| IMPL-021 | cmd/gookv-ctl (admin CLI) | Done |
-| IMPL-022 | WriteBatch SavePoint (copy-on-savepoint) | Done |
-| IMPL-023 | Raw KV API (RawGet/Put/Delete/Scan/Batch) | Done |
-| IMPL-024 | MVCC Scanner (range queries) | Done |
-| IMPL-025 | TxnScheduler (command dispatcher) | Done |
-| IMPL-026 | RPC wiring (pessimistic lock, resolve, heartbeat) | Done |
-| IMPL-027 | Raft log compaction (GC tick, background deletion) | Done |
-| IMPL-028 | Raft snapshot (SST export/ingest, async generation) | Done |
-| IMPL-029 | Coprocessor gRPC integration | Done |
-| IMPL-030 | MVCC GC worker (three-state machine, KvGC RPC) | Done |
-| IMPL-031 | PD server (TSO, metadata, 16 gRPC RPCs) | Done |
-| IMPL-032 | Raft configuration changes (AddNode/RemoveNode) | Done |
-| IMPL-033 | PD integration (heartbeats, split reporting) | Done |
-| IMPL-034 | Region split (size-based checker, batch split) | Done |
-| IMPL-035 | Region merge (prepare/commit/rollback) | Done |
-| IMPL-036 | CleanupRegionData (peer destruction cleanup) | Done |
-| IMPL-037 | End-to-end integration test suite | Done |
-| IMPL-038 | Async commit / 1PC gRPC path integration (KvPrewrite routing, PD-based TSO) | Done |
-| IMPL-039 | KvCheckSecondaryLocks, KvScanLock RPCs | Done |
-| IMPL-040 | Raw KV extensions (RawBatchScan, RawGetKeyTTL, RawCompareAndSwap, RawChecksum) | Done |
-| IMPL-041 | Raw KV TTL support (per-key expiry encoding, automatic filtering) | Done |
-| IMPL-042 | PD client multi-endpoint failover and retry | Done |
-| IMPL-043 | PD-coordinated region split (split check tick, AskBatchSplit, child bootstrap) | Done |
-| IMPL-044 | Region validation in gRPC handlers (validateRegionContext) | Done |
-| IMPL-045 | Engine traits conformance test suite (17 test cases) | Done |
-| IMPL-046 | Codec fuzz tests (6 fuzz targets) | Done |
-| IMPL-047 | CLI improvements (compact with full LSM compaction, dump --sst for SST parsing) | Done |
-| IMPL-048 | Client library for multi-region routing (pkg/client) | Done |
-| IMPL-049 | Snapshot transfer (end-to-end streaming via gRPC) | Done |
-| IMPL-050 | Store worker goroutine (dynamic peer creation/destruction) | Done |
-| IMPL-051 | Significant messages (Unreachable, SnapshotStatus, MergeResult) | Done |
-| IMPL-052 | GC safe point PD centralization (pdclient methods, KvGC integration) | Done |
-| IMPL-053 | KvDeleteRange (ModifyTypeDeleteRange, gRPC handler, Raft serialization) | Done |
-| IMPL-054 | PD scheduling (Scheduler, replica repair, leader balance, PDWorker delivery) | Done |
-| IMPL-055 | pkg/client (cross-region TxnClient, LockResolver, 2PC committer) | Done |
-| IMPL-056 | Dynamic node addition (join mode) | Done |
-| IMPL-057 | Store state machine (Up/Disconnected/Down/Tombstone) | Done |
-| IMPL-058 | Region balance scheduler | Done |
-| IMPL-059 | Excess replica shedding scheduler | Done |
-| IMPL-060 | MoveTracker (3-step region move) | Done |
-| IMPL-061 | Store identity persistence | Done |
-| IMPL-062 | Snapshot send semaphore | Done |
-| IMPL-063 | gookv-ctl store commands + GetAllStores | Done |
-| IMPL-064 | PD Raft replication (multi-node HA, command-based state machine, follower forwarding, buffered allocation, log compaction) | Done |
-
 ## Known Limitations
 
-The following features are intentionally deferred or not yet fully connected. See `impl_doc/08_not_yet_implemented.md` for details.
+See `gookv-design/10_not_yet_implemented.md` for full details.
 
-### gRPC RPCs
-
-| RPC | Status | Notes |
-|-----|--------|-------|
-| `BatchCoprocessor` | Stub | Only single-region `Coprocessor` and `CoprocessorStream` are implemented. Multi-region dispatch is not wired. |
-
-### Client Library (`pkg/client`)
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| TSO batching | Not implemented | Each `GetTS` call opens a new stream. Batching multiple allocations into a single RPC is a low-priority optimization. |
-
-### Placement Driver (PD)
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Periodic PD leader refresh | Not implemented | `Config.UpdateInterval` is defined but not consumed. The client relies on connection-time endpoint discovery and error-driven reconnection. |
-| Store heartbeat capacity/available/used_size fields | Not populated | Capacity/Available/UsedSize not yet populated in store heartbeat. |
-| PD Raft dynamic membership | Not implemented | PD cluster topology is fixed at startup via `--initial-cluster`. Adding or removing PD nodes at runtime is not supported. |
-
-### Raftstore
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Casual / Start messages | Not implemented | `PeerMsgTypeCasual` and `PeerMsgTypeStart` are defined but ignored in `handleMessage`. |
-| Streaming snapshot generation | Not implemented | Current implementation holds all region data in memory; may OOM for large regions. |
-| Region epoch validation in schedule messages | Not implemented | Currently relies on Raft's built-in rejection. |
+| Category | Feature | Notes |
+|----------|---------|-------|
+| gRPC | BatchCoprocessor | Stub only; single-region Coprocessor works |
+| Client | TSO batching | Each GetTS is a separate RPC; low-priority optimization |
+| Raftstore | Streaming snapshot generation | Holds all data in memory; OOM risk for large regions |
+| Raftstore | Leader lease read path | `appliedIndex >= commitIndex` check missing; ReadIndex used instead |
+| Raftstore | Split key selection from dominant CF | Deferred; low impact |
+| PD | Dynamic membership change | Fixed topology at startup; requires restart to change |
+| PD | Store heartbeat capacity fields | Capacity/Available/UsedSize not populated |
+| Server | Flow control | `IsBusy()` always returns false |
 
 ## Acknowledgments
 
