@@ -43,7 +43,7 @@
 3. **Track Progress**: Mark items complete as you go
 4. **Explain Changes**: High-level summary at each step
 5. **Document Results**: Add review section to `tasks/todo.md`
-6. **Capture Lessons**: Update `tasks/lessons.md` after corrections
+6. **Capture Lessons**: Update `lessons.md` after corrections
 
 ## Core Principles
 
@@ -56,15 +56,9 @@
 
 ### Overview
 gookv is a Go-based distributed transactional KV store modeled after TiKV.
-- Design docs: `impl_doc/` (00-08) — primary reference
+- Current design and implementation docs: `cutreny_impl/` (00-08) — primary reference for understand codebase
 - TiKV impl docs: `tikv_impl_docs/` — secondary reference (use only when stuck)
 - TiKV Rust source: `tikv` - clone of the TiKV repo
-
-### TDD Workflow
-1. Find TiKV test cases for the component (use Serena Rust LSP)
-2. Convert to Go test stubs (table-driven tests, testify/assert)
-3. Implement until all tests pass
-4. Add additional Go-specific tests as needed
 
 ### Constraints
 - Python work must use virtualenv
@@ -76,4 +70,7 @@ gookv is a Go-based distributed transactional KV store modeled after TiKV.
 - Public packages: pkg/ (codec, keys, cfnames, txntypes, pdclient)
 - Private packages: internal/ (engine, raftstore, storage, server, etc.)
 - Build: `make -f Makefile build`
-- Test: `make -f Makefile test`
+- Test:
+  - `make -f Makefile test`
+  - `make -f Makefile test-e2e`
+  - `make -f Makefile test-e2e-external`
