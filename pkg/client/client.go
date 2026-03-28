@@ -73,6 +73,11 @@ func (c *Client) RawKV() *RawKVClient {
 	}
 }
 
+// PD returns the underlying pdclient.Client for administrative operations.
+func (c *Client) PD() pdclient.Client {
+	return c.pdClient
+}
+
 // Close releases all resources.
 func (c *Client) Close() error {
 	c.sender.Close()

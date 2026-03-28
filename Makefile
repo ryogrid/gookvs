@@ -1,4 +1,4 @@
-.PHONY: test vet proto test-e2e test-e2e-external cluster-start cluster-stop cluster-verify pd-cluster-start pd-cluster-stop pd-cluster-verify txn-demo-start txn-demo-stop txn-demo-verify scale-demo-start scale-demo-stop scale-demo-verify pd-failover-demo-start pd-failover-demo-stop pd-failover-demo-verify txn-integrity-demo-start txn-integrity-demo-stop txn-integrity-demo-verify
+.PHONY: test vet proto test-e2e test-e2e-external cluster-start cluster-stop cluster-verify pd-cluster-start pd-cluster-stop pd-cluster-verify txn-demo-start txn-demo-stop txn-demo-verify scale-demo-start scale-demo-stop scale-demo-verify pd-failover-demo-start pd-failover-demo-stop pd-failover-demo-verify txn-integrity-demo-start txn-integrity-demo-stop txn-integrity-demo-verify gookv-cli
 
 GO_SRC := $(shell find cmd/ internal/ pkg/ -name '*.go')
 
@@ -18,7 +18,7 @@ test-e2e:
 test-e2e-external: build
 	go test ./e2e_external/... -v -count=1 -timeout 900s
 
-build: gookv-server gookv-ctl gookv-pd
+build: gookv-server gookv-ctl gookv-pd gookv-cli
 
 gookv-server: $(GO_SRC) go.mod go.sum
 	go build -o gookv-server ./cmd/gookv-server
@@ -28,6 +28,9 @@ gookv-ctl: $(GO_SRC) go.mod go.sum
 
 gookv-pd: $(GO_SRC) go.mod go.sum
 	go build -o gookv-pd ./cmd/gookv-pd
+
+gookv-cli: $(GO_SRC) go.mod go.sum
+	go build -o gookv-cli ./cmd/gookv-cli
 
 vet:
 	go vet ./...
