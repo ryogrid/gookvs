@@ -16,6 +16,7 @@ This document lists features and capabilities that are not yet implemented or ha
 | 8 | Raftstore | Leader lease read path | Not implemented | Medium — ReadIndex used instead (extra round-trip) |
 | 9 | Server | Flow control integration | Not implemented | Low — `IsBusy()` always returns false |
 | 10 | PD Client | `grpc.DialContext` + `WithBlock` migration | Deferred | Low — deprecated API, functionally correct |
+| 11 | PD / Bootstrap | MaxPeerCount must match initial voter count | Known constraint | High — ConfChange churn destabilizes cluster if mismatched |
 
 ---
 
@@ -82,3 +83,18 @@ The ReadIndex (ReadOnlySafe) path is used instead, which guarantees both leaders
 Three sites in `pkg/pdclient/client.go` use the deprecated `grpc.DialContext` with `grpc.WithBlock()` for connection establishment. The modern `grpc.NewClient` API does not support blocking dial, requiring a redesign to non-blocking connection establishment with retry logic.
 
 All other `grpc.Dial` call sites have been migrated to `grpc.NewClient`. These three sites remain because removing `WithBlock()` changes the connection establishment semantics and requires careful testing of PD client reconnection behavior.
+
+## 11. MaxPeerCount Must Match Initial Voter Count
+
+gookv bootstraps the initial region with **all nodes** listed in `--initial-cluster` as Raft voters. The PD scheduler's `MaxPeerCount` (default 3, configurable via `--max-peer-count`) controls how many replicas each region should have.
+
+**Known constraint:** If `MaxPeerCount < number of initial voters`, the PD scheduler immediately begins removing excess peers via ConfChange to reduce the replica count. This causes:
+
+- **Continuous ConfChange churn**: confVer keeps incrementing as peers are added/removed
+- **Leadership instability**: Raft leaders may step down during ConfChange transitions
+- **Client routing failures**: clients receive "not leader" / "epoch not match" errors as cached region metadata becomes stale faster than retries can converge
+- **Potential data loss on restart**: newly added peers (via ConfChange) may not have received snapshots before the cluster destabilizes
+
+**Workaround:** Always set `--max-peer-count` equal to the number of KVS nodes when all nodes are initial voters. The e2elib (`pkg/e2elib/cluster.go`) automatically sets `MaxPeerCount = NumNodes` for test clusters.
+
+**Proper fix (not yet implemented):** Bootstrap the initial region with only `min(NumNodes, MaxPeerCount)` voters, and let the remaining nodes join as empty stores that PD can schedule regions to. This matches TiKV's architecture where the initial Raft group has 3 members regardless of cluster size.
