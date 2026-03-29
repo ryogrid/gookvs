@@ -16,9 +16,10 @@ import (
 
 // PDNodeConfig holds configuration for starting a PD node.
 type PDNodeConfig struct {
-	BinaryPath string
-	ClusterID  uint64
-	LogLevel   string
+	BinaryPath   string
+	ClusterID    uint64
+	LogLevel     string
+	MaxPeerCount int // 0 = PD default (3)
 }
 
 // PDNode represents a running PD process managed for testing.
@@ -92,6 +93,9 @@ func (n *PDNode) Start() error {
 		"--cluster-id", strconv.FormatUint(clusterID, 10),
 		"--data-dir", n.dataDir,
 		"--log-level", logLevel,
+	}
+	if n.cfg.MaxPeerCount > 0 {
+		args = append(args, "--max-peer-count", strconv.Itoa(n.cfg.MaxPeerCount))
 	}
 
 	n.cmd = exec.Command(binary, args...)

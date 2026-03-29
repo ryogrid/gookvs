@@ -53,10 +53,14 @@ func (c *GokvCluster) Start() error {
 		return fmt.Errorf("e2elib: cluster already started")
 	}
 
-	// Create and start PD.
+	// Create and start PD. Set MaxPeerCount to NumNodes so the scheduler
+	// doesn't try to remove peers from regions that already have all nodes.
 	pdCfg := c.cfg.PDConfig
 	if pdCfg.BinaryPath == "" {
 		pdCfg.BinaryPath = c.cfg.PDBinaryPath
+	}
+	if pdCfg.MaxPeerCount == 0 {
+		pdCfg.MaxPeerCount = c.cfg.NumNodes
 	}
 	c.pd = NewPDNode(c.t, c.alloc, pdCfg)
 	if err := c.pd.Start(); err != nil {

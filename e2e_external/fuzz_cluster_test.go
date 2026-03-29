@@ -30,7 +30,7 @@ const (
 	fuzzDefaultIters     = 500
 	fuzzDefaultClients   = 8
 	fuzzStabilizeTimeout = 180 * time.Second
-	fuzzNodeCount        = 3
+	fuzzNodeCount        = 5
 	fuzzFaultInterval    = 10 * time.Second // time between fault injection events
 )
 
@@ -650,9 +650,52 @@ func TestFuzzCluster(t *testing.T) {
 
 	pdAddr := cluster.PD().Addr()
 
-	// Seed accounts.
+	// Seed accounts with retry. Region splits may occur during seeding
+	// (SplitSize=128KB), causing transient "not leader" errors.
 	t.Logf("Seeding %d accounts with initial balance %d...", fuzzNumAccounts, fuzzInitialBalance)
-	e2elib.SeedAccounts(t, cluster.TxnKV(), fuzzNumAccounts, fuzzInitialBalance)
+	{
+		ctx := context.Background()
+		balanceStr := strconv.Itoa(fuzzInitialBalance)
+		batchSize := 50
+		for start := 0; start < fuzzNumAccounts; start += batchSize {
+			end := start + batchSize
+			if end > fuzzNumAccounts {
+				end = fuzzNumAccounts
+			}
+			var committed bool
+			for attempt := 0; attempt < 10; attempt++ {
+				txn, err := cluster.TxnKV().Begin(ctx)
+				if err != nil {
+					time.Sleep(2 * time.Second)
+					cluster.ResetClient()
+					continue
+				}
+				failed := false
+				for i := start; i < end; i++ {
+					if err := txn.Set(ctx, accountKey(i), []byte(balanceStr)); err != nil {
+						failed = true
+						break
+					}
+				}
+				if failed {
+					_ = txn.Rollback(ctx)
+					time.Sleep(2 * time.Second)
+					cluster.ResetClient()
+					continue
+				}
+				if err := txn.Commit(ctx); err != nil {
+					_ = txn.Rollback(ctx)
+					t.Logf("Seed batch [%d,%d) attempt %d: %v", start, end, attempt+1, err)
+					time.Sleep(2 * time.Second)
+					cluster.ResetClient()
+					continue
+				}
+				committed = true
+				break
+			}
+			require.True(t, committed, "seed batch [%d,%d) failed after retries", start, end)
+		}
+	}
 
 	// Wait for region topology to stabilize: no changes in region count,
 	// peers, or leaders for 30 seconds.

@@ -67,6 +67,7 @@ func main() {
 	initialCluster := flag.String("initial-cluster", "", "PD cluster topology: ID1=HOST:PORT,ID2=HOST:PORT,...")
 	peerPort := flag.String("peer-port", "0.0.0.0:2380", "Listen address for PD-to-PD Raft peer communication")
 	clientCluster := flag.String("client-cluster", "", "PD client addresses: ID1=HOST:PORT,... (for leader forwarding)")
+	maxPeerCount := flag.Int("max-peer-count", 3, "Maximum number of replicas per region")
 
 	flag.Parse()
 
@@ -98,6 +99,9 @@ func main() {
 	cfg.ListenAddr = *listenAddr
 	cfg.DataDir = *dataDir
 	cfg.ClusterID = *clusterID
+	if *maxPeerCount > 0 {
+		cfg.MaxPeerCount = *maxPeerCount
+	}
 
 	// Step 16 & 17: Construct PDServerRaftConfig if --initial-cluster is specified.
 	if *initialCluster != "" {
