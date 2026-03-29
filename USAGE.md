@@ -118,6 +118,7 @@ Notes:
 | `--addr` | `0.0.0.0:2379` | Client-facing gRPC listen address |
 | `--data-dir` | `/tmp/gookv-pd` | Data directory for metadata and Raft logs |
 | `--cluster-id` | `1` | Cluster ID |
+| `--max-peer-count` | `3` | Maximum number of replicas per region. Must match the number of KVS nodes when all nodes are initial Raft voters (see note below) |
 | `--log-level` | `info` | Log level: debug, info, warn, error |
 | `--log-file` | `<data-dir>/log/pd.log` | Log file path |
 | `--pd-id` | `0` | PD node ID (required with `--initial-cluster`) |
