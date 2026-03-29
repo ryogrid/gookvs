@@ -1,4 +1,4 @@
-.PHONY: test vet proto test-e2e test-e2e-external cluster-start cluster-stop cluster-verify pd-cluster-start pd-cluster-stop pd-cluster-verify txn-demo-start txn-demo-stop txn-demo-verify scale-demo-start scale-demo-stop scale-demo-verify pd-failover-demo-start pd-failover-demo-stop pd-failover-demo-verify txn-integrity-demo-start txn-integrity-demo-stop txn-integrity-demo-verify gookv-cli
+.PHONY: test vet proto test-e2e test-e2e-external test-fuzz-cluster cluster-start cluster-stop cluster-verify pd-cluster-start pd-cluster-stop pd-cluster-verify txn-demo-start txn-demo-stop txn-demo-verify scale-demo-start scale-demo-stop scale-demo-verify pd-failover-demo-start pd-failover-demo-stop pd-failover-demo-verify txn-integrity-demo-start txn-integrity-demo-stop txn-integrity-demo-verify gookv-cli
 
 GO_SRC := $(shell find cmd/ internal/ pkg/ -name '*.go')
 
@@ -16,7 +16,10 @@ test-e2e:
 	go test ./e2e/... -v -count=1 -timeout 120s
 
 test-e2e-external: build
-	go test ./e2e_external/... -v -count=1 -timeout 900s
+	go test ./e2e_external/... -v -count=1 -timeout 2400s
+
+test-fuzz-cluster: build
+	go test ./e2e_external/... -run TestFuzzCluster -v -count=1 -timeout 2400s
 
 build: gookv-server gookv-ctl gookv-pd gookv-cli
 
