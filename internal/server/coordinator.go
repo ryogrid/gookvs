@@ -156,9 +156,12 @@ func (sc *StoreCoordinator) BootstrapRegion(region *metapb.Region, allPeers []ra
 	}
 
 	// Wire sendFunc to use gRPC transport.
+	// Use peer.Region() (not the captured region) so that ConfChange updates
+	// (added/removed peers) are visible when resolving msg.To → store ID.
 	peer.SetSendFunc(func(msgs []raftpb.Message) {
+		currentRegion := peer.Region()
 		for i := range msgs {
-			sc.sendRaftMessage(regionID, region, peerID, &msgs[i])
+			sc.sendRaftMessage(regionID, currentRegion, peerID, &msgs[i])
 		}
 	})
 
@@ -562,9 +565,11 @@ func (sc *StoreCoordinator) CreatePeer(req *raftstore.CreatePeerRequest) error {
 	}
 
 	// Wire sendFunc and applyFunc (same pattern as BootstrapRegion).
+	// Use peer.Region() (not captured req.Region) so ConfChange updates are visible.
 	peer.SetSendFunc(func(msgs []raftpb.Message) {
+		currentRegion := peer.Region()
 		for i := range msgs {
-			sc.sendRaftMessage(regionID, req.Region, req.PeerID, &msgs[i])
+			sc.sendRaftMessage(regionID, currentRegion, req.PeerID, &msgs[i])
 		}
 	})
 	peer.SetApplyFunc(func(_ uint64, entries []raftpb.Entry) {
