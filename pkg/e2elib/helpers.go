@@ -9,6 +9,7 @@ import (
 
 	"github.com/pingcap/kvproto/pkg/tikvpb"
 	"github.com/ryogrid/gookv/pkg/client"
+	"github.com/ryogrid/gookv/pkg/codec"
 	"github.com/ryogrid/gookv/pkg/pdclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -144,7 +145,12 @@ func countRegions(ctx context.Context, pd pdclient.Client) int {
 			// This is the last region (covers to +infinity).
 			break
 		}
-		key = endKey
+		// endKey is memcomparable-encoded; decode to raw key for the next GetRegion call.
+		rawKey, _, err := codec.DecodeBytes(endKey)
+		if err != nil {
+			break
+		}
+		key = rawKey
 	}
 	return count
 }

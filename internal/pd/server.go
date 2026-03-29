@@ -1135,6 +1135,19 @@ func (m *MetadataStore) PutRegion(region *metapb.Region, leader *metapb.Peer) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Reject stale heartbeats: if the stored region has a newer epoch, skip.
+	if existing, ok := m.regions[region.GetId()]; ok {
+		storedEpoch := existing.GetRegionEpoch()
+		incomingEpoch := region.GetRegionEpoch()
+		if storedEpoch != nil && incomingEpoch != nil {
+			if incomingEpoch.GetVersion() < storedEpoch.GetVersion() ||
+				incomingEpoch.GetConfVer() < storedEpoch.GetConfVer() {
+				return // stale, discard
+			}
+		}
+	}
+
 	m.regions[region.GetId()] = region
 	if leader != nil {
 		m.leaders[region.GetId()] = leader

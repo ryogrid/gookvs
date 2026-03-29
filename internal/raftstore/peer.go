@@ -979,11 +979,14 @@ func (p *Peer) onSplitCheckTick() {
 		return
 	}
 
+	p.regionMu.RLock()
+	region := p.region
+	p.regionMu.RUnlock()
 	task := split.SplitCheckTask{
 		RegionID: p.regionID,
-		Region:   p.region,
-		StartKey: p.region.GetStartKey(),
-		EndKey:   p.region.GetEndKey(),
+		Region:   region,
+		StartKey: region.GetStartKey(),
+		EndKey:   region.GetEndKey(),
 		Policy:   split.CheckPolicyScan,
 	}
 
@@ -1049,8 +1052,11 @@ func (p *Peer) sendRegionHeartbeatToPD() {
 	if p.pdTaskCh == nil {
 		return
 	}
+	p.regionMu.RLock()
+	region := p.region
+	p.regionMu.RUnlock()
 	info := &RegionHeartbeatInfo{
-		Region: p.region,
+		Region: region,
 		Peer:   &metapb.Peer{Id: p.peerID, StoreId: p.storeID},
 	}
 	// Non-blocking send.

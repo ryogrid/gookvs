@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,100 +28,140 @@ const (
 	fuzzInitialBalance   = 1000
 	fuzzExpectedTotal    = fuzzNumAccounts * fuzzInitialBalance
 	fuzzDefaultIters     = 500
-	fuzzStabilizeTimeout = 60 * time.Second
+	fuzzDefaultClients   = 8
+	fuzzStabilizeTimeout = 180 * time.Second
 	fuzzNodeCount        = 3
+	fuzzFaultInterval    = 3 * time.Second // time between fault injection events
 )
 
-// opType represents the type of operation in the fuzz loop.
-type opType int
+// --- Operation types and weights ---
+
+type clientOpType int
 
 const (
-	opTransfer opType = iota
-	opMultiTransfer
-	opAudit
-	opBatchRead
-	opStopNode
-	opRestartNode
-	opKillLeader
+	copTransfer clientOpType = iota
+	copMultiTransfer
+	copAudit
+	copBatchRead
 )
 
-// opWeight associates an operation with a selection weight.
-type opWeight struct {
-	op     opType
+type clientOpWeight struct {
+	op     clientOpType
 	weight int
 }
 
-var opWeights = []opWeight{
-	{opTransfer, 30},
-	{opMultiTransfer, 20},
-	{opAudit, 15},
-	{opBatchRead, 10},
-	{opStopNode, 10},
-	{opRestartNode, 10},
-	{opKillLeader, 5},
+var clientOpWeights = []clientOpWeight{
+	{copTransfer, 40},
+	{copMultiTransfer, 25},
+	{copAudit, 10},
+	{copBatchRead, 25},
 }
 
-var totalWeight int
+var clientTotalWeight int
+
+type faultOpType int
+
+const (
+	fopStopNode faultOpType = iota
+	fopRestartNode
+	fopKillLeader
+)
+
+type faultOpWeight struct {
+	op     faultOpType
+	weight int
+}
+
+var faultOpWeights = []faultOpWeight{
+	{fopStopNode, 40},
+	{fopRestartNode, 40},
+	{fopKillLeader, 20},
+}
+
+var faultTotalWeight int
 
 func init() {
-	for _, w := range opWeights {
-		totalWeight += w.weight
+	for _, w := range clientOpWeights {
+		clientTotalWeight += w.weight
+	}
+	for _, w := range faultOpWeights {
+		faultTotalWeight += w.weight
 	}
 }
 
-// pickOp selects a random operation based on weights.
-func pickOp(rng *rand.Rand) opType {
-	r := rng.IntN(totalWeight)
+func pickClientOp(rng *rand.Rand) clientOpType {
+	r := rng.IntN(clientTotalWeight)
 	cum := 0
-	for _, w := range opWeights {
+	for _, w := range clientOpWeights {
 		cum += w.weight
 		if r < cum {
 			return w.op
 		}
 	}
-	return opTransfer
+	return copTransfer
 }
 
-// fuzzStats tracks operation counts during the fuzz run.
+func pickFaultOp(rng *rand.Rand) faultOpType {
+	r := rng.IntN(faultTotalWeight)
+	cum := 0
+	for _, w := range faultOpWeights {
+		cum += w.weight
+		if r < cum {
+			return w.op
+		}
+	}
+	return fopStopNode
+}
+
+// --- Atomic stats (goroutine-safe) ---
+
 type fuzzStats struct {
-	transfers      int
-	multiTransfers int
-	audits         int
-	batchReads     int
-	txnSuccesses   int
-	txnConflicts   int
-	txnTransient   int
-	stopNodes      int
-	restartNodes   int
-	killLeaders    int
-	auditPasses    int
-	auditSkips     int
+	transfers      atomic.Int64
+	multiTransfers atomic.Int64
+	audits         atomic.Int64
+	batchReads     atomic.Int64
+	txnSuccesses   atomic.Int64
+	txnConflicts   atomic.Int64
+	txnTransient   atomic.Int64
+	stopNodes      atomic.Int64
+	restartNodes   atomic.Int64
+	killLeaders    atomic.Int64
+	auditPasses    atomic.Int64
+	auditSkips     atomic.Int64
 }
 
-func (s fuzzStats) String() string {
+func (s *fuzzStats) String() string {
 	return fmt.Sprintf(
 		"transfers=%d multiTransfers=%d audits=%d(pass=%d skip=%d) batchReads=%d "+
 			"txnOK=%d conflicts=%d transient=%d faults(stop=%d restart=%d killLeader=%d)",
-		s.transfers, s.multiTransfers, s.audits, s.auditPasses, s.auditSkips, s.batchReads,
-		s.txnSuccesses, s.txnConflicts, s.txnTransient,
-		s.stopNodes, s.restartNodes, s.killLeaders,
+		s.transfers.Load(), s.multiTransfers.Load(),
+		s.audits.Load(), s.auditPasses.Load(), s.auditSkips.Load(),
+		s.batchReads.Load(),
+		s.txnSuccesses.Load(), s.txnConflicts.Load(), s.txnTransient.Load(),
+		s.stopNodes.Load(), s.restartNodes.Load(), s.killLeaders.Load(),
 	)
 }
 
-// fuzzState holds all state for the fuzz run.
-type fuzzState struct {
+// --- Shared cluster state (protected by mutex for nodeUp) ---
+
+type fuzzCluster struct {
 	t       *testing.T
 	cluster *e2elib.GokvCluster
 	pdAddr  string
-	rng     *rand.Rand
-	nodeUp  [fuzzNodeCount]bool
-	stats   fuzzStats
+
+	mu     sync.Mutex
+	nodeUp []bool
+
+	stats fuzzStats
 }
 
-// runningCount returns the number of currently running nodes.
-func (s *fuzzState) runningCount() int {
+func (fc *fuzzCluster) majority() int {
+	return len(fc.nodeUp)/2 + 1
+}
+
+func (fc *fuzzCluster) runningCount() int {
 	n := 0
-	for _, up := range s.nodeUp {
+	for _, up := range fc.nodeUp {
 		if up {
 			n++
 		}
@@ -127,51 +169,55 @@ func (s *fuzzState) runningCount() int {
 	return n
 }
 
-// accountKey returns the key for account i (matching SeedAccounts format).
+// --- Per-goroutine client ---
+
+type fuzzClient struct {
+	fc  *fuzzCluster
+	rng *rand.Rand
+	id  int
+}
+
 func accountKey(i int) []byte {
 	return []byte(fmt.Sprintf("account-%d", i))
 }
 
-// isTxnRetryable returns true if the error is a retryable transaction conflict.
 func isTxnRetryable(err error) bool {
 	return errors.Is(err, client.ErrWriteConflict) || errors.Is(err, client.ErrDeadlock)
 }
 
-// --- Transaction Operations ---
+// --- Client transaction operations ---
 
-// doTransfer performs a 2-account balance transfer within a single transaction.
-func (s *fuzzState) doTransfer() {
-	s.stats.transfers++
+func (c *fuzzClient) doTransfer() {
+	c.fc.stats.transfers.Add(1)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	a := s.rng.IntN(fuzzNumAccounts)
-	b := s.rng.IntN(fuzzNumAccounts)
+	a := c.rng.IntN(fuzzNumAccounts)
+	b := c.rng.IntN(fuzzNumAccounts)
 	for b == a {
-		b = s.rng.IntN(fuzzNumAccounts)
+		b = c.rng.IntN(fuzzNumAccounts)
 	}
 
-	txn, err := s.cluster.TxnKV().Begin(ctx)
+	txn, err := c.fc.cluster.TxnKV().Begin(ctx)
 	if err != nil {
-		s.stats.txnTransient++
-		s.t.Logf("[transfer] begin err: %v", err)
+		c.fc.stats.txnTransient.Add(1)
 		return
 	}
 
 	valA, err := txn.Get(ctx, accountKey(a))
 	if err != nil {
-		s.stats.txnTransient++
+		c.fc.stats.txnTransient.Add(1)
 		_ = txn.Rollback(ctx)
 		return
 	}
 	valB, err := txn.Get(ctx, accountKey(b))
 	if err != nil {
-		s.stats.txnTransient++
+		c.fc.stats.txnTransient.Add(1)
 		_ = txn.Rollback(ctx)
 		return
 	}
 	if valA == nil || valB == nil {
-		s.stats.txnTransient++
+		c.fc.stats.txnTransient.Add(1)
 		_ = txn.Rollback(ctx)
 		return
 	}
@@ -184,46 +230,44 @@ func (s *fuzzState) doTransfer() {
 		return
 	}
 
-	amount := s.rng.IntN(min(balA, 100)) + 1
+	amount := c.rng.IntN(min(balA, 100)) + 1
 	newA := balA - amount
 	newB := balB + amount
 
 	if err := txn.Set(ctx, accountKey(a), []byte(strconv.Itoa(newA))); err != nil {
-		s.stats.txnTransient++
+		c.fc.stats.txnTransient.Add(1)
 		_ = txn.Rollback(ctx)
 		return
 	}
 	if err := txn.Set(ctx, accountKey(b), []byte(strconv.Itoa(newB))); err != nil {
-		s.stats.txnTransient++
+		c.fc.stats.txnTransient.Add(1)
 		_ = txn.Rollback(ctx)
 		return
 	}
 
 	if err := txn.Commit(ctx); err != nil {
 		if isTxnRetryable(err) {
-			s.stats.txnConflicts++
+			c.fc.stats.txnConflicts.Add(1)
 		} else {
-			s.stats.txnTransient++
+			c.fc.stats.txnTransient.Add(1)
 		}
 		_ = txn.Rollback(ctx)
 		return
 	}
-	s.stats.txnSuccesses++
+	c.fc.stats.txnSuccesses.Add(1)
 }
 
-// doMultiTransfer performs a 3-5 account redistribution within a single transaction.
-// The total balance across the selected accounts is preserved.
-func (s *fuzzState) doMultiTransfer() {
-	s.stats.multiTransfers++
+func (c *fuzzClient) doMultiTransfer() {
+	c.fc.stats.multiTransfers.Add(1)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	n := s.rng.IntN(3) + 3 // 3 to 5 accounts
-	indices := s.pickDistinct(n, fuzzNumAccounts)
+	n := c.rng.IntN(3) + 3 // 3 to 5 accounts
+	indices := c.pickDistinct(n, fuzzNumAccounts)
 
-	txn, err := s.cluster.TxnKV().Begin(ctx)
+	txn, err := c.fc.cluster.TxnKV().Begin(ctx)
 	if err != nil {
-		s.stats.txnTransient++
+		c.fc.stats.txnTransient.Add(1)
 		return
 	}
 
@@ -232,12 +276,12 @@ func (s *fuzzState) doMultiTransfer() {
 	for i, idx := range indices {
 		val, err := txn.Get(ctx, accountKey(idx))
 		if err != nil {
-			s.stats.txnTransient++
+			c.fc.stats.txnTransient.Add(1)
 			_ = txn.Rollback(ctx)
 			return
 		}
 		if val == nil {
-			s.stats.txnTransient++
+			c.fc.stats.txnTransient.Add(1)
 			_ = txn.Rollback(ctx)
 			return
 		}
@@ -245,12 +289,11 @@ func (s *fuzzState) doMultiTransfer() {
 		total += balances[i]
 	}
 
-	// Redistribute: random split of total into n non-negative integers.
-	newBalances := s.randomSplit(total, n)
+	newBalances := c.randomSplit(total, n)
 
 	for i, idx := range indices {
 		if err := txn.Set(ctx, accountKey(idx), []byte(strconv.Itoa(newBalances[i]))); err != nil {
-			s.stats.txnTransient++
+			c.fc.stats.txnTransient.Add(1)
 			_ = txn.Rollback(ctx)
 			return
 		}
@@ -258,26 +301,24 @@ func (s *fuzzState) doMultiTransfer() {
 
 	if err := txn.Commit(ctx); err != nil {
 		if isTxnRetryable(err) {
-			s.stats.txnConflicts++
+			c.fc.stats.txnConflicts.Add(1)
 		} else {
-			s.stats.txnTransient++
+			c.fc.stats.txnTransient.Add(1)
 		}
 		_ = txn.Rollback(ctx)
 		return
 	}
-	s.stats.txnSuccesses++
+	c.fc.stats.txnSuccesses.Add(1)
 }
 
-// doAudit reads all accounts in a single transaction and verifies the total.
-// Returns (total, error). error is non-nil on invariant violation or transient failure.
-func (s *fuzzState) doAudit() (int, error) {
-	s.stats.audits++
+func (c *fuzzClient) doAudit() (int, error) {
+	c.fc.stats.audits.Add(1)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	txn, err := s.cluster.TxnKV().Begin(ctx)
+	txn, err := c.fc.cluster.TxnKV().Begin(ctx)
 	if err != nil {
-		s.stats.auditSkips++
+		c.fc.stats.auditSkips.Add(1)
 		return 0, fmt.Errorf("begin: %w", err)
 	}
 
@@ -286,12 +327,12 @@ func (s *fuzzState) doAudit() (int, error) {
 		val, err := txn.Get(ctx, accountKey(i))
 		if err != nil {
 			_ = txn.Rollback(ctx)
-			s.stats.auditSkips++
+			c.fc.stats.auditSkips.Add(1)
 			return 0, fmt.Errorf("get account-%d: %w", i, err)
 		}
 		if val == nil {
 			_ = txn.Rollback(ctx)
-			s.stats.auditSkips++
+			c.fc.stats.auditSkips.Add(1)
 			return 0, fmt.Errorf("account-%d not found", i)
 		}
 		b, err := strconv.Atoi(string(val))
@@ -306,29 +347,27 @@ func (s *fuzzState) doAudit() (int, error) {
 		total += b
 	}
 
-	// Read-only commit; ignore errors.
 	_ = txn.Commit(ctx)
 
 	if total != fuzzExpectedTotal {
 		return total, fmt.Errorf("balance mismatch: got %d, want %d", total, fuzzExpectedTotal)
 	}
 
-	s.stats.auditPasses++
+	c.fc.stats.auditPasses.Add(1)
 	return total, nil
 }
 
-// doBatchRead reads a random subset of accounts and verifies balances are non-negative.
-func (s *fuzzState) doBatchRead() {
-	s.stats.batchReads++
+func (c *fuzzClient) doBatchRead() {
+	c.fc.stats.batchReads.Add(1)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	n := s.rng.IntN(6) + 5 // 5 to 10 accounts
-	indices := s.pickDistinct(n, fuzzNumAccounts)
+	n := c.rng.IntN(6) + 5 // 5 to 10 accounts
+	indices := c.pickDistinct(n, fuzzNumAccounts)
 
-	txn, err := s.cluster.TxnKV().Begin(ctx)
+	txn, err := c.fc.cluster.TxnKV().Begin(ctx)
 	if err != nil {
-		s.stats.txnTransient++
+		c.fc.stats.txnTransient.Add(1)
 		return
 	}
 
@@ -339,7 +378,7 @@ func (s *fuzzState) doBatchRead() {
 
 	pairs, err := txn.BatchGet(ctx, keys)
 	if err != nil {
-		s.stats.txnTransient++
+		c.fc.stats.txnTransient.Add(1)
 		_ = txn.Rollback(ctx)
 		return
 	}
@@ -347,18 +386,84 @@ func (s *fuzzState) doBatchRead() {
 	for _, pair := range pairs {
 		b, err := strconv.Atoi(string(pair.Value))
 		if err == nil && b < 0 {
-			s.t.Errorf("[batchRead] negative balance: key=%s val=%d", pair.Key, b)
+			c.fc.t.Errorf("[client %d] negative balance: key=%s val=%d", c.id, pair.Key, b)
 		}
 	}
 
 	_ = txn.Commit(ctx)
 }
 
-// --- Fault Injection ---
+// --- Client helpers ---
+
+func (c *fuzzClient) pickDistinct(n, max int) []int {
+	if n > max {
+		n = max
+	}
+	set := make(map[int]struct{}, n)
+	for len(set) < n {
+		set[c.rng.IntN(max)] = struct{}{}
+	}
+	result := make([]int, 0, n)
+	for v := range set {
+		result = append(result, v)
+	}
+	return result
+}
+
+func (c *fuzzClient) randomSplit(total, n int) []int {
+	if n == 1 {
+		return []int{total}
+	}
+	if total == 0 {
+		return make([]int, n)
+	}
+	breaks := make([]int, n-1)
+	for i := range breaks {
+		breaks[i] = c.rng.IntN(total + 1)
+	}
+	sort.Ints(breaks)
+
+	result := make([]int, n)
+	prev := 0
+	for i, b := range breaks {
+		result[i] = b - prev
+		prev = b
+	}
+	result[n-1] = total - prev
+	return result
+}
+
+// clientLoop runs transaction operations until opsLeft reaches zero or ctx is cancelled.
+func (c *fuzzClient) clientLoop(ctx context.Context, opsLeft *atomic.Int64) {
+	for opsLeft.Add(-1) >= 0 {
+		if ctx.Err() != nil {
+			return
+		}
+		op := pickClientOp(c.rng)
+		switch op {
+		case copTransfer:
+			c.doTransfer()
+		case copMultiTransfer:
+			c.doMultiTransfer()
+		case copAudit:
+			total, err := c.doAudit()
+			if err != nil {
+				if strings.Contains(err.Error(), "mismatch") || strings.Contains(err.Error(), "negative") {
+					c.fc.t.Errorf("[client %d] INVARIANT VIOLATION: %v", c.id, err)
+				}
+			} else {
+				_ = total
+			}
+		case copBatchRead:
+			c.doBatchRead()
+		}
+	}
+}
+
+// --- Fault injection (runs on dedicated goroutine) ---
 
 var fuzzStoreIDRegex = regexp.MustCompile(`store:(\d+)`)
 
-// fuzzParseLeaderStore extracts the leader store ID from REGION command output.
 func fuzzParseLeaderStore(output string) (uint64, bool) {
 	for _, line := range strings.Split(output, "\n") {
 		if strings.Contains(line, "Leader:") {
@@ -374,34 +479,38 @@ func fuzzParseLeaderStore(output string) (uint64, bool) {
 	return 0, false
 }
 
-func (s *fuzzState) doStopNode() {
-	if s.runningCount() <= 2 {
-		return // keep majority
+func (fc *fuzzCluster) doStopNode(rng *rand.Rand) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	if fc.runningCount() <= fc.majority() {
+		return
 	}
 
-	// Pick a random running node.
 	var candidates []int
-	for i, up := range s.nodeUp {
+	for i, up := range fc.nodeUp {
 		if up {
 			candidates = append(candidates, i)
 		}
 	}
-	idx := candidates[s.rng.IntN(len(candidates))]
+	idx := candidates[rng.IntN(len(candidates))]
 
-	if err := s.cluster.StopNode(idx); err != nil {
-		s.t.Logf("[stopNode] node %d: %v", idx, err)
+	if err := fc.cluster.StopNode(idx); err != nil {
+		fc.t.Logf("[fault] stopNode %d: %v", idx, err)
 		return
 	}
-	s.nodeUp[idx] = false
-	s.cluster.ResetClient()
-	s.stats.stopNodes++
-	time.Sleep(500 * time.Millisecond)
+	fc.nodeUp[idx] = false
+	fc.cluster.ResetClient()
+	fc.stats.stopNodes.Add(1)
+	fc.t.Logf("[fault] stopped node %d (running=%d)", idx, fc.runningCount())
 }
 
-func (s *fuzzState) doRestartNode() {
-	// Find a stopped node.
+func (fc *fuzzCluster) doRestartNode(rng *rand.Rand) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
 	var candidates []int
-	for i, up := range s.nodeUp {
+	for i, up := range fc.nodeUp {
 		if !up {
 			candidates = append(candidates, i)
 		}
@@ -409,104 +518,95 @@ func (s *fuzzState) doRestartNode() {
 	if len(candidates) == 0 {
 		return
 	}
-	idx := candidates[s.rng.IntN(len(candidates))]
+	idx := candidates[rng.IntN(len(candidates))]
 
-	if err := s.cluster.RestartNode(idx); err != nil {
-		s.t.Logf("[restartNode] node %d restart: %v", idx, err)
+	if err := fc.cluster.RestartNode(idx); err != nil {
+		fc.t.Logf("[fault] restartNode %d: %v", idx, err)
 		return
 	}
-	if err := s.cluster.Node(idx).WaitForReady(30 * time.Second); err != nil {
-		s.t.Logf("[restartNode] node %d not ready: %v", idx, err)
+	if err := fc.cluster.Node(idx).WaitForReady(30 * time.Second); err != nil {
+		fc.t.Logf("[fault] node %d not ready: %v", idx, err)
 		return
 	}
-	s.nodeUp[idx] = true
-	s.cluster.ResetClient()
-	s.stats.restartNodes++
-	time.Sleep(1 * time.Second)
+	fc.nodeUp[idx] = true
+	fc.cluster.ResetClient()
+	fc.stats.restartNodes.Add(1)
+	fc.t.Logf("[fault] restarted node %d (running=%d)", idx, fc.runningCount())
 }
 
-func (s *fuzzState) doKillLeader() {
-	if s.runningCount() < fuzzNodeCount {
-		return // only safe when all nodes are up
+func (fc *fuzzCluster) doKillLeader(rng *rand.Rand) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	if fc.runningCount() <= fc.majority() {
+		return
 	}
 
-	stdout, _, err := e2elib.CLIExecRaw(s.t, s.pdAddr, "REGION \"\"")
+	// Release lock for CLI call (blocking I/O).
+	fc.mu.Unlock()
+	stdout, _, err := e2elib.CLIExecRaw(fc.t, fc.pdAddr, "REGION \"\"")
+	fc.mu.Lock()
+
 	if err != nil {
-		s.t.Logf("[killLeader] REGION cmd err: %v", err)
 		return
 	}
 
 	leaderID, ok := fuzzParseLeaderStore(stdout)
 	if !ok || leaderID == 0 {
-		s.t.Logf("[killLeader] could not parse leader from output")
 		return
 	}
 
 	leaderIdx := int(leaderID) - 1
-	if leaderIdx < 0 || leaderIdx >= fuzzNodeCount || !s.nodeUp[leaderIdx] {
-		s.t.Logf("[killLeader] invalid leader idx %d", leaderIdx)
+	if leaderIdx < 0 || leaderIdx >= len(fc.nodeUp) || !fc.nodeUp[leaderIdx] {
 		return
 	}
 
-	if err := s.cluster.StopNode(leaderIdx); err != nil {
-		s.t.Logf("[killLeader] stop node %d: %v", leaderIdx, err)
+	// Re-check majority after re-acquiring lock.
+	if fc.runningCount() <= fc.majority() {
 		return
 	}
-	s.nodeUp[leaderIdx] = false
-	s.cluster.ResetClient()
-	s.stats.killLeaders++
-	time.Sleep(2 * time.Second)
+
+	if err := fc.cluster.StopNode(leaderIdx); err != nil {
+		fc.t.Logf("[fault] killLeader node %d: %v", leaderIdx, err)
+		return
+	}
+	fc.nodeUp[leaderIdx] = false
+	fc.cluster.ResetClient()
+	fc.stats.killLeaders.Add(1)
+	fc.t.Logf("[fault] killed leader node %d (running=%d)", leaderIdx, fc.runningCount())
 }
 
-// --- Helpers ---
+// faultLoop injects faults at regular intervals until ctx is cancelled.
+// Also prints stats every 10 seconds.
+func (fc *fuzzCluster) faultLoop(ctx context.Context, rng *rand.Rand) {
+	statsTicker := time.NewTicker(10 * time.Second)
+	defer statsTicker.Stop()
+	faultTicker := time.NewTicker(fuzzFaultInterval)
+	defer faultTicker.Stop()
 
-// pickDistinct returns n distinct random integers in [0, max).
-func (s *fuzzState) pickDistinct(n, max int) []int {
-	if n > max {
-		n = max
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-statsTicker.C:
+			fc.t.Logf("[stats] %s", &fc.stats)
+		case <-faultTicker.C:
+			op := pickFaultOp(rng)
+			switch op {
+			case fopStopNode:
+				fc.doStopNode(rng)
+			case fopRestartNode:
+				fc.doRestartNode(rng)
+			case fopKillLeader:
+				fc.doKillLeader(rng)
+			}
+		}
 	}
-	set := make(map[int]struct{}, n)
-	for len(set) < n {
-		set[s.rng.IntN(max)] = struct{}{}
-	}
-	result := make([]int, 0, n)
-	for v := range set {
-		result = append(result, v)
-	}
-	return result
-}
-
-// randomSplit splits total into n non-negative integers that sum to total.
-// Uses the "stars and bars" method: generate n-1 random breakpoints in [0, total].
-func (s *fuzzState) randomSplit(total, n int) []int {
-	if n == 1 {
-		return []int{total}
-	}
-	if total == 0 {
-		return make([]int, n)
-	}
-
-	breaks := make([]int, n-1)
-	for i := range breaks {
-		breaks[i] = s.rng.IntN(total + 1)
-	}
-	sort.Ints(breaks)
-
-	result := make([]int, n)
-	prev := 0
-	for i, b := range breaks {
-		result[i] = b - prev
-		prev = b
-	}
-	result[n-1] = total - prev
-	return result
 }
 
 // --- Main Test ---
 
 func TestFuzzCluster(t *testing.T) {
-	e2elib.SkipIfNoBinary(t, "gookv-server", "gookv-pd", "gookv-cli")
-
 	// Parse configuration from environment.
 	seed := time.Now().UnixNano()
 	if s := os.Getenv("FUZZ_SEED"); s != "" {
@@ -520,89 +620,149 @@ func TestFuzzCluster(t *testing.T) {
 			iterations = v
 		}
 	}
-	t.Logf("Fuzz seed: %d  iterations: %d", seed, iterations)
+	numClients := fuzzDefaultClients
+	if s := os.Getenv("FUZZ_CLIENTS"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			numClients = v
+		}
+	}
+	t.Logf("Fuzz seed: %d  iterations: %d  clients: %d  nodes: %d",
+		seed, iterations, numClients, fuzzNodeCount)
 
-	// Start cluster.
-	cluster := newClusterWithLeader(t)
+	// Start cluster with split config for multi-region distribution.
+	e2elib.SkipIfNoBinary(t, "gookv-server", "gookv-pd")
+	cluster := e2elib.NewGokvCluster(t, e2elib.GokvClusterConfig{
+		NumNodes:           fuzzNodeCount,
+		SplitSize:          "128KB",
+		SplitCheckInterval: "5s",
+	})
+	require.NoError(t, cluster.Start())
+	t.Cleanup(func() { cluster.Stop() })
+
+	// Wait for Raft leader election.
+	electionTimeout := time.Duration(30+fuzzNodeCount*10) * time.Second
+	rawKV := cluster.RawKV()
+	e2elib.WaitForCondition(t, electionTimeout, "cluster leader election", func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return rawKV.Put(ctx, []byte("__health__"), []byte("ok")) == nil
+	})
+
 	pdAddr := cluster.PD().Addr()
 
 	// Seed accounts.
 	t.Logf("Seeding %d accounts with initial balance %d...", fuzzNumAccounts, fuzzInitialBalance)
 	e2elib.SeedAccounts(t, cluster.TxnKV(), fuzzNumAccounts, fuzzInitialBalance)
 
-	// Verify initial invariant.
-	total, balances := e2elib.ReadAllBalances(t, cluster.TxnKV(), fuzzNumAccounts)
-	require.Equal(t, fuzzExpectedTotal, total, "initial total balance mismatch")
-	for i, b := range balances {
-		require.GreaterOrEqual(t, b, 0, "initial account-%d has negative balance", i)
+	// Wait for region splits to stabilize (no new splits for 15 seconds).
+	t.Log("Waiting for region splits to stabilize...")
+	lastCount := 0
+	stableSince := time.Now()
+	deadline := time.Now().Add(180 * time.Second)
+	for time.Now().Before(deadline) {
+		count := e2elib.CLIWaitForRegionCount(t, pdAddr, 1, 10*time.Second)
+		if count != lastCount {
+			t.Logf("Region count: %d", count)
+			lastCount = count
+			stableSince = time.Now()
+		}
+		if time.Since(stableSince) >= 15*time.Second {
+			break
+		}
+		time.Sleep(3 * time.Second)
 	}
-	t.Logf("Initial audit passed: total=%d", total)
+	t.Logf("Region splits stabilized: %d regions", lastCount)
 
-	// Initialize fuzz state.
-	state := &fuzzState{
+	// Initialize shared cluster state.
+	fc := &fuzzCluster{
 		t:       t,
 		cluster: cluster,
 		pdAddr:  pdAddr,
-		rng:     rand.New(rand.NewPCG(uint64(seed), uint64(seed>>32))),
-		nodeUp:  [fuzzNodeCount]bool{true, true, true},
+		nodeUp:  make([]bool, fuzzNodeCount),
+	}
+	for i := range fc.nodeUp {
+		fc.nodeUp[i] = true
 	}
 
-	// Chaos loop.
-	for i := 0; i < iterations; i++ {
-		op := pickOp(state.rng)
-		switch op {
-		case opTransfer:
-			state.doTransfer()
-		case opMultiTransfer:
-			state.doMultiTransfer()
-		case opAudit:
-			got, err := state.doAudit()
-			if err != nil {
-				// During chaos, transient errors are expected.
-				// Invariant violations are real failures.
-				if strings.Contains(err.Error(), "mismatch") || strings.Contains(err.Error(), "negative") {
-					t.Errorf("[iter %d] INVARIANT VIOLATION: %v", i, err)
-				} else {
-					t.Logf("[iter %d] audit skipped (transient): %v", i, err)
-				}
-			} else {
-				if i%50 == 0 {
-					t.Logf("[iter %d] audit ok: total=%d", i, got)
-				}
-			}
-		case opBatchRead:
-			state.doBatchRead()
-		case opStopNode:
-			state.doStopNode()
-		case opRestartNode:
-			state.doRestartNode()
-		case opKillLeader:
-			state.doKillLeader()
+	// Verify initial invariant. Retry because post-split leader propagation takes time.
+	initClient := &fuzzClient{fc: fc, rng: rand.New(rand.NewPCG(uint64(seed), uint64(seed>>32)))}
+	var initTotal int
+	var initErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		cluster.ResetClient()
+		initTotal, initErr = initClient.doAudit()
+		if initErr == nil {
+			break
 		}
+		t.Logf("Initial audit attempt %d: %v (retrying...)", attempt+1, initErr)
+		time.Sleep(10 * time.Second)
 	}
+	require.NoError(t, initErr, "initial audit failed after retries")
+	require.Equal(t, fuzzExpectedTotal, initTotal, "initial total balance mismatch")
+	t.Logf("Initial audit passed: total=%d", initTotal)
+
+	// Shared operation counter for all client goroutines.
+	var opsLeft atomic.Int64
+	opsLeft.Store(int64(iterations))
+
+	// Create a cancellable context so the fault loop stops when clients finish.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Launch client goroutines.
+	var wg sync.WaitGroup
+	for i := 0; i < numClients; i++ {
+		wg.Add(1)
+		c := &fuzzClient{
+			fc:  fc,
+			rng: rand.New(rand.NewPCG(uint64(seed)+uint64(i)*7919, uint64(seed>>32)+uint64(i)*6271)),
+			id:  i,
+		}
+		go func() {
+			defer wg.Done()
+			c.clientLoop(ctx, &opsLeft)
+		}()
+	}
+
+	// Launch fault injection goroutine.
+	var faultWg sync.WaitGroup
+	faultWg.Add(1)
+	go func() {
+		defer faultWg.Done()
+		faultRng := rand.New(rand.NewPCG(uint64(seed)+999983, uint64(seed>>32)+999979))
+		fc.faultLoop(ctx, faultRng)
+	}()
+
+	// Wait for all client operations to complete.
+	wg.Wait()
+	cancel() // signal fault loop to stop
+	faultWg.Wait()
+
+	t.Logf("Chaos phase complete. Stats so far: %s", &fc.stats)
 
 	// Restore all nodes.
 	t.Log("Restoring all nodes...")
-	for i := 0; i < fuzzNodeCount; i++ {
-		if !state.nodeUp[i] {
+	fc.mu.Lock()
+	for i := 0; i < len(fc.nodeUp); i++ {
+		if !fc.nodeUp[i] {
 			require.NoError(t, cluster.RestartNode(i))
-			require.NoError(t, cluster.Node(i).WaitForReady(30*time.Second))
-			state.nodeUp[i] = true
+			require.NoError(t, cluster.Node(i).WaitForReady(60*time.Second))
+			fc.nodeUp[i] = true
+			time.Sleep(2 * time.Second)
 		}
 	}
+	fc.mu.Unlock()
 	cluster.ResetClient()
 
-	// Wait for cluster stabilization via CLI (creates fresh connections).
+	// Wait for cluster stabilization via CLI.
 	e2elib.CLIWaitForCondition(t, pdAddr, "PUT __fuzz-health__ ok",
 		func(output string) bool {
 			return strings.Contains(output, "OK")
 		}, fuzzStabilizeTimeout)
 
-	// Warmup the Go client connection after fault recovery.
-	// ResetClient() cleared the cached client; the next TxnKV() call creates a fresh one.
-	// Do a lightweight txn to ensure the new client's gRPC connections are live.
+	// Warmup Go client after fault recovery.
 	cluster.ResetClient()
-	e2elib.WaitForCondition(t, 30*time.Second, "go client warmup", func() bool {
+	e2elib.WaitForCondition(t, 60*time.Second, "go client warmup", func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		txn, err := cluster.TxnKV().Begin(ctx)
@@ -614,12 +774,16 @@ func TestFuzzCluster(t *testing.T) {
 		return err == nil
 	})
 
-	// Final consistency check using doAudit (has per-operation timeouts).
+	// Final consistency check.
 	t.Log("Running final audit...")
+	auditClient := &fuzzClient{
+		fc:  fc,
+		rng: rand.New(rand.NewPCG(uint64(seed)+111, uint64(seed>>32)+222)),
+	}
 	var finalTotal int
 	var finalErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		finalTotal, finalErr = state.doAudit()
+		finalTotal, finalErr = auditClient.doAudit()
 		if finalErr == nil {
 			break
 		}
@@ -630,6 +794,6 @@ func TestFuzzCluster(t *testing.T) {
 	require.NoError(t, finalErr, "final audit failed after retries")
 	assert.Equal(t, fuzzExpectedTotal, finalTotal, "final total balance mismatch")
 
-	t.Logf("Fuzz stats: %s", state.stats)
+	t.Logf("Final stats: %s", &fc.stats)
 	t.Logf("Final audit: total=%d (expected=%d)", finalTotal, fuzzExpectedTotal)
 }

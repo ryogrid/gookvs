@@ -14,15 +14,22 @@ import (
 // newClusterWithLeader creates a 3-node cluster and waits for Raft leader election.
 func newClusterWithLeader(t *testing.T) *e2elib.GokvCluster {
 	t.Helper()
+	return newClusterWithLeaderN(t, 3)
+}
+
+// newClusterWithLeaderN creates an N-node cluster and waits for Raft leader election.
+func newClusterWithLeaderN(t *testing.T, numNodes int) *e2elib.GokvCluster {
+	t.Helper()
 	e2elib.SkipIfNoBinary(t, "gookv-server", "gookv-pd")
 
-	cluster := e2elib.NewGokvCluster(t, e2elib.GokvClusterConfig{NumNodes: 3})
+	cluster := e2elib.NewGokvCluster(t, e2elib.GokvClusterConfig{NumNodes: numNodes})
 	require.NoError(t, cluster.Start())
 	t.Cleanup(func() { cluster.Stop() })
 
-	// Wait for Raft leader election.
+	// Wait for Raft leader election. Scale timeout with node count.
+	electionTimeout := time.Duration(30+numNodes*10) * time.Second
 	rawKV := cluster.RawKV()
-	e2elib.WaitForCondition(t, 30*time.Second, "cluster leader election", func() bool {
+	e2elib.WaitForCondition(t, electionTimeout, "cluster leader election", func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		return rawKV.Put(ctx, []byte("__health__"), []byte("ok")) == nil

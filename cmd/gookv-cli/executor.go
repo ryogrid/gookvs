@@ -13,6 +13,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/ryogrid/gookv/pkg/client"
+	"github.com/ryogrid/gookv/pkg/codec"
 	"github.com/ryogrid/gookv/pkg/pdclient"
 )
 
@@ -707,13 +708,18 @@ func (e *Executor) execRegionList(ctx context.Context, cmd Command) (*Result, er
 			leaderStr,
 		})
 
-		// Advance to next region
+		// Advance to next region.
+		// endKey is memcomparable-encoded; decode to raw key for the next GetRegion call.
 		endKey := region.GetEndKey()
 		if len(endKey) == 0 {
 			// Last region (unbounded upper end)
 			break
 		}
-		key = endKey
+		rawKey, _, err := codec.DecodeBytes(endKey)
+		if err != nil {
+			break
+		}
+		key = rawKey
 	}
 
 	return &Result{
