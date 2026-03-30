@@ -646,8 +646,26 @@ func (p *Peer) handleReady() {
 		}
 	}
 
+	// Debug: log ConfChange committed entries for ALL regions.
+	for _, e := range rd.CommittedEntries {
+		if e.Type == raftpb.EntryConfChange || e.Type == raftpb.EntryConfChangeV2 {
+			slog.Info("committed ConfChange entry",
+				"region", p.regionID, "peer", p.peerID,
+				"type", e.Type, "index", e.Index, "term", e.Term)
+		}
+	}
+
 	// Send Raft messages to other peers.
 	if p.sendFunc != nil && len(rd.Messages) > 0 {
+		// Debug: trace region 1 messages to new peers.
+		if p.regionID == 1 {
+			for _, m := range rd.Messages {
+				if m.To >= 1000 {
+					slog.Info("peer.Ready: region 1 msg to new peer",
+						"to", m.To, "type", m.Type, "from", p.peerID)
+				}
+			}
+		}
 		p.sendFunc(rd.Messages)
 	}
 

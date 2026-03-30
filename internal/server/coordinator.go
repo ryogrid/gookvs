@@ -940,6 +940,13 @@ func (sc *StoreCoordinator) sendRaftMessage(regionID uint64, region *metapb.Regi
 		return
 	}
 
+	// Debug: trace region 1 messages to newly added peers (ID >= 1000).
+	if regionID == 1 && msg.To >= 1000 {
+		slog.Info("sendRaftMessage: region 1 → new peer",
+			"msgTo", msg.To, "toStore", toStoreID, "msgType", msg.Type,
+			"fromPeer", fromPeerID, "selfStore", sc.storeID)
+	}
+
 	// Loopback: if target peer is on this store, deliver directly via router
 	// instead of gRPC. This is critical for ReadIndex (ReadOnlySafe mode)
 	// which requires heartbeat responses from local follower peers.

@@ -3,6 +3,7 @@ package raftstore
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"go.etcd.io/etcd/raft/v3/raftpb"
@@ -31,13 +32,21 @@ type ChangePeerResult struct {
 // applyConfChangeEntry processes a committed conf change entry and updates
 // region metadata accordingly. Returns a ChangePeerResult, or nil if no action taken.
 func (p *Peer) applyConfChangeEntry(e raftpb.Entry) *ChangePeerResult {
+	slog.Info("applyConfChangeEntry called", "region", p.regionID, "entryType", e.Type, "index", e.Index)
 	if e.Type == raftpb.EntryConfChange {
 		var cc raftpb.ConfChange
 		if err := cc.Unmarshal(e.Data); err != nil {
 			return nil
 		}
 		p.rawNode.ApplyConfChange(cc)
-		return p.processConfChange(cc.Type, cc.NodeID, e.Index, cc.Context)
+		result := p.processConfChange(cc.Type, cc.NodeID, e.Index, cc.Context)
+		if p.regionID == 1 {
+			slog.Info("region 1 ConfChange applied",
+				"type", cc.Type, "nodeID", cc.NodeID,
+				"peers", len(result.Region.GetPeers()),
+				"isLeader", p.isLeader.Load(), "myPeer", p.peerID)
+		}
+		return result
 
 	} else if e.Type == raftpb.EntryConfChangeV2 {
 		var cc raftpb.ConfChangeV2
