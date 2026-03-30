@@ -120,13 +120,16 @@ func (n *GokvNode) Start() error {
 		args = append(args, "--config", n.configPath)
 	}
 
+	// Direct slog output to the same file as stdout/stderr for unified logging.
+	args = append(args, "--log-file", n.logPath)
+
 	args = append(args, n.cfg.ExtraFlags...)
 
 	n.cmd = exec.Command(binary, args...)
 
-	lf, err := os.Create(n.logPath)
+	lf, err := os.OpenFile(n.logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 	if err != nil {
-		return fmt.Errorf("e2elib: create server log file: %w", err)
+		return fmt.Errorf("e2elib: open server log file: %w", err)
 	}
 	n.cmd.Stdout = lf
 	n.cmd.Stderr = lf
