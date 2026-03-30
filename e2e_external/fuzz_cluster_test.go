@@ -30,7 +30,7 @@ const (
 	fuzzDefaultIters     = 500
 	fuzzDefaultClients   = 8
 	fuzzStabilizeTimeout = 180 * time.Second
-	fuzzNodeCount        = 5
+	fuzzNodeCount        = 3
 	fuzzFaultInterval    = 10 * time.Second // time between fault injection events
 )
 

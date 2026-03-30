@@ -185,8 +185,12 @@ func (p *Peer) applySplitAdminEntry(e *raftpb.Entry) {
 		return
 	}
 
-	// Send result to coordinator for child region bootstrapping (leader only).
-	if p.isLeader.Load() && p.splitResultCh != nil {
+	// Send result to coordinator for child region bootstrapping.
+	// All replicas (not just the leader) must bootstrap child regions so that
+	// the new Raft group can establish quorum. Without this, the leader sends
+	// heartbeats to follower peers that don't exist, ReadIndex can't confirm
+	// quorum, and reads time out.
+	if p.splitResultCh != nil {
 		select {
 		case p.splitResultCh <- result:
 		default:
