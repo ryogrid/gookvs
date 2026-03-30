@@ -14,6 +14,11 @@ import (
 // snapshot and join the Raft group.
 const stabilizeHeartbeats = 3
 
+// moveCooldownHeartbeats is the number of heartbeat cycles after a move completes
+// during which the same region cannot be the target of another balance move.
+// This prevents continuous peer shuffling when multiple stores are underloaded.
+const moveCooldownHeartbeats = 10
+
 // MoveState tracks the current stage of a region move.
 type MoveState int
 
@@ -51,10 +56,18 @@ type PendingMove struct {
 	StabilizeCount int // heartbeat cycles spent in MoveStateStabilizing
 }
 
+// moveCooldown tracks a recently completed move for cooldown enforcement.
+type moveCooldown struct {
+	completedAt    int // heartbeat counter at completion
+	cooldownExpiry int // heartbeat counter when cooldown expires
+}
+
 // MoveTracker tracks in-progress region moves across heartbeat cycles.
 type MoveTracker struct {
-	mu    sync.Mutex
-	moves map[uint64]*PendingMove // regionID -> pending move
+	mu             sync.Mutex
+	moves          map[uint64]*PendingMove // regionID -> pending move
+	cooldowns      map[uint64]*moveCooldown // regionID -> cooldown after completion
+	heartbeatCount int                      // global heartbeat counter
 }
 
 // Compile-time check that MoveTracker implements MoveTrackerInterface.
@@ -63,7 +76,8 @@ var _ MoveTrackerInterface = (*MoveTracker)(nil)
 // NewMoveTracker creates a new MoveTracker.
 func NewMoveTracker() *MoveTracker {
 	return &MoveTracker{
-		moves: make(map[uint64]*PendingMove),
+		moves:     make(map[uint64]*PendingMove),
+		cooldowns: make(map[uint64]*moveCooldown),
 	}
 }
 
@@ -80,12 +94,21 @@ func (t *MoveTracker) StartMove(regionID uint64, sourcePeer *metapb.Peer, target
 	}
 }
 
-// HasPendingMove returns true if the given region has an in-progress move.
+// HasPendingMove returns true if the given region has an in-progress move
+// or is in a post-move cooldown period.
 func (t *MoveTracker) HasPendingMove(regionID uint64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	_, ok := t.moves[regionID]
-	return ok
+	if _, ok := t.moves[regionID]; ok {
+		return true
+	}
+	if cd, ok := t.cooldowns[regionID]; ok {
+		if t.heartbeatCount < cd.cooldownExpiry {
+			return true // still in cooldown
+		}
+		delete(t.cooldowns, regionID) // cooldown expired
+	}
+	return false
 }
 
 // ActiveMoveCount returns the number of in-progress moves.
@@ -105,6 +128,8 @@ func (t *MoveTracker) Advance(regionID uint64, region *metapb.Region, leader *me
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	t.heartbeatCount++
 
 	move, ok := t.moves[regionID]
 	if !ok {
@@ -196,8 +221,13 @@ func (t *MoveTracker) Advance(regionID uint64, region *metapb.Region, leader *me
 
 	case MoveStateRemoving:
 		if !hasPeerOnStore(region, move.SourcePeer.GetStoreId()) {
-			// Source peer is gone — move complete.
+			// Source peer is gone — move complete. Enter cooldown to prevent
+			// the scheduler from immediately starting another move for this region.
 			delete(t.moves, regionID)
+			t.cooldowns[regionID] = &moveCooldown{
+				completedAt:    t.heartbeatCount,
+				cooldownExpiry: t.heartbeatCount + moveCooldownHeartbeats,
+			}
 			return nil
 		}
 		// Source peer still present — retry RemoveNode.

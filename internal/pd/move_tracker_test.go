@@ -96,7 +96,8 @@ func TestMoveTracker_FullCycle(t *testing.T) {
 	}
 	cmd = tracker.Advance(100, region, newLeader)
 	assert.Nil(t, cmd, "should return nil when move is complete")
-	assert.False(t, tracker.HasPendingMove(100))
+	// Move is complete but region is in cooldown — HasPendingMove still true.
+	assert.True(t, tracker.HasPendingMove(100), "should be in cooldown after completion")
 	assert.Equal(t, 0, tracker.ActiveMoveCount())
 }
 
@@ -149,7 +150,51 @@ func TestMoveTracker_SourceNotLeader(t *testing.T) {
 	}
 	cmd = tracker.Advance(100, region, leader)
 	assert.Nil(t, cmd, "should return nil when move is complete")
-	assert.False(t, tracker.HasPendingMove(100))
+	assert.True(t, tracker.HasPendingMove(100), "should be in cooldown after completion")
+}
+
+func TestMoveTracker_CooldownExpiry(t *testing.T) {
+	// After a move completes, HasPendingMove should return true during cooldown
+	// and false after cooldown expires.
+	tracker := NewMoveTracker()
+	sourcePeer := &metapb.Peer{Id: 10, StoreId: 1}
+	tracker.StartMove(100, sourcePeer, 3)
+
+	region := &metapb.Region{
+		Id: 100,
+		Peers: []*metapb.Peer{
+			{Id: 10, StoreId: 1},
+			{Id: 20, StoreId: 2},
+			{Id: 30, StoreId: 3},
+		},
+	}
+	leader := &metapb.Peer{Id: 20, StoreId: 2}
+
+	// Adding → Stabilizing.
+	tracker.Advance(100, region, leader)
+	// Drive through stabilization.
+	advanceStabilizing(t, tracker, 100, region, leader)
+	// Stabilization → Removing (source not leader).
+	tracker.Advance(100, region, leader)
+	// Source peer removed → complete + cooldown.
+	regionAfter := &metapb.Region{
+		Id:    100,
+		Peers: []*metapb.Peer{{Id: 20, StoreId: 2}, {Id: 30, StoreId: 3}},
+	}
+	tracker.Advance(100, regionAfter, leader)
+
+	// Should be in cooldown.
+	assert.True(t, tracker.HasPendingMove(100), "should be in cooldown")
+	assert.Equal(t, 0, tracker.ActiveMoveCount())
+
+	// Advance enough times to expire the cooldown (each Advance increments heartbeatCount).
+	// Need to advance with a different region to tick the counter without affecting region 100's move.
+	for i := 0; i < moveCooldownHeartbeats+1; i++ {
+		tracker.Advance(999, &metapb.Region{Id: 999}, nil) // tick counter
+	}
+
+	// Cooldown should have expired.
+	assert.False(t, tracker.HasPendingMove(100), "cooldown should have expired")
 }
 
 func TestMoveTracker_StabilizingWait(t *testing.T) {
