@@ -1,0 +1,1792 @@
+.
+├── cmd
+│   ├── build.rs
+│   ├── tikv-ctl
+│   │   ├── build.rs
+│   │   └── src
+│   │       ├── cmd.rs
+│   │       ├── executor.rs
+│   │       ├── fork_readonly_tikv.rs
+│   │       ├── main.rs
+│   │       └── util.rs
+│   └── tikv-server
+│       ├── build.rs
+│       └── src
+│           └── main.rs
+├── components
+│   ├── api_version
+│   │   └── src
+│   │       ├── api_v1.rs
+│   │       ├── api_v1ttl.rs
+│   │       ├── api_v2.rs
+│   │       ├── keyspace.rs
+│   │       └── lib.rs
+│   ├── backup
+│   │   └── src
+│   │       ├── disk_snap.rs
+│   │       ├── endpoint.rs
+│   │       ├── errors.rs
+│   │       ├── lib.rs
+│   │       ├── metrics.rs
+│   │       ├── service.rs
+│   │       ├── softlimit.rs
+│   │       ├── utils.rs
+│   │       └── writer.rs
+│   ├── backup-stream
+│   │   ├── src
+│   │   │   ├── checkpoint_manager.rs
+│   │   │   ├── config.rs
+│   │   │   ├── endpoint.rs
+│   │   │   ├── errors.rs
+│   │   │   ├── event_loader.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── metadata
+│   │   │   │   ├── checkpoint_cache.rs
+│   │   │   │   ├── client.rs
+│   │   │   │   ├── keys.rs
+│   │   │   │   ├── metrics.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── store
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   ├── pd.rs
+│   │   │   │   │   └── slash_etc.rs
+│   │   │   │   └── test.rs
+│   │   │   ├── metrics.rs
+│   │   │   ├── observer.rs
+│   │   │   ├── router.rs
+│   │   │   ├── service.rs
+│   │   │   ├── subscription_manager.rs
+│   │   │   ├── subscription_track.rs
+│   │   │   ├── tempfiles.rs
+│   │   │   └── utils.rs
+│   │   └── tests
+│   │       ├── failpoints
+│   │       │   └── mod.rs
+│   │       ├── integration
+│   │       │   └── mod.rs
+│   │       └── suite.rs
+│   ├── batch-system
+│   │   ├── benches
+│   │   │   ├── batch-system.rs
+│   │   │   └── router.rs
+│   │   ├── src
+│   │   │   ├── batch.rs
+│   │   │   ├── config.rs
+│   │   │   ├── fsm.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── mailbox.rs
+│   │   │   ├── metrics.rs
+│   │   │   ├── router.rs
+│   │   │   ├── scheduler.rs
+│   │   │   └── test_runner.rs
+│   │   └── tests
+│   │       └── cases
+│   │           ├── batch.rs
+│   │           ├── mod.rs
+│   │           └── router.rs
+│   ├── causal_ts
+│   │   ├── benches
+│   │   │   └── tso.rs
+│   │   └── src
+│   │       ├── config.rs
+│   │       ├── errors.rs
+│   │       ├── lib.rs
+│   │       ├── metrics.rs
+│   │       └── tso.rs
+│   ├── cdc
+│   │   ├── benches
+│   │   │   └── cdc_event.rs
+│   │   ├── src
+│   │   │   ├── channel.rs
+│   │   │   ├── config.rs
+│   │   │   ├── delegate.rs
+│   │   │   ├── endpoint.rs
+│   │   │   ├── errors.rs
+│   │   │   ├── initializer.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── metrics.rs
+│   │   │   ├── observer.rs
+│   │   │   ├── old_value.rs
+│   │   │   ├── service.rs
+│   │   │   └── txn_source.rs
+│   │   └── tests
+│   │       ├── failpoints
+│   │       │   ├── mod.rs
+│   │       │   ├── test_endpoint.rs
+│   │       │   ├── test_memory_quota.rs
+│   │       │   ├── test_observe.rs
+│   │       │   ├── test_register.rs
+│   │       │   └── test_resolve.rs
+│   │       ├── integrations
+│   │       │   ├── mod.rs
+│   │       │   ├── test_cdc.rs
+│   │       │   └── test_flow_control.rs
+│   │       └── mod.rs
+│   ├── cloud
+│   │   ├── aws
+│   │   │   └── src
+│   │   │       ├── kms.rs
+│   │   │       ├── lib.rs
+│   │   │       ├── s3.rs
+│   │   │       └── util.rs
+│   │   ├── azure
+│   │   │   └── src
+│   │   │       ├── azblob.rs
+│   │   │       ├── kms.rs
+│   │   │       ├── lib.rs
+│   │   │       └── token_credentials
+│   │   │           ├── certificate_credentials.rs
+│   │   │           └── mod.rs
+│   │   ├── gcp
+│   │   │   └── src
+│   │   │       ├── client.rs
+│   │   │       ├── gcs.rs
+│   │   │       ├── kms.rs
+│   │   │       └── lib.rs
+│   │   └── src
+│   │       ├── blob.rs
+│   │       ├── error.rs
+│   │       ├── kms.rs
+│   │       ├── lib.rs
+│   │       └── metrics.rs
+│   ├── codec
+│   │   └── src
+│   │       ├── buffer.rs
+│   │       ├── byte.rs
+│   │       ├── convert.rs
+│   │       ├── error.rs
+│   │       ├── lib.rs
+│   │       └── number.rs
+│   ├── collections
+│   │   └── src
+│   │       └── lib.rs
+│   ├── compact-log-backup
+│   │   └── src
+│   │       ├── compaction
+│   │       │   ├── collector.rs
+│   │       │   ├── exec.rs
+│   │       │   ├── meta.rs
+│   │       │   └── mod.rs
+│   │       ├── errors.rs
+│   │       ├── exec_hooks
+│   │       │   ├── checkpoint.rs
+│   │       │   ├── consistency.rs
+│   │       │   ├── mod.rs
+│   │       │   ├── observability.rs
+│   │       │   ├── save_meta.rs
+│   │       │   └── skip_small_compaction.rs
+│   │       ├── execute
+│   │       │   ├── hooking.rs
+│   │       │   ├── mod.rs
+│   │       │   └── test.rs
+│   │       ├── lib.rs
+│   │       ├── source.rs
+│   │       ├── statistic.rs
+│   │       ├── storage.rs
+│   │       ├── test_util.rs
+│   │       └── util.rs
+│   ├── concurrency_manager
+│   │   ├── benches
+│   │   │   ├── lock_table.rs
+│   │   │   └── update_max_ts.rs
+│   │   ├── src
+│   │   │   ├── key_handle.rs
+│   │   │   ├── lib.rs
+│   │   │   └── lock_table.rs
+│   │   └── tests
+│   │       └── memory_usage.rs
+│   ├── coprocessor_plugin_api
+│   │   ├── build.rs
+│   │   └── src
+│   │       ├── allocator.rs
+│   │       ├── errors.rs
+│   │       ├── lib.rs
+│   │       ├── plugin_api.rs
+│   │       ├── storage_api.rs
+│   │       └── util.rs
+│   ├── crossbeam-skiplist
+│   │   ├── benches
+│   │   │   ├── btree.rs
+│   │   │   ├── hash.rs
+│   │   │   ├── skiplist.rs
+│   │   │   └── skipmap.rs
+│   │   ├── examples
+│   │   │   └── simple.rs
+│   │   ├── src
+│   │   │   ├── base.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── map.rs
+│   │   │   └── set.rs
+│   │   └── tests
+│   │       ├── base.rs
+│   │       ├── map.rs
+│   │       └── set.rs
+│   ├── crypto
+│   │   ├── build.rs
+│   │   └── src
+│   │       ├── fips.rs
+│   │       ├── lib.rs
+│   │       └── rand.rs
+│   ├── encryption
+│   │   ├── export
+│   │   │   ├── examples
+│   │   │   │   └── ecli.rs
+│   │   │   └── src
+│   │   │       └── lib.rs
+│   │   └── src
+│   │       ├── backup
+│   │       │   ├── backup_encryption.rs
+│   │       │   └── mod.rs
+│   │       ├── config.rs
+│   │       ├── crypter.rs
+│   │       ├── encrypted_file
+│   │       │   ├── header.rs
+│   │       │   └── mod.rs
+│   │       ├── errors.rs
+│   │       ├── file_dict_file.rs
+│   │       ├── io.rs
+│   │       ├── lib.rs
+│   │       ├── manager
+│   │       │   └── mod.rs
+│   │       ├── master_key
+│   │       │   ├── file.rs
+│   │       │   ├── kms.rs
+│   │       │   ├── mem.rs
+│   │       │   ├── metadata.rs
+│   │       │   └── mod.rs
+│   │       ├── metrics.rs
+│   │       └── test_utils.rs
+│   ├── engine_panic
+│   │   └── src
+│   │       ├── cf_names.rs
+│   │       ├── cf_options.rs
+│   │       ├── checkpoint.rs
+│   │       ├── compact.rs
+│   │       ├── db_options.rs
+│   │       ├── db_vector.rs
+│   │       ├── engine.rs
+│   │       ├── flow_control_factors.rs
+│   │       ├── import.rs
+│   │       ├── io_limiter.rs
+│   │       ├── lib.rs
+│   │       ├── misc.rs
+│   │       ├── mvcc_properties.rs
+│   │       ├── perf_context.rs
+│   │       ├── raft_engine.rs
+│   │       ├── range_properties.rs
+│   │       ├── snapshot.rs
+│   │       ├── sst.rs
+│   │       ├── table_properties.rs
+│   │       ├── ttl_properties.rs
+│   │       └── write_batch.rs
+│   ├── engine_rocks
+│   │   └── src
+│   │       ├── cf_names.rs
+│   │       ├── cf_options.rs
+│   │       ├── checkpoint.rs
+│   │       ├── compact.rs
+│   │       ├── compact_listener.rs
+│   │       ├── config.rs
+│   │       ├── db_options.rs
+│   │       ├── db_vector.rs
+│   │       ├── decode_properties.rs
+│   │       ├── encryption.rs
+│   │       ├── engine.rs
+│   │       ├── engine_iterator.rs
+│   │       ├── event_listener.rs
+│   │       ├── file_system.rs
+│   │       ├── flow_control_factors.rs
+│   │       ├── flow_listener.rs
+│   │       ├── import.rs
+│   │       ├── lib.rs
+│   │       ├── logger.rs
+│   │       ├── misc.rs
+│   │       ├── mvcc_properties.rs
+│   │       ├── options.rs
+│   │       ├── perf_context.rs
+│   │       ├── perf_context_impl.rs
+│   │       ├── perf_context_metrics.rs
+│   │       ├── properties.rs
+│   │       ├── raft_engine.rs
+│   │       ├── range_properties.rs
+│   │       ├── raw.rs
+│   │       ├── rocks_metrics.rs
+│   │       ├── rocks_metrics_defs.rs
+│   │       ├── snapshot.rs
+│   │       ├── sst.rs
+│   │       ├── sst_partitioner.rs
+│   │       ├── status.rs
+│   │       ├── table_properties.rs
+│   │       ├── ttl_properties.rs
+│   │       ├── util.rs
+│   │       └── write_batch.rs
+│   ├── engine_rocks_helper
+│   │   └── src
+│   │       ├── lib.rs
+│   │       ├── metric.rs
+│   │       └── sst_recovery.rs
+│   ├── engine_test
+│   │   └── src
+│   │       └── lib.rs
+│   ├── engine_tirocks
+│   │   └── src
+│   │       ├── cf_options.rs
+│   │       ├── db_options.rs
+│   │       ├── db_vector.rs
+│   │       ├── engine.rs
+│   │       ├── engine_iterator.rs
+│   │       ├── lib.rs
+│   │       ├── logger.rs
+│   │       ├── perf_context.rs
+│   │       ├── properties
+│   │       │   ├── mod.rs
+│   │       │   ├── mvcc.rs
+│   │       │   ├── range.rs
+│   │       │   ├── table.rs
+│   │       │   └── ttl.rs
+│   │       ├── snapshot.rs
+│   │       ├── status.rs
+│   │       ├── util.rs
+│   │       └── write_batch.rs
+│   ├── engine_traits
+│   │   └── src
+│   │       ├── cf_defs.rs
+│   │       ├── cf_names.rs
+│   │       ├── cf_options.rs
+│   │       ├── checkpoint.rs
+│   │       ├── compact.rs
+│   │       ├── compaction_job.rs
+│   │       ├── db_options.rs
+│   │       ├── db_vector.rs
+│   │       ├── engine.rs
+│   │       ├── engines.rs
+│   │       ├── errors.rs
+│   │       ├── file_system.rs
+│   │       ├── flow_control_factors.rs
+│   │       ├── flush.rs
+│   │       ├── import.rs
+│   │       ├── iterable.rs
+│   │       ├── lib.rs
+│   │       ├── misc.rs
+│   │       ├── mutable.rs
+│   │       ├── mvcc_properties.rs
+│   │       ├── options.rs
+│   │       ├── peekable.rs
+│   │       ├── perf_context.rs
+│   │       ├── raft_engine.rs
+│   │       ├── range.rs
+│   │       ├── range_properties.rs
+│   │       ├── raw_ttl.rs
+│   │       ├── region_cache_engine.rs
+│   │       ├── snapshot.rs
+│   │       ├── snapshot_misc.rs
+│   │       ├── sst.rs
+│   │       ├── sst_partitioner.rs
+│   │       ├── table_properties.rs
+│   │       ├── tablet.rs
+│   │       ├── ttl_properties.rs
+│   │       ├── util.rs
+│   │       └── write_batch.rs
+│   ├── engine_traits_tests
+│   │   └── src
+│   │       ├── basic_read_write.rs
+│   │       ├── cf_names.rs
+│   │       ├── checkpoint.rs
+│   │       ├── ctor.rs
+│   │       ├── delete_range.rs
+│   │       ├── iterator.rs
+│   │       ├── lib.rs
+│   │       ├── misc.rs
+│   │       ├── read_consistency.rs
+│   │       ├── scenario_writes.rs
+│   │       ├── snapshot_basic.rs
+│   │       ├── sst.rs
+│   │       └── write_batch.rs
+│   ├── error_code
+│   │   ├── bin.rs
+│   │   └── src
+│   │       ├── backup_stream.rs
+│   │       ├── causal_ts.rs
+│   │       ├── cloud.rs
+│   │       ├── codec.rs
+│   │       ├── coprocessor.rs
+│   │       ├── encryption.rs
+│   │       ├── engine.rs
+│   │       ├── lib.rs
+│   │       ├── pd.rs
+│   │       ├── raft.rs
+│   │       ├── raftstore.rs
+│   │       ├── sst_importer.rs
+│   │       └── storage.rs
+│   ├── external_storage
+│   │   ├── examples
+│   │   │   └── scli.rs
+│   │   └── src
+│   │       ├── export.rs
+│   │       ├── hdfs.rs
+│   │       ├── lib.rs
+│   │       ├── local.rs
+│   │       ├── locking.rs
+│   │       ├── metrics.rs
+│   │       └── noop.rs
+│   ├── file_system
+│   │   └── src
+│   │       ├── file.rs
+│   │       ├── io_stats
+│   │       │   ├── biosnoop.rs
+│   │       │   ├── mod.rs
+│   │       │   └── proc.rs
+│   │       ├── lib.rs
+│   │       ├── metrics.rs
+│   │       ├── metrics_manager.rs
+│   │       └── rate_limiter.rs
+│   ├── health_controller
+│   │   └── src
+│   │       ├── lib.rs
+│   │       ├── reporters.rs
+│   │       ├── slow_score.rs
+│   │       ├── trend.rs
+│   │       └── types.rs
+│   ├── hybrid_engine
+│   │   └── src
+│   │       ├── db_vector.rs
+│   │       ├── engine.rs
+│   │       ├── engine_iterator.rs
+│   │       ├── lib.rs
+│   │       ├── metrics.rs
+│   │       ├── observer
+│   │       │   ├── load_eviction.rs
+│   │       │   ├── mod.rs
+│   │       │   ├── snapshot.rs
+│   │       │   ├── test_write_batch.rs
+│   │       │   └── write_batch.rs
+│   │       ├── snapshot.rs
+│   │       └── util.rs
+│   ├── in_memory_engine
+│   │   ├── benches
+│   │   │   └── load_region.rs
+│   │   ├── src
+│   │   │   ├── background.rs
+│   │   │   ├── config.rs
+│   │   │   ├── cross_check.rs
+│   │   │   ├── engine.rs
+│   │   │   ├── keys.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── memory_controller.rs
+│   │   │   ├── memory_usage_test.rs
+│   │   │   ├── metrics.rs
+│   │   │   ├── perf_context.rs
+│   │   │   ├── prop_test.rs
+│   │   │   ├── read.rs
+│   │   │   ├── region_label.rs
+│   │   │   ├── region_manager.rs
+│   │   │   ├── region_stats.rs
+│   │   │   ├── statistics.rs
+│   │   │   ├── test_util.rs
+│   │   │   └── write_batch.rs
+│   │   └── tests
+│   │       └── failpoints
+│   │           ├── mod.rs
+│   │           └── test_memory_engine.rs
+│   ├── into_other
+│   │   └── src
+│   │       └── lib.rs
+│   ├── keys
+│   │   └── src
+│   │       ├── lib.rs
+│   │       └── rewrite.rs
+│   ├── log_wrappers
+│   │   └── src
+│   │       ├── hex.rs
+│   │       ├── lib.rs
+│   │       └── test_util.rs
+│   ├── memory_trace_macros
+│   │   └── src
+│   │       └── lib.rs
+│   ├── online_config
+│   │   ├── online_config_derive
+│   │   │   └── src
+│   │   │       └── lib.rs
+│   │   └── src
+│   │       └── lib.rs
+│   ├── panic_hook
+│   │   └── src
+│   │       └── lib.rs
+│   ├── pd_client
+│   │   └── src
+│   │       ├── client.rs
+│   │       ├── client_v2.rs
+│   │       ├── config.rs
+│   │       ├── errors.rs
+│   │       ├── feature_gate.rs
+│   │       ├── lib.rs
+│   │       ├── meta_storage.rs
+│   │       ├── metrics.rs
+│   │       ├── tso.rs
+│   │       └── util.rs
+│   ├── profiler
+│   │   ├── examples
+│   │   │   └── prime.rs
+│   │   └── src
+│   │       ├── lib.rs
+│   │       ├── profiler_dummy.rs
+│   │       └── profiler_unix.rs
+│   ├── raft_log_engine
+│   │   └── src
+│   │       ├── engine.rs
+│   │       ├── lib.rs
+│   │       └── perf_context.rs
+│   ├── raftstore
+│   │   └── src
+│   │       ├── compacted_event_sender.rs
+│   │       ├── coprocessor
+│   │       │   ├── config.rs
+│   │       │   ├── consistency_check.rs
+│   │       │   ├── dispatcher.rs
+│   │       │   ├── error.rs
+│   │       │   ├── metrics.rs
+│   │       │   ├── mod.rs
+│   │       │   ├── read_write
+│   │       │   │   ├── mod.rs
+│   │       │   │   ├── snapshot.rs
+│   │       │   │   └── write_batch.rs
+│   │       │   ├── region_info_accessor.rs
+│   │       │   ├── split_check
+│   │       │   │   ├── half.rs
+│   │       │   │   ├── keys.rs
+│   │       │   │   ├── mod.rs
+│   │       │   │   ├── size.rs
+│   │       │   │   └── table.rs
+│   │       │   └── split_observer.rs
+│   │       ├── errors.rs
+│   │       ├── lib.rs
+│   │       ├── router.rs
+│   │       └── store
+│   │           ├── async_io
+│   │           │   ├── mod.rs
+│   │           │   ├── read.rs
+│   │           │   ├── write.rs
+│   │           │   ├── write_router.rs
+│   │           │   └── write_tests.rs
+│   │           ├── bootstrap.rs
+│   │           ├── cmd_resp.rs
+│   │           ├── compaction_guard.rs
+│   │           ├── config.rs
+│   │           ├── entry_storage.rs
+│   │           ├── fsm
+│   │           │   ├── apply.rs
+│   │           │   ├── life.rs
+│   │           │   ├── metrics.rs
+│   │           │   ├── mod.rs
+│   │           │   ├── peer.rs
+│   │           │   └── store.rs
+│   │           ├── hibernate_state.rs
+│   │           ├── local_metrics.rs
+│   │           ├── memory.rs
+│   │           ├── metrics.rs
+│   │           ├── mod.rs
+│   │           ├── msg.rs
+│   │           ├── peer.rs
+│   │           ├── peer_storage.rs
+│   │           ├── read_queue.rs
+│   │           ├── region_meta.rs
+│   │           ├── region_snapshot.rs
+│   │           ├── replication_mode.rs
+│   │           ├── simple_write.rs
+│   │           ├── snap
+│   │           │   └── io.rs
+│   │           ├── snap.rs
+│   │           ├── snapshot_backup.rs
+│   │           ├── transport.rs
+│   │           ├── txn_ext.rs
+│   │           ├── unsafe_recovery.rs
+│   │           ├── util.rs
+│   │           └── worker
+│   │               ├── check_leader.rs
+│   │               ├── cleanup.rs
+│   │               ├── cleanup_snapshot.rs
+│   │               ├── cleanup_sst.rs
+│   │               ├── compact.rs
+│   │               ├── consistency_check.rs
+│   │               ├── disk_check.rs
+│   │               ├── metrics.rs
+│   │               ├── mod.rs
+│   │               ├── pd.rs
+│   │               ├── raftlog_gc.rs
+│   │               ├── read.rs
+│   │               ├── refresh_config.rs
+│   │               ├── region.rs
+│   │               ├── snap_gen.rs
+│   │               ├── split_check.rs
+│   │               ├── split_config.rs
+│   │               ├── split_controller.rs
+│   │               └── split_validator.rs
+│   ├── raftstore-v2
+│   │   ├── src
+│   │   │   ├── batch
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── store.rs
+│   │   │   ├── bootstrap.rs
+│   │   │   ├── fsm
+│   │   │   │   ├── apply.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── peer.rs
+│   │   │   │   └── store.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── operation
+│   │   │   │   ├── bucket.rs
+│   │   │   │   ├── command
+│   │   │   │   │   ├── admin
+│   │   │   │   │   │   ├── compact_log.rs
+│   │   │   │   │   │   ├── conf_change.rs
+│   │   │   │   │   │   ├── flashback.rs
+│   │   │   │   │   │   ├── merge
+│   │   │   │   │   │   │   ├── commit.rs
+│   │   │   │   │   │   │   ├── mod.rs
+│   │   │   │   │   │   │   ├── prepare.rs
+│   │   │   │   │   │   │   └── rollback.rs
+│   │   │   │   │   │   ├── mod.rs
+│   │   │   │   │   │   ├── split.rs
+│   │   │   │   │   │   └── transfer_leader.rs
+│   │   │   │   │   ├── control.rs
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   └── write
+│   │   │   │   │       ├── ingest.rs
+│   │   │   │   │       └── mod.rs
+│   │   │   │   ├── disk_snapshot_backup.rs
+│   │   │   │   ├── life.rs
+│   │   │   │   ├── misc.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── pd.rs
+│   │   │   │   ├── query
+│   │   │   │   │   ├── capture.rs
+│   │   │   │   │   ├── lease.rs
+│   │   │   │   │   ├── local.rs
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   └── replica.rs
+│   │   │   │   ├── ready
+│   │   │   │   │   ├── apply_trace.rs
+│   │   │   │   │   ├── async_writer.rs
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   └── snapshot.rs
+│   │   │   │   ├── txn_ext.rs
+│   │   │   │   └── unsafe_recovery
+│   │   │   │       ├── create.rs
+│   │   │   │       ├── demote.rs
+│   │   │   │       ├── destroy.rs
+│   │   │   │       ├── force_leader.rs
+│   │   │   │       ├── mod.rs
+│   │   │   │       └── report.rs
+│   │   │   ├── raft
+│   │   │   │   ├── apply.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── peer.rs
+│   │   │   │   └── storage.rs
+│   │   │   ├── router
+│   │   │   │   ├── imp.rs
+│   │   │   │   ├── internal_message.rs
+│   │   │   │   ├── message.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── response_channel.rs
+│   │   │   └── worker
+│   │   │       ├── mod.rs
+│   │   │       ├── pd
+│   │   │       │   ├── misc.rs
+│   │   │       │   ├── mod.rs
+│   │   │       │   ├── region.rs
+│   │   │       │   ├── slowness.rs
+│   │   │       │   ├── split.rs
+│   │   │       │   └── store.rs
+│   │   │       ├── refresh_config.rs
+│   │   │       └── tablet.rs
+│   │   └── tests
+│   │       ├── failpoints
+│   │       │   ├── mod.rs
+│   │       │   ├── test_basic_write.rs
+│   │       │   ├── test_bootstrap.rs
+│   │       │   ├── test_bucket.rs
+│   │       │   ├── test_life.rs
+│   │       │   ├── test_merge.rs
+│   │       │   ├── test_pd_heartbeat.rs
+│   │       │   ├── test_split.rs
+│   │       │   └── test_trace_apply.rs
+│   │       └── integrations
+│   │           ├── cluster.rs
+│   │           ├── mod.rs
+│   │           ├── test_basic_write.rs
+│   │           ├── test_conf_change.rs
+│   │           ├── test_life.rs
+│   │           ├── test_merge.rs
+│   │           ├── test_pd_heartbeat.rs
+│   │           ├── test_read.rs
+│   │           ├── test_split.rs
+│   │           ├── test_status.rs
+│   │           ├── test_trace_apply.rs
+│   │           └── test_transfer_leader.rs
+│   ├── resolved_ts
+│   │   ├── src
+│   │   │   ├── advance.rs
+│   │   │   ├── cmd.rs
+│   │   │   ├── endpoint.rs
+│   │   │   ├── errors.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── metrics.rs
+│   │   │   ├── observer.rs
+│   │   │   ├── resolver.rs
+│   │   │   └── scanner.rs
+│   │   └── tests
+│   │       ├── failpoints
+│   │       │   └── mod.rs
+│   │       ├── integrations
+│   │       │   └── mod.rs
+│   │       └── mod.rs
+│   ├── resource_control
+│   │   └── src
+│   │       ├── channel.rs
+│   │       ├── config.rs
+│   │       ├── future.rs
+│   │       ├── lib.rs
+│   │       ├── metrics.rs
+│   │       ├── resource_group.rs
+│   │       ├── resource_limiter.rs
+│   │       ├── service.rs
+│   │       └── worker.rs
+│   ├── resource_metering
+│   │   ├── src
+│   │   │   ├── collector.rs
+│   │   │   ├── config.rs
+│   │   │   ├── error.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── metrics.rs
+│   │   │   ├── model.rs
+│   │   │   ├── recorder
+│   │   │   │   ├── collector_reg.rs
+│   │   │   │   ├── localstorage.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── sub_recorder
+│   │   │   │       ├── cpu.rs
+│   │   │   │       ├── mod.rs
+│   │   │   │       └── summary.rs
+│   │   │   └── reporter
+│   │   │       ├── collector_impl.rs
+│   │   │       ├── data_sink.rs
+│   │   │       ├── data_sink_reg.rs
+│   │   │       ├── mod.rs
+│   │   │       ├── pubsub.rs
+│   │   │       └── single_target.rs
+│   │   └── tests
+│   │       ├── recorder_test.rs
+│   │       └── summary_test.rs
+│   ├── security
+│   │   └── src
+│   │       └── lib.rs
+│   ├── server
+│   │   └── src
+│   │       ├── common.rs
+│   │       ├── lib.rs
+│   │       ├── memory.rs
+│   │       ├── raft_engine_switch.rs
+│   │       ├── server.rs
+│   │       ├── server2.rs
+│   │       ├── setup.rs
+│   │       ├── signal_handler.rs
+│   │       └── utils.rs
+│   ├── service
+│   │   └── src
+│   │       ├── lib.rs
+│   │       ├── service_event.rs
+│   │       └── service_manager.rs
+│   ├── snap_recovery
+│   │   └── src
+│   │       ├── data_resolver.rs
+│   │       ├── init_cluster.rs
+│   │       ├── leader_keeper.rs
+│   │       ├── lib.rs
+│   │       ├── metrics.rs
+│   │       ├── region_meta_collector.rs
+│   │       └── services.rs
+│   ├── sst_importer
+│   │   └── src
+│   │       ├── caching
+│   │       │   ├── cache_map.rs
+│   │       │   ├── mod.rs
+│   │       │   └── storage_cache.rs
+│   │       ├── config.rs
+│   │       ├── errors.rs
+│   │       ├── import_file.rs
+│   │       ├── import_mode.rs
+│   │       ├── import_mode2.rs
+│   │       ├── lib.rs
+│   │       ├── metrics.rs
+│   │       ├── sst_importer.rs
+│   │       ├── sst_merge_iter.rs
+│   │       ├── sst_writer.rs
+│   │       └── util.rs
+│   ├── test_backup
+│   │   └── src
+│   │       ├── disk_snap.rs
+│   │       └── lib.rs
+│   ├── test_coprocessor
+│   │   └── src
+│   │       ├── column.rs
+│   │       ├── dag.rs
+│   │       ├── fixture.rs
+│   │       ├── lib.rs
+│   │       ├── store.rs
+│   │       ├── table.rs
+│   │       └── util.rs
+│   ├── test_coprocessor_plugin
+│   │   └── example_plugin
+│   │       └── src
+│   │           └── lib.rs
+│   ├── test_pd
+│   │   └── src
+│   │       ├── lib.rs
+│   │       ├── mocker
+│   │       │   ├── bootstrap.rs
+│   │       │   ├── etcd.rs
+│   │       │   ├── incompatible.rs
+│   │       │   ├── leader_change.rs
+│   │       │   ├── meta_storage.rs
+│   │       │   ├── mod.rs
+│   │       │   ├── retry.rs
+│   │       │   ├── service.rs
+│   │       │   └── split.rs
+│   │       ├── server.rs
+│   │       └── util.rs
+│   ├── test_pd_client
+│   │   └── src
+│   │       ├── lib.rs
+│   │       └── pd.rs
+│   ├── test_raftstore
+│   │   └── src
+│   │       ├── cluster.rs
+│   │       ├── config.rs
+│   │       ├── lib.rs
+│   │       ├── node.rs
+│   │       ├── router.rs
+│   │       ├── server.rs
+│   │       ├── transport_simulate.rs
+│   │       └── util.rs
+│   ├── test_raftstore-v2
+│   │   └── src
+│   │       ├── cluster.rs
+│   │       ├── lib.rs
+│   │       ├── node.rs
+│   │       ├── server.rs
+│   │       ├── transport_simulate.rs
+│   │       └── util.rs
+│   ├── test_raftstore_macro
+│   │   └── src
+│   │       └── lib.rs
+│   ├── test_sst_importer
+│   │   └── src
+│   │       ├── lib.rs
+│   │       └── util.rs
+│   ├── test_storage
+│   │   └── src
+│   │       ├── assert_storage.rs
+│   │       ├── lib.rs
+│   │       ├── sync_storage.rs
+│   │       └── util.rs
+│   ├── test_util
+│   │   └── src
+│   │       ├── encryption.rs
+│   │       ├── kv_generator.rs
+│   │       ├── lib.rs
+│   │       ├── logging.rs
+│   │       ├── macros.rs
+│   │       ├── runner.rs
+│   │       └── security.rs
+│   ├── tidb_query_aggr
+│   │   └── src
+│   │       ├── impl_avg.rs
+│   │       ├── impl_bit_op.rs
+│   │       ├── impl_count.rs
+│   │       ├── impl_first.rs
+│   │       ├── impl_max_min.rs
+│   │       ├── impl_sum.rs
+│   │       ├── impl_variance.rs
+│   │       ├── lib.rs
+│   │       ├── parser.rs
+│   │       ├── summable.rs
+│   │       └── util.rs
+│   ├── tidb_query_codegen
+│   │   └── src
+│   │       ├── aggr_function.rs
+│   │       ├── lib.rs
+│   │       └── rpn_function.rs
+│   ├── tidb_query_common
+│   │   └── src
+│   │       ├── error.rs
+│   │       ├── execute_stats.rs
+│   │       ├── lib.rs
+│   │       ├── macros.rs
+│   │       ├── metrics.rs
+│   │       ├── storage
+│   │       │   ├── mod.rs
+│   │       │   ├── range.rs
+│   │       │   ├── ranges_iter.rs
+│   │       │   ├── scanner.rs
+│   │       │   └── test_fixture.rs
+│   │       └── util.rs
+│   ├── tidb_query_datatype
+│   │   ├── benches
+│   │   │   └── bench_vector_distance.rs
+│   │   └── src
+│   │       ├── builder
+│   │       │   ├── field_type.rs
+│   │       │   └── mod.rs
+│   │       ├── codec
+│   │       │   ├── batch
+│   │       │   │   ├── lazy_column.rs
+│   │       │   │   ├── lazy_column_vec.rs
+│   │       │   │   └── mod.rs
+│   │       │   ├── chunk
+│   │       │   │   ├── chunk.rs
+│   │       │   │   ├── column.rs
+│   │       │   │   └── mod.rs
+│   │       │   ├── collation
+│   │       │   │   ├── charset.rs
+│   │       │   │   ├── collator
+│   │       │   │   │   ├── binary.rs
+│   │       │   │   │   ├── gb18030_collation.rs
+│   │       │   │   │   ├── gbk_collation.rs
+│   │       │   │   │   ├── latin1_bin.rs
+│   │       │   │   │   ├── mod.rs
+│   │       │   │   │   ├── utf8mb4_binary.rs
+│   │       │   │   │   ├── utf8mb4_general_ci.rs
+│   │       │   │   │   └── utf8mb4_uca
+│   │       │   │   │       ├── data_0400.rs
+│   │       │   │   │       ├── data_0900.rs
+│   │       │   │   │       └── mod.rs
+│   │       │   │   ├── encoding
+│   │       │   │   │   ├── ascii.rs
+│   │       │   │   │   ├── gb18030.rs
+│   │       │   │   │   ├── gb18030_data.rs
+│   │       │   │   │   ├── gbk.rs
+│   │       │   │   │   ├── mod.rs
+│   │       │   │   │   ├── unicode_letter.rs
+│   │       │   │   │   └── utf8.rs
+│   │       │   │   └── mod.rs
+│   │       │   ├── convert.rs
+│   │       │   ├── data_type
+│   │       │   │   ├── bit_vec.rs
+│   │       │   │   ├── chunked_vec_bytes.rs
+│   │       │   │   ├── chunked_vec_common.rs
+│   │       │   │   ├── chunked_vec_enum.rs
+│   │       │   │   ├── chunked_vec_json.rs
+│   │       │   │   ├── chunked_vec_set.rs
+│   │       │   │   ├── chunked_vec_sized.rs
+│   │       │   │   ├── chunked_vec_vector_float32.rs
+│   │       │   │   ├── logical_rows.rs
+│   │       │   │   ├── mod.rs
+│   │       │   │   ├── scalar.rs
+│   │       │   │   └── vector.rs
+│   │       │   ├── datum.rs
+│   │       │   ├── datum_codec.rs
+│   │       │   ├── error.rs
+│   │       │   ├── mod.rs
+│   │       │   ├── mysql
+│   │       │   │   ├── binary_literal.rs
+│   │       │   │   ├── charset.rs
+│   │       │   │   ├── decimal.rs
+│   │       │   │   ├── duration.rs
+│   │       │   │   ├── enums.rs
+│   │       │   │   ├── json
+│   │       │   │   │   ├── binary.rs
+│   │       │   │   │   ├── comparison.rs
+│   │       │   │   │   ├── constants.rs
+│   │       │   │   │   ├── jcodec.rs
+│   │       │   │   │   ├── json_contains.rs
+│   │       │   │   │   ├── json_depth.rs
+│   │       │   │   │   ├── json_extract.rs
+│   │       │   │   │   ├── json_keys.rs
+│   │       │   │   │   ├── json_length.rs
+│   │       │   │   │   ├── json_memberof.rs
+│   │       │   │   │   ├── json_merge.rs
+│   │       │   │   │   ├── json_modify.rs
+│   │       │   │   │   ├── json_remove.rs
+│   │       │   │   │   ├── json_type.rs
+│   │       │   │   │   ├── json_unquote.rs
+│   │       │   │   │   ├── mod.rs
+│   │       │   │   │   ├── modifier.rs
+│   │       │   │   │   ├── path_expr.rs
+│   │       │   │   │   └── serde.rs
+│   │       │   │   ├── mod.rs
+│   │       │   │   ├── set.rs
+│   │       │   │   ├── time
+│   │       │   │   │   ├── extension.rs
+│   │       │   │   │   ├── interval.rs
+│   │       │   │   │   ├── mod.rs
+│   │       │   │   │   ├── tz.rs
+│   │       │   │   │   └── weekmode.rs
+│   │       │   │   └── vector.rs
+│   │       │   ├── overflow.rs
+│   │       │   ├── row
+│   │       │   │   ├── mod.rs
+│   │       │   │   └── v2
+│   │       │   │       ├── compat_v1.rs
+│   │       │   │       ├── encoder_for_test.rs
+│   │       │   │       ├── mod.rs
+│   │       │   │       └── row_slice.rs
+│   │       │   └── table.rs
+│   │       ├── def
+│   │       │   ├── eval_type.rs
+│   │       │   ├── field_type.rs
+│   │       │   └── mod.rs
+│   │       ├── error.rs
+│   │       ├── expr
+│   │       │   ├── ctx.rs
+│   │       │   └── mod.rs
+│   │       └── lib.rs
+│   ├── tidb_query_executors
+│   │   └── src
+│   │       ├── fast_hash_aggr_executor.rs
+│   │       ├── index_lookup_executor.rs
+│   │       ├── index_scan_executor.rs
+│   │       ├── interface.rs
+│   │       ├── lib.rs
+│   │       ├── limit_executor.rs
+│   │       ├── partition_top_n_executor.rs
+│   │       ├── projection_executor.rs
+│   │       ├── runner.rs
+│   │       ├── selection_executor.rs
+│   │       ├── simple_aggr_executor.rs
+│   │       ├── slow_hash_aggr_executor.rs
+│   │       ├── stream_aggr_executor.rs
+│   │       ├── table_scan_executor.rs
+│   │       ├── top_n_executor.rs
+│   │       └── util
+│   │           ├── aggr_executor.rs
+│   │           ├── hash_aggr_helper.rs
+│   │           ├── mock_executor.rs
+│   │           ├── mod.rs
+│   │           ├── scan_executor.rs
+│   │           └── top_n_heap.rs
+│   ├── tidb_query_expr
+│   │   └── src
+│   │       ├── impl_arithmetic.rs
+│   │       ├── impl_cast.rs
+│   │       ├── impl_compare.rs
+│   │       ├── impl_compare_in.rs
+│   │       ├── impl_control.rs
+│   │       ├── impl_encryption.rs
+│   │       ├── impl_json.rs
+│   │       ├── impl_like.rs
+│   │       ├── impl_math.rs
+│   │       ├── impl_miscellaneous.rs
+│   │       ├── impl_op.rs
+│   │       ├── impl_other.rs
+│   │       ├── impl_regexp.rs
+│   │       ├── impl_string.rs
+│   │       ├── impl_time.rs
+│   │       ├── impl_vec.rs
+│   │       ├── lib.rs
+│   │       └── types
+│   │           ├── expr.rs
+│   │           ├── expr_builder.rs
+│   │           ├── expr_eval.rs
+│   │           ├── function.rs
+│   │           ├── mod.rs
+│   │           └── test_util.rs
+│   ├── tikv_alloc
+│   │   └── src
+│   │       ├── default.rs
+│   │       ├── error.rs
+│   │       ├── jemalloc.rs
+│   │       ├── lib.rs
+│   │       ├── mimalloc.rs
+│   │       ├── snmalloc.rs
+│   │       ├── system.rs
+│   │       ├── tcmalloc.rs
+│   │       └── trace.rs
+│   ├── tikv_kv
+│   │   └── src
+│   │       ├── btree_engine.rs
+│   │       ├── cursor.rs
+│   │       ├── lib.rs
+│   │       ├── metrics.rs
+│   │       ├── mock_engine.rs
+│   │       ├── raft_extension.rs
+│   │       ├── raftstore_impls.rs
+│   │       ├── rocksdb_engine.rs
+│   │       └── stats.rs
+│   ├── tikv_util
+│   │   ├── benches
+│   │   │   └── channel
+│   │   │       ├── bench_channel.rs
+│   │   │       └── mod.rs
+│   │   └── src
+│   │       ├── buffer_vec.rs
+│   │       ├── callback.rs
+│   │       ├── codec
+│   │       │   ├── bytes.rs
+│   │       │   ├── mod.rs
+│   │       │   ├── number.rs
+│   │       │   └── stream_event.rs
+│   │       ├── config.rs
+│   │       ├── deadline.rs
+│   │       ├── future.rs
+│   │       ├── keybuilder.rs
+│   │       ├── lib.rs
+│   │       ├── log.rs
+│   │       ├── logger
+│   │       │   ├── file_log.rs
+│   │       │   ├── formatter.rs
+│   │       │   └── mod.rs
+│   │       ├── lru.rs
+│   │       ├── macros.rs
+│   │       ├── math.rs
+│   │       ├── memory.rs
+│   │       ├── metrics
+│   │       │   ├── allocator_metrics.rs
+│   │       │   ├── metrics_reader.rs
+│   │       │   ├── mod.rs
+│   │       │   ├── process_dummy.rs
+│   │       │   ├── process_linux.rs
+│   │       │   ├── threads_dummy.rs
+│   │       │   └── threads_linux.rs
+│   │       ├── mpsc
+│   │       │   ├── future.rs
+│   │       │   ├── mod.rs
+│   │       │   └── priority_queue.rs
+│   │       ├── quota_limiter.rs
+│   │       ├── range_latch.rs
+│   │       ├── resizable_threadpool.rs
+│   │       ├── resource_control.rs
+│   │       ├── smoother.rs
+│   │       ├── store
+│   │       │   ├── mod.rs
+│   │       │   ├── peer.rs
+│   │       │   ├── query_stats.rs
+│   │       │   └── region.rs
+│   │       ├── stream.rs
+│   │       ├── sys
+│   │       │   ├── cgroup.rs
+│   │       │   ├── cpu_time.rs
+│   │       │   ├── disk.rs
+│   │       │   ├── inspector.rs
+│   │       │   ├── ioload.rs
+│   │       │   ├── mod.rs
+│   │       │   └── thread.rs
+│   │       ├── thread_group.rs
+│   │       ├── thread_name_prefix.rs
+│   │       ├── time.rs
+│   │       ├── timer.rs
+│   │       ├── topn.rs
+│   │       ├── worker
+│   │       │   ├── future.rs
+│   │       │   ├── metrics.rs
+│   │       │   ├── mod.rs
+│   │       │   └── pool.rs
+│   │       └── yatp_pool
+│   │           ├── future_pool.rs
+│   │           ├── metrics.rs
+│   │           └── mod.rs
+│   ├── tipb_helper
+│   │   └── src
+│   │       ├── expr_def_builder.rs
+│   │       └── lib.rs
+│   ├── tracker
+│   │   └── src
+│   │       ├── future.rs
+│   │       ├── lib.rs
+│   │       ├── metrics.rs
+│   │       ├── slab.rs
+│   │       └── tls.rs
+│   └── txn_types
+│       └── src
+│           ├── lib.rs
+│           ├── lock.rs
+│           ├── timestamp.rs
+│           ├── types.rs
+│           └── write.rs
+├── fuzz
+│   ├── cli.rs
+│   ├── fuzzer-afl
+│   │   ├── src
+│   │   │   └── lib.rs
+│   │   └── template.rs
+│   ├── fuzzer-honggfuzz
+│   │   ├── src
+│   │   │   └── lib.rs
+│   │   └── template.rs
+│   ├── fuzzer-libfuzzer
+│   │   ├── src
+│   │   │   └── lib.rs
+│   │   └── template.rs
+│   └── targets
+│       ├── mod.rs
+│       └── util.rs
+├── src
+│   ├── config
+│   │   ├── configurable.rs
+│   │   └── mod.rs
+│   ├── coprocessor
+│   │   ├── cache.rs
+│   │   ├── checksum.rs
+│   │   ├── config_manager.rs
+│   │   ├── dag
+│   │   │   ├── mod.rs
+│   │   │   └── storage_impl.rs
+│   │   ├── endpoint.rs
+│   │   ├── error.rs
+│   │   ├── interceptors
+│   │   │   ├── concurrency_limiter.rs
+│   │   │   ├── deadline.rs
+│   │   │   └── mod.rs
+│   │   ├── metrics.rs
+│   │   ├── mod.rs
+│   │   ├── readpool_impl.rs
+│   │   ├── statistics
+│   │   │   ├── analyze.rs
+│   │   │   ├── analyze_context.rs
+│   │   │   ├── cmsketch.rs
+│   │   │   ├── fmsketch.rs
+│   │   │   ├── histogram.rs
+│   │   │   └── mod.rs
+│   │   └── tracker.rs
+│   ├── coprocessor_v2
+│   │   ├── config.rs
+│   │   ├── endpoint.rs
+│   │   ├── mod.rs
+│   │   ├── plugin_registry.rs
+│   │   └── raw_storage_impl.rs
+│   ├── import
+│   │   ├── duplicate_detect.rs
+│   │   ├── ingest.rs
+│   │   ├── mod.rs
+│   │   ├── raft_writer.rs
+│   │   └── sst_service.rs
+│   ├── lib.rs
+│   ├── read_pool.rs
+│   ├── server
+│   │   ├── config.rs
+│   │   ├── debug.rs
+│   │   ├── debug2.rs
+│   │   ├── engine_factory.rs
+│   │   ├── errors.rs
+│   │   ├── gc_worker
+│   │   │   ├── compaction_filter.rs
+│   │   │   ├── compaction_runner.rs
+│   │   │   ├── config.rs
+│   │   │   ├── gc_manager.rs
+│   │   │   ├── gc_worker.rs
+│   │   │   ├── mod.rs
+│   │   │   └── rawkv_compaction_filter.rs
+│   │   ├── load_statistics
+│   │   │   ├── linux.rs
+│   │   │   └── mod.rs
+│   │   ├── lock_manager
+│   │   │   ├── client.rs
+│   │   │   ├── config.rs
+│   │   │   ├── deadlock.rs
+│   │   │   ├── metrics.rs
+│   │   │   ├── mod.rs
+│   │   │   └── waiter_manager.rs
+│   │   ├── metrics.rs
+│   │   ├── mod.rs
+│   │   ├── proxy.rs
+│   │   ├── raft_client.rs
+│   │   ├── raft_server.rs
+│   │   ├── raftkv
+│   │   │   ├── mod.rs
+│   │   │   └── raft_extension.rs
+│   │   ├── raftkv2
+│   │   │   ├── mod.rs
+│   │   │   ├── node.rs
+│   │   │   └── raft_extension.rs
+│   │   ├── reset_to_version.rs
+│   │   ├── resolve.rs
+│   │   ├── server.rs
+│   │   ├── service
+│   │   │   ├── batch.rs
+│   │   │   ├── debug.rs
+│   │   │   ├── diagnostics
+│   │   │   │   ├── log.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── sys.rs
+│   │   │   ├── kv.rs
+│   │   │   └── mod.rs
+│   │   ├── snap.rs
+│   │   ├── status_server
+│   │   │   ├── lite.rs
+│   │   │   ├── metrics.rs
+│   │   │   ├── mod.rs
+│   │   │   └── profile.rs
+│   │   ├── tablet_snap.rs
+│   │   ├── transport.rs
+│   │   └── ttl
+│   │       ├── mod.rs
+│   │       ├── ttl_checker.rs
+│   │       └── ttl_compaction_filter.rs
+│   └── storage
+│       ├── config.rs
+│       ├── config_manager.rs
+│       ├── errors.rs
+│       ├── kv
+│       │   ├── mod.rs
+│       │   └── test_engine_builder.rs
+│       ├── lock_manager
+│       │   ├── lock_wait_context.rs
+│       │   ├── lock_waiting_queue.rs
+│       │   └── mod.rs
+│       ├── metrics.rs
+│       ├── mod.rs
+│       ├── mvcc
+│       │   ├── consistency_check.rs
+│       │   ├── metrics.rs
+│       │   ├── mod.rs
+│       │   ├── mvcc_read_tracker.rs
+│       │   ├── reader
+│       │   │   ├── mod.rs
+│       │   │   ├── point_getter.rs
+│       │   │   ├── reader.rs
+│       │   │   └── scanner
+│       │   │       ├── backward.rs
+│       │   │       ├── forward.rs
+│       │   │       └── mod.rs
+│       │   └── txn.rs
+│       ├── raw
+│       │   ├── encoded.rs
+│       │   ├── mod.rs
+│       │   ├── raw_mvcc.rs
+│       │   └── store.rs
+│       ├── read_pool.rs
+│       ├── txn
+│       │   ├── actions
+│       │   │   ├── acquire_pessimistic_lock.rs
+│       │   │   ├── check_data_constraint.rs
+│       │   │   ├── check_txn_status.rs
+│       │   │   ├── cleanup.rs
+│       │   │   ├── commit.rs
+│       │   │   ├── common.rs
+│       │   │   ├── flashback_to_version.rs
+│       │   │   ├── gc.rs
+│       │   │   ├── mod.rs
+│       │   │   ├── mvcc.rs
+│       │   │   ├── prewrite.rs
+│       │   │   └── tests.rs
+│       │   ├── commands
+│       │   │   ├── acquire_pessimistic_lock.rs
+│       │   │   ├── acquire_pessimistic_lock_resumed.rs
+│       │   │   ├── atomic_store.rs
+│       │   │   ├── check_secondary_locks.rs
+│       │   │   ├── check_txn_status.rs
+│       │   │   ├── cleanup.rs
+│       │   │   ├── commit.rs
+│       │   │   ├── compare_and_swap.rs
+│       │   │   ├── flashback_to_version.rs
+│       │   │   ├── flashback_to_version_read_phase.rs
+│       │   │   ├── flush.rs
+│       │   │   ├── macros.rs
+│       │   │   ├── mod.rs
+│       │   │   ├── mvcc_by_key.rs
+│       │   │   ├── mvcc_by_start_ts.rs
+│       │   │   ├── pause.rs
+│       │   │   ├── pessimistic_rollback.rs
+│       │   │   ├── pessimistic_rollback_read_phase.rs
+│       │   │   ├── prewrite.rs
+│       │   │   ├── resolve_lock.rs
+│       │   │   ├── resolve_lock_lite.rs
+│       │   │   ├── resolve_lock_readphase.rs
+│       │   │   ├── rollback.rs
+│       │   │   └── txn_heart_beat.rs
+│       │   ├── flow_controller
+│       │   │   ├── mod.rs
+│       │   │   ├── singleton_flow_controller.rs
+│       │   │   └── tablet_flow_controller.rs
+│       │   ├── latch.rs
+│       │   ├── mod.rs
+│       │   ├── sched_pool.rs
+│       │   ├── scheduler.rs
+│       │   ├── store.rs
+│       │   ├── task.rs
+│       │   ├── tracker.rs
+│       │   └── txn_status_cache.rs
+│       └── types.rs
+├── target
+│   ├── release
+│   │   └── build
+│   │       ├── anyhow-2402d1d0dfa7dc66
+│   │       │   └── out
+│   │       │       └── probe.rs
+│   │       ├── clang-sys-1ddc437d8c5f979d
+│   │       │   └── out
+│   │       │       ├── common.rs
+│   │       │       └── dynamic.rs
+│   │       ├── protobuf-6f6beb0c15799cc2
+│   │       │   └── out
+│   │       │       └── version.rs
+│   │       ├── protobuf-cad426f9207e9e57
+│   │       │   └── out
+│   │       │       └── version.rs
+│   │       ├── rustversion-3071c9de7c4ff01f
+│   │       │   └── out
+│   │       │       └── version.rs
+│   │       └── thiserror-1dbb2f5d041b2956
+│   │           └── out
+│   │               └── probe.rs
+│   └── x86_64-unknown-linux-gnu
+│       └── release
+│           └── build
+│               ├── anyhow-447549dfe14abaa6
+│               │   └── out
+│               │       └── probe.rs
+│               ├── aws-types-36d03bb12794c158
+│               │   └── out
+│               │       └── build_env.rs
+│               ├── chrono-tz-251e4744a391c975
+│               │   └── out
+│               │       ├── directory.rs
+│               │       └── timezones.rs
+│               ├── http-types-111201ded01a967f
+│               │   └── out
+│               │       └── probe.rs
+│               ├── kvproto-7c2f8c645b1fffbc
+│               │   └── out
+│               │       └── protos
+│               │           ├── autoid.rs
+│               │           ├── autoid_grpc.rs
+│               │           ├── brpb.rs
+│               │           ├── brpb_grpc.rs
+│               │           ├── cdcpb.rs
+│               │           ├── cdcpb_grpc.rs
+│               │           ├── configpb.rs
+│               │           ├── configpb_grpc.rs
+│               │           ├── coprocessor.rs
+│               │           ├── deadlock.rs
+│               │           ├── deadlock_grpc.rs
+│               │           ├── debugpb.rs
+│               │           ├── debugpb_grpc.rs
+│               │           ├── diagnosticspb.rs
+│               │           ├── diagnosticspb_grpc.rs
+│               │           ├── disaggregated.rs
+│               │           ├── disk_usage.rs
+│               │           ├── encryptionpb.rs
+│               │           ├── enginepb.rs
+│               │           ├── enginepb_grpc.rs
+│               │           ├── errorpb.rs
+│               │           ├── gcpb.rs
+│               │           ├── gcpb_grpc.rs
+│               │           ├── import_kvpb.rs
+│               │           ├── import_kvpb_grpc.rs
+│               │           ├── import_sstpb.rs
+│               │           ├── import_sstpb_grpc.rs
+│               │           ├── keyspacepb.rs
+│               │           ├── keyspacepb_grpc.rs
+│               │           ├── kvrpcpb.rs
+│               │           ├── logbackuppb.rs
+│               │           ├── logbackuppb_grpc.rs
+│               │           ├── meta_storagepb.rs
+│               │           ├── meta_storagepb_grpc.rs
+│               │           ├── metapb.rs
+│               │           ├── mod.rs
+│               │           ├── mpp.rs
+│               │           ├── pdpb.rs
+│               │           ├── pdpb_grpc.rs
+│               │           ├── raft_cmdpb.rs
+│               │           ├── raft_serverpb.rs
+│               │           ├── recoverdatapb.rs
+│               │           ├── recoverdatapb_grpc.rs
+│               │           ├── replication_modepb.rs
+│               │           ├── resource_manager.rs
+│               │           ├── resource_manager_grpc.rs
+│               │           ├── resource_usage_agent.rs
+│               │           ├── resource_usage_agent_grpc.rs
+│               │           ├── routerpb.rs
+│               │           ├── routerpb_grpc.rs
+│               │           ├── schedulingpb.rs
+│               │           ├── schedulingpb_grpc.rs
+│               │           ├── tikvpb.rs
+│               │           ├── tikvpb_grpc.rs
+│               │           ├── tracepb.rs
+│               │           ├── tracepb_grpc.rs
+│               │           ├── tsopb.rs
+│               │           └── tsopb_grpc.rs
+│               ├── pprof-440e9edd6197f267
+│               │   └── out
+│               │       ├── mod.rs
+│               │       └── profile.rs
+│               ├── protobuf-5a6b1c1d4d3fe2f7
+│               │   └── out
+│               │       └── version.rs
+│               ├── protobuf-bf7c376afdcdd39e
+│               │   └── out
+│               │       └── version.rs
+│               ├── raft-proto-3e787d7910c429d5
+│               │   └── out
+│               │       └── protos
+│               │           ├── eraftpb.rs
+│               │           └── mod.rs
+│               ├── serde-04885efeb9ae43ea
+│               │   └── out
+│               │       └── private.rs
+│               ├── serde_core-38e2368efbb56f62
+│               │   └── out
+│               │       └── private.rs
+│               ├── thiserror-755d1f1422ab28d5
+│               │   └── out
+│               │       └── probe.rs
+│               ├── tipb-1a16d22ab8f3e847
+│               │   └── out
+│               │       └── protos
+│               │           ├── analyze.rs
+│               │           ├── checksum.rs
+│               │           ├── executor.rs
+│               │           ├── explain.rs
+│               │           ├── expression.rs
+│               │           ├── metadata.rs
+│               │           ├── mod.rs
+│               │           ├── resourcetag.rs
+│               │           ├── schema.rs
+│               │           ├── select.rs
+│               │           ├── topsql_agent.rs
+│               │           ├── topsql_agent_grpc.rs
+│               │           └── trace.rs
+│               └── typenum-38062e81168b5bcc
+│                   └── out
+│                       ├── consts.rs
+│                       ├── op.rs
+│                       └── tests.rs
+└── tests
+    ├── benches
+    │   ├── coprocessor_executors
+    │   │   ├── hash_aggr
+    │   │   │   ├── mod.rs
+    │   │   │   └── util.rs
+    │   │   ├── index_scan
+    │   │   │   ├── fixture.rs
+    │   │   │   ├── mod.rs
+    │   │   │   └── util.rs
+    │   │   ├── integrated
+    │   │   │   ├── fixture.rs
+    │   │   │   ├── mod.rs
+    │   │   │   └── util.rs
+    │   │   ├── mod.rs
+    │   │   ├── selection
+    │   │   │   ├── mod.rs
+    │   │   │   └── util.rs
+    │   │   ├── simple_aggr
+    │   │   │   ├── mod.rs
+    │   │   │   └── util.rs
+    │   │   ├── stream_aggr
+    │   │   │   ├── mod.rs
+    │   │   │   └── util.rs
+    │   │   ├── table_scan
+    │   │   │   ├── fixture.rs
+    │   │   │   ├── mod.rs
+    │   │   │   └── util.rs
+    │   │   ├── top_n
+    │   │   │   ├── mod.rs
+    │   │   │   └── util.rs
+    │   │   └── util
+    │   │       ├── bencher.rs
+    │   │       ├── executor_descriptor.rs
+    │   │       ├── fixture.rs
+    │   │       ├── mod.rs
+    │   │       ├── scan_bencher.rs
+    │   │       └── store.rs
+    │   ├── deadlock_detector
+    │   │   └── mod.rs
+    │   ├── hierarchy
+    │   │   ├── engine
+    │   │   │   └── mod.rs
+    │   │   ├── engine_factory.rs
+    │   │   ├── mod.rs
+    │   │   ├── mvcc
+    │   │   │   └── mod.rs
+    │   │   ├── storage
+    │   │   │   └── mod.rs
+    │   │   └── txn
+    │   │       └── mod.rs
+    │   ├── memory
+    │   │   └── mod.rs
+    │   ├── misc
+    │   │   ├── coprocessor
+    │   │   │   ├── codec
+    │   │   │   │   ├── mod.rs
+    │   │   │   │   └── mysql
+    │   │   │   │       ├── json
+    │   │   │   │       │   └── mod.rs
+    │   │   │   │       └── mod.rs
+    │   │   │   ├── dag
+    │   │   │   │   ├── expr
+    │   │   │   │   │   ├── mod.rs
+    │   │   │   │   │   └── scalar.rs
+    │   │   │   │   └── mod.rs
+    │   │   │   └── mod.rs
+    │   │   ├── keybuilder
+    │   │   │   ├── bench_keybuilder.rs
+    │   │   │   └── mod.rs
+    │   │   ├── mod.rs
+    │   │   ├── raftkv
+    │   │   │   └── mod.rs
+    │   │   ├── serialization
+    │   │   │   ├── bench_serialization.rs
+    │   │   │   └── mod.rs
+    │   │   ├── storage
+    │   │   │   ├── incremental_get.rs
+    │   │   │   ├── key.rs
+    │   │   │   ├── mod.rs
+    │   │   │   ├── mvcc_reader.rs
+    │   │   │   └── scan.rs
+    │   │   ├── util
+    │   │   │   ├── mod.rs
+    │   │   │   └── slice_compare.rs
+    │   │   └── writebatch
+    │   │       ├── bench_writebatch.rs
+    │   │       └── mod.rs
+    │   └── raftstore
+    │       └── mod.rs
+    ├── failpoints
+    │   ├── cases
+    │   │   ├── mod.rs
+    │   │   ├── test_async_fetch.rs
+    │   │   ├── test_async_io.rs
+    │   │   ├── test_auto_compaction.rs
+    │   │   ├── test_backup.rs
+    │   │   ├── test_bootstrap.rs
+    │   │   ├── test_cmd_epoch_checker.rs
+    │   │   ├── test_conf_change.rs
+    │   │   ├── test_coprocessor.rs
+    │   │   ├── test_debugger.rs
+    │   │   ├── test_disk_full.rs
+    │   │   ├── test_disk_snap_br.rs
+    │   │   ├── test_early_apply.rs
+    │   │   ├── test_encryption.rs
+    │   │   ├── test_engine.rs
+    │   │   ├── test_gc_metrics.rs
+    │   │   ├── test_gc_worker.rs
+    │   │   ├── test_hibernate.rs
+    │   │   ├── test_import_service.rs
+    │   │   ├── test_in_memory_engine.rs
+    │   │   ├── test_kv_service.rs
+    │   │   ├── test_life.rs
+    │   │   ├── test_local_read.rs
+    │   │   ├── test_memory_usage_limit.rs
+    │   │   ├── test_merge.rs
+    │   │   ├── test_metrics_overflow.rs
+    │   │   ├── test_pd_client.rs
+    │   │   ├── test_pd_client_legacy.rs
+    │   │   ├── test_pending_peers.rs
+    │   │   ├── test_rawkv.rs
+    │   │   ├── test_read_execution_tracker.rs
+    │   │   ├── test_replica_read.rs
+    │   │   ├── test_replica_stale_read.rs
+    │   │   ├── test_server.rs
+    │   │   ├── test_snap.rs
+    │   │   ├── test_split_region.rs
+    │   │   ├── test_sst_ingest.rs
+    │   │   ├── test_sst_recovery.rs
+    │   │   ├── test_stale_peer.rs
+    │   │   ├── test_stale_read.rs
+    │   │   ├── test_stats.rs
+    │   │   ├── test_storage.rs
+    │   │   ├── test_table_properties.rs
+    │   │   ├── test_titan.rs
+    │   │   ├── test_transaction.rs
+    │   │   ├── test_transfer_leader.rs
+    │   │   ├── test_ttl.rs
+    │   │   ├── test_unsafe_recovery.rs
+    │   │   └── test_witness.rs
+    │   └── mod.rs
+    └── integrations
+        ├── backup
+        │   ├── disk_snap.rs
+        │   └── mod.rs
+        ├── config
+        │   ├── dynamic
+        │   │   ├── gc_worker.rs
+        │   │   ├── mod.rs
+        │   │   ├── pessimistic_txn.rs
+        │   │   ├── raftstore.rs
+        │   │   ├── snap.rs
+        │   │   └── split_check.rs
+        │   ├── graceful_shutdown_config.rs
+        │   ├── mod.rs
+        │   └── test_config_client.rs
+        ├── coprocessor
+        │   ├── mod.rs
+        │   ├── test_analyze.rs
+        │   ├── test_checksum.rs
+        │   └── test_select.rs
+        ├── import
+        │   ├── mod.rs
+        │   ├── test_apply_log.rs
+        │   ├── test_sst_service.rs
+        │   └── util.rs
+        ├── mod.rs
+        ├── pd
+        │   ├── mod.rs
+        │   ├── test_rpc_client.rs
+        │   └── test_rpc_client_legacy.rs
+        ├── raftstore
+        │   ├── mod.rs
+        │   ├── test_bootstrap.rs
+        │   ├── test_clear_stale_data.rs
+        │   ├── test_compact_lock_cf.rs
+        │   ├── test_compact_log.rs
+        │   ├── test_conf_change.rs
+        │   ├── test_early_apply.rs
+        │   ├── test_flashback.rs
+        │   ├── test_hibernate.rs
+        │   ├── test_joint_consensus.rs
+        │   ├── test_lease_read.rs
+        │   ├── test_life.rs
+        │   ├── test_merge.rs
+        │   ├── test_multi.rs
+        │   ├── test_prevote.rs
+        │   ├── test_region_change_observer.rs
+        │   ├── test_region_heartbeat.rs
+        │   ├── test_region_info_accessor.rs
+        │   ├── test_replica_read.rs
+        │   ├── test_replication_mode.rs
+        │   ├── test_scale_pool.rs
+        │   ├── test_single.rs
+        │   ├── test_snap.rs
+        │   ├── test_snap_recovery.rs
+        │   ├── test_split_region.rs
+        │   ├── test_stale_peer.rs
+        │   ├── test_stale_read.rs
+        │   ├── test_stats.rs
+        │   ├── test_status_command.rs
+        │   ├── test_tombstone.rs
+        │   ├── test_transfer_leader.rs
+        │   ├── test_transport.rs
+        │   ├── test_unsafe_recovery.rs
+        │   ├── test_update_region_size.rs
+        │   ├── test_v1_v2_mixed.rs
+        │   └── test_witness.rs
+        ├── resource_metering
+        │   ├── mod.rs
+        │   ├── test_cpu.rs
+        │   ├── test_dynamic_config.rs
+        │   ├── test_pubsub.rs
+        │   ├── test_read_keys.rs
+        │   ├── test_receiver.rs
+        │   └── test_suite
+        │       ├── mock_pubsub.rs
+        │       ├── mock_receiver_server.rs
+        │       └── mod.rs
+        ├── server
+        │   ├── debugger.rs
+        │   ├── gc_worker.rs
+        │   ├── kv_service.rs
+        │   ├── lock_manager.rs
+        │   ├── mod.rs
+        │   ├── raft_client.rs
+        │   ├── security.rs
+        │   ├── server.rs
+        │   └── status_server.rs
+        ├── server_encryption.rs
+        └── storage
+            ├── mod.rs
+            ├── test_raft_storage.rs
+            ├── test_raftkv.rs
+            ├── test_region_info_accessor.rs
+            ├── test_storage.rs
+            └── test_titan.rs
+
+390 directories, 1400 files

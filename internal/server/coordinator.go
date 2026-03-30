@@ -489,6 +489,7 @@ func (sc *StoreCoordinator) HandleRaftMessage(msg *raft_serverpb.RaftMessage) er
 		Data: &raftMsg,
 	}
 
+	slog.Debug("HandleRaftMessage", "region", regionID, "from", msg.GetFromPeer().GetId(), "to", msg.GetToPeer().GetId())
 	err = sc.router.Send(regionID, peerMsg)
 	if err == router.ErrMailboxFull {
 		// Consensus messages must not be silently dropped. Retry briefly.
@@ -933,6 +934,9 @@ func (sc *StoreCoordinator) sendRaftMessage(regionID uint64, region *metapb.Regi
 		}
 	}
 	if toStoreID == 0 {
+		slog.Warn("sendRaftMessage: cannot resolve store for peer",
+			"region", regionID, "msgTo", msg.To, "msgType", msg.Type,
+			"peerCount", len(region.GetPeers()))
 		return
 	}
 
@@ -993,7 +997,8 @@ func (sc *StoreCoordinator) sendRaftMessage(regionID uint64, region *metapb.Regi
 	// Send asynchronously so the peer loop is not blocked by slow/dead stores.
 	go func() {
 		if err := sc.client.Send(toStoreID, raftMessage); err != nil {
-			slog.Debug("raft send failed", "to_store", toStoreID, "err", err)
+			slog.Warn("raft send failed", "to_store", toStoreID, "region", regionID,
+				"msgTo", msg.To, "msgType", msg.Type, "err", err)
 			sc.reportUnreachable(regionID, msg.To)
 		}
 	}()
