@@ -9,23 +9,46 @@ import (
 	"github.com/pingcap/kvproto/pkg/pdpb"
 )
 
+// stabilizeHeartbeats is the number of heartbeat cycles to wait after AddPeer
+// before advancing to RemovePeer. This gives the new peer time to receive a
+// snapshot and join the Raft group.
+const stabilizeHeartbeats = 3
+
 // MoveState tracks the current stage of a region move.
 type MoveState int
 
 const (
 	MoveStateAdding       MoveState = iota // Waiting for AddPeer to complete
-	MoveStateTransferring                   // Waiting for leader transfer
-	MoveStateRemoving                       // Waiting for RemovePeer to complete
+	MoveStateStabilizing                   // Waiting for new peer to receive snapshot and stabilize
+	MoveStateTransferring                  // Waiting for leader transfer
+	MoveStateRemoving                      // Waiting for RemovePeer to complete
 )
+
+// String returns a human-readable name for the move state.
+func (s MoveState) String() string {
+	switch s {
+	case MoveStateAdding:
+		return "Adding"
+	case MoveStateStabilizing:
+		return "Stabilizing"
+	case MoveStateTransferring:
+		return "Transferring"
+	case MoveStateRemoving:
+		return "Removing"
+	default:
+		return "Unknown"
+	}
+}
 
 // PendingMove tracks a single in-progress region move.
 type PendingMove struct {
-	RegionID      uint64
-	SourcePeer    *metapb.Peer
-	TargetStoreID uint64
-	TargetPeerID  uint64
-	State         MoveState
-	StartedAt     time.Time
+	RegionID       uint64
+	SourcePeer     *metapb.Peer
+	TargetStoreID  uint64
+	TargetPeerID   uint64
+	State          MoveState
+	StartedAt      time.Time
+	StabilizeCount int // heartbeat cycles spent in MoveStateStabilizing
 }
 
 // MoveTracker tracks in-progress region moves across heartbeat cycles.
@@ -76,6 +99,10 @@ func (t *MoveTracker) ActiveMoveCount() int {
 // current region metadata and leader. Returns a ScheduleCommand if an action
 // is needed, or nil if no action is required (either waiting or move is complete).
 func (t *MoveTracker) Advance(regionID uint64, region *metapb.Region, leader *metapb.Peer) *ScheduleCommand {
+	if region == nil {
+		return nil
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -97,7 +124,18 @@ func (t *MoveTracker) Advance(regionID uint64, region *metapb.Region, leader *me
 				break
 			}
 		}
+		// Transition to stabilizing — wait for the new peer to receive a
+		// snapshot and join the Raft group before removing the source peer.
+		move.State = MoveStateStabilizing
+		move.StabilizeCount = 0
+		return nil
 
+	case MoveStateStabilizing:
+		move.StabilizeCount++
+		if move.StabilizeCount < stabilizeHeartbeats {
+			return nil // keep waiting for new peer to stabilize
+		}
+		// Stabilization complete — proceed to transfer/remove.
 		sourceStoreID := move.SourcePeer.GetStoreId()
 		if leader != nil && leader.GetStoreId() == sourceStoreID {
 			// Source is leader — transfer leadership before removing.

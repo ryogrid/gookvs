@@ -63,6 +63,12 @@ func (s *Scheduler) Schedule(regionID uint64, region *metapb.Region, leader *met
 		if cmd := s.moveTracker.Advance(regionID, region, leader); cmd != nil {
 			return cmd
 		}
+		// While a move is pending (e.g., stabilizing), block other schedulers
+		// to avoid conflicting ConfChanges (e.g., excess shedding removing a
+		// different peer during the stabilization window).
+		if s.moveTracker.HasPendingMove(regionID) {
+			return nil
+		}
 	}
 	// Priority 1: Remove excess replicas.
 	if cmd := s.scheduleExcessReplicaShedding(regionID, region, leader); cmd != nil {

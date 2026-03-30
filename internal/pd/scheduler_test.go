@@ -229,3 +229,46 @@ func TestSchedule_PriorityOrder(t *testing.T) {
 	assert.Equal(t, eraftpb.ConfChangeType_RemoveNode, cmd.ChangePeer.GetChangeType())
 	assert.Nil(t, cmd.TransferLeader, "leader balance should not run when excess shedding applies")
 }
+
+func TestSchedule_PendingMoveBlocksExcessShedding(t *testing.T) {
+	// When a move is pending (e.g., in MoveStateStabilizing), the excess
+	// shedding scheduler should be blocked to avoid conflicting ConfChanges.
+	meta := NewMetadataStore(1, 30*time.Second, 30*time.Minute)
+	idAlloc := NewIDAllocator()
+	for _, id := range []uint64{1, 2, 3, 4} {
+		meta.PutStore(&metapb.Store{Id: id, Address: "addr"})
+		meta.UpdateStoreStats(id, &pdpb.StoreStats{StoreId: id})
+	}
+	tracker := NewMoveTracker()
+	sched := NewScheduler(meta, idAlloc, 3, 0.05, 4, tracker)
+
+	putDummyRegions(meta, 1, 5, 200)
+	putDummyRegions(meta, 2, 5, 300)
+	putDummyRegions(meta, 3, 5, 400)
+	putDummyRegions(meta, 4, 5, 500)
+
+	// Region 100 has 4 peers (exceeds maxPeerCount=3).
+	region := &metapb.Region{
+		Id: 100,
+		Peers: []*metapb.Peer{
+			{Id: 1001, StoreId: 1},
+			{Id: 1002, StoreId: 2},
+			{Id: 1003, StoreId: 3},
+			{Id: 1004, StoreId: 4},
+		},
+	}
+	meta.PutRegion(region, nil)
+	leader := &metapb.Peer{Id: 1001, StoreId: 1}
+
+	// Without a pending move, excess shedding should fire.
+	cmd := sched.Schedule(100, region, leader)
+	require.NotNil(t, cmd, "should emit RemoveNode from excess shedding")
+	assert.NotNil(t, cmd.ChangePeer)
+
+	// Now start a pending move for region 100 (simulates MoveStateStabilizing).
+	tracker.StartMove(100, &metapb.Peer{Id: 1001, StoreId: 1}, 4)
+
+	// With a pending move, Schedule should return nil (excess shedding blocked).
+	cmd = sched.Schedule(100, region, leader)
+	assert.Nil(t, cmd, "should block all schedulers while move is pending")
+}
