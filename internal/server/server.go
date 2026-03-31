@@ -504,6 +504,41 @@ func (svc *tikvService) KvCommit(ctx context.Context, req *kvrpcpb.CommitRequest
 	startTS := txntypes.TimeStamp(req.GetStartVersion())
 	commitTS := txntypes.TimeStamp(req.GetCommitVersion())
 
+	// Defense-in-depth: validate ALL commit keys belong to the current region.
+	// After a region split, a batched commit may contain keys that have moved
+	// to a new region. Reject the entire request so the client can re-group.
+	if coord := svc.server.coordinator; coord != nil && req.GetContext().GetRegionId() != 0 {
+		peer := coord.GetPeer(req.GetContext().GetRegionId())
+		if peer != nil {
+			region := peer.Region()
+			rStartKey := region.GetStartKey()
+			rEndKey := region.GetEndKey()
+			for _, key := range keys {
+				encodedKey := codec.EncodeBytes(nil, key)
+				if len(rStartKey) > 0 && bytes.Compare(encodedKey, rStartKey) < 0 {
+					resp.RegionError = &errorpb.Error{
+						Message: fmt.Sprintf("commit key %q not in region %d", key, req.GetContext().GetRegionId()),
+						KeyNotInRegion: &errorpb.KeyNotInRegion{
+							Key: key, RegionId: req.GetContext().GetRegionId(),
+							StartKey: rStartKey, EndKey: rEndKey,
+						},
+					}
+					return resp, nil
+				}
+				if len(rEndKey) > 0 && bytes.Compare(encodedKey, rEndKey) >= 0 {
+					resp.RegionError = &errorpb.Error{
+						Message: fmt.Sprintf("commit key %q not in region %d", key, req.GetContext().GetRegionId()),
+						KeyNotInRegion: &errorpb.KeyNotInRegion{
+							Key: key, RegionId: req.GetContext().GetRegionId(),
+							StartKey: rStartKey, EndKey: rEndKey,
+						},
+					}
+					return resp, nil
+				}
+			}
+		}
+	}
+
 	// Cluster mode: compute modifications then propose via Raft.
 	// Group modifies by region to ensure each region's Raft group applies
 	// only the keys that belong to it.
@@ -599,6 +634,39 @@ func (svc *tikvService) KvBatchRollback(ctx context.Context, req *kvrpcpb.BatchR
 
 	keys := req.GetKeys()
 	startTS := txntypes.TimeStamp(req.GetStartVersion())
+
+	// Defense-in-depth: validate ALL rollback keys belong to the current region.
+	if coord := svc.server.coordinator; coord != nil && req.GetContext().GetRegionId() != 0 {
+		peer := coord.GetPeer(req.GetContext().GetRegionId())
+		if peer != nil {
+			region := peer.Region()
+			rStartKey := region.GetStartKey()
+			rEndKey := region.GetEndKey()
+			for _, key := range keys {
+				encodedKey := codec.EncodeBytes(nil, key)
+				if len(rStartKey) > 0 && bytes.Compare(encodedKey, rStartKey) < 0 {
+					resp.RegionError = &errorpb.Error{
+						Message: fmt.Sprintf("rollback key %q not in region %d", key, req.GetContext().GetRegionId()),
+						KeyNotInRegion: &errorpb.KeyNotInRegion{
+							Key: key, RegionId: req.GetContext().GetRegionId(),
+							StartKey: rStartKey, EndKey: rEndKey,
+						},
+					}
+					return resp, nil
+				}
+				if len(rEndKey) > 0 && bytes.Compare(encodedKey, rEndKey) >= 0 {
+					resp.RegionError = &errorpb.Error{
+						Message: fmt.Sprintf("rollback key %q not in region %d", key, req.GetContext().GetRegionId()),
+						KeyNotInRegion: &errorpb.KeyNotInRegion{
+							Key: key, RegionId: req.GetContext().GetRegionId(),
+							StartKey: rStartKey, EndKey: rEndKey,
+						},
+					}
+					return resp, nil
+				}
+			}
+		}
+	}
 
 	if coord := svc.server.coordinator; coord != nil {
 		modifies, err, guard := svc.server.storage.BatchRollbackModifies(keys, startTS)

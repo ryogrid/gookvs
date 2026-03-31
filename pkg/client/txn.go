@@ -39,8 +39,9 @@ type TxnHandle struct {
 	membuf     map[string]mutationEntry
 	lockKeys      [][]byte // pessimistic lock keys
 	cachedPrimary []byte   // deterministic primary key (cached)
-	committed     bool
-	rolledBack    bool
+	committed            bool
+	rolledBack           bool
+	commitStatusUnknown  bool // primary commit attempted but status indeterminate
 }
 
 // newTxnHandle creates a new TxnHandle.
@@ -369,6 +370,11 @@ func (t *TxnHandle) Commit(ctx context.Context) error {
 
 	err := committer.execute(ctx)
 	if err != nil {
+		if committer.commitStatusUnknown {
+			t.mu.Lock()
+			t.commitStatusUnknown = true
+			t.mu.Unlock()
+		}
 		return err
 	}
 
@@ -379,6 +385,10 @@ func (t *TxnHandle) Commit(ctx context.Context) error {
 }
 
 // Rollback aborts the transaction by rolling back all prewritten/locked keys.
+// If the commit status is unknown (primary commit attempted but status
+// indeterminate due to region unavailability), Rollback is a no-op to avoid
+// rolling back secondaries while the primary might be committed. Lock
+// resolution will handle the correct outcome once regions recover.
 func (t *TxnHandle) Rollback(ctx context.Context) error {
 	t.mu.Lock()
 	if t.committed {
@@ -388,6 +398,12 @@ func (t *TxnHandle) Rollback(ctx context.Context) error {
 	if t.rolledBack {
 		t.mu.Unlock()
 		return nil // already rolled back
+	}
+	if t.commitStatusUnknown {
+		// Primary commit may have succeeded — do NOT rollback.
+		// Lock resolver will commit or rollback based on actual primary status.
+		t.mu.Unlock()
+		return nil
 	}
 	t.rolledBack = true
 

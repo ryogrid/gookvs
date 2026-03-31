@@ -27,9 +27,10 @@ type twoPhaseCommitter struct {
 	startTS      txntypes.TimeStamp
 	commitTS     txntypes.TimeStamp
 	mutations    []mutationWithKey
-	primary      []byte
-	opts         TxnOptions
-	prewriteDone bool
+	primary              []byte
+	opts                 TxnOptions
+	prewriteDone         bool
+	commitStatusUnknown  bool // set when primary commit status is indeterminate
 }
 
 // newTwoPhaseCommitter creates a committer from a TxnHandle's buffered mutations.
@@ -88,8 +89,11 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) error {
 		committed, checkErr := c.isPrimaryCommitted(ctx)
 		if checkErr != nil {
 			// Cannot determine primary status — don't rollback (might be committed).
+			// Mark as unknown so that the caller's Rollback() is a no-op,
+			// leaving locks in place for lock resolution to handle correctly.
 			slog.Warn("isPrimaryCommitted check failed, not rolling back",
 				"startTS", c.startTS, "commitErr", err, "checkErr", checkErr)
+			c.commitStatusUnknown = true
 			return err
 		}
 		if committed {
