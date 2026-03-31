@@ -354,7 +354,16 @@ func (sc *StoreCoordinator) applyEntriesForPeer(peer *raftstore.Peer, entries []
 			continue
 		}
 
-		// Apply all modifies unconditionally.
+		// Filter out modifies whose decoded user key falls outside the
+		// current region boundaries. After a split, a pre-split batch
+		// entry may contain keys that now belong to the child region;
+		// applying them here would duplicate writes that lock resolution
+		// correctly handles on the child.
+		modifies = sc.filterModifiesByRegion(peer, modifies)
+		if len(modifies) == 0 {
+			continue
+		}
+
 		if err := sc.storage.ApplyModifies(modifies); err != nil {
 			slog.Warn("[APPLY-TRACE] ApplyModifies failed",
 				"modifies", len(modifies), "err", err)
@@ -362,6 +371,34 @@ func (sc *StoreCoordinator) applyEntriesForPeer(peer *raftstore.Peer, entries []
 	}
 }
 
+
+// filterModifiesByRegion removes modifies whose encoded user key falls outside
+// the peer's current region boundaries. This prevents stale batch entries
+// (proposed before a split) from applying keys that now belong to a child region.
+func (sc *StoreCoordinator) filterModifiesByRegion(peer *raftstore.Peer, modifies []mvcc.Modify) []mvcc.Modify {
+	region := peer.Region()
+	startKey := region.GetStartKey()
+	endKey := region.GetEndKey()
+	if len(startKey) == 0 && len(endKey) == 0 {
+		return modifies // unbounded region, no filtering needed
+	}
+
+	filtered := modifies[:0] // reuse backing array
+	for _, m := range modifies {
+		// Extract the encoded user key from the modify key.
+		// Write/Default CF keys have a timestamp suffix; Lock CF keys do not.
+		encodedUserKey := mvcc.TruncateToUserKey(m.Key)
+
+		if len(startKey) > 0 && bytes.Compare(encodedUserKey, startKey) < 0 {
+			continue // key before region start
+		}
+		if len(endKey) > 0 && bytes.Compare(encodedUserKey, endKey) >= 0 {
+			continue // key at or after region end
+		}
+		filtered = append(filtered, m)
+	}
+	return filtered
+}
 
 // ReadIndex performs a linearizable read index check for the given region.
 // The Raft leader confirms it is still the leader by contacting a quorum,

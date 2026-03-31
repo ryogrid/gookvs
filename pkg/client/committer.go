@@ -86,25 +86,38 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) error {
 		// The primary commit may have succeeded at the Raft level but the
 		// response was lost (e.g., timeout during leader change after split).
 		// Check the actual transaction status before rolling back.
-		committed, checkErr := c.isPrimaryCommitted(ctx)
+		status, checkErr := c.checkPrimaryStatus(ctx)
 		if checkErr != nil {
 			// Cannot determine primary status — don't rollback (might be committed).
 			// Mark as unknown so that the caller's Rollback() is a no-op,
 			// leaving locks in place for lock resolution to handle correctly.
-			slog.Warn("isPrimaryCommitted check failed, not rolling back",
+			slog.Warn("checkPrimaryStatus failed, not rolling back",
 				"startTS", c.startTS, "commitErr", err, "checkErr", checkErr)
 			c.commitStatusUnknown = true
 			return err
 		}
-		if committed {
+		switch status {
+		case primaryCommitted:
 			// Primary IS committed — proceed with secondaries.
 			slog.Info("commitPrimary returned error but primary is committed, proceeding",
 				"startTS", c.startTS, "err", err)
 			c.commitSecondaries(context.Background())
 			return nil
+		case primaryStillLocked:
+			// Lock still present but commit Raft entry may be in the pipeline
+			// (proposed but not yet applied). Do NOT rollback — if the entry
+			// is committed at Raft level, rolling back secondaries while the
+			// primary commit is pending causes balance inconsistency.
+			// Let lock resolution handle the correct outcome.
+			slog.Warn("primary still locked after commit attempt, not rolling back",
+				"startTS", c.startTS, "commitErr", err)
+			c.commitStatusUnknown = true
+			return err
+		default:
+			// Primary is definitely not committed (rolled back or not found).
+			_ = c.rollback(context.Background())
+			return err
 		}
-		_ = c.rollback(context.Background())
-		return err
 	}
 
 	// Commit secondaries synchronously to ensure no orphan locks.
@@ -223,8 +236,17 @@ func (c *twoPhaseCommitter) prewriteRegion(ctx context.Context, muts []mutationW
 // have succeeded but the response was lost (e.g., timeout during leader change).
 // Returns (true, nil) if committed, (false, nil) if not committed,
 // or (false, error) if the status check itself failed.
-func (c *twoPhaseCommitter) isPrimaryCommitted(ctx context.Context) (bool, error) {
-	var committed bool
+// primaryStatus represents the result of checking the primary key's status.
+type primaryStatus int
+
+const (
+	primaryNotCommitted primaryStatus = iota // definitely not committed (rolled back or not found)
+	primaryCommitted                         // definitely committed
+	primaryStillLocked                       // lock still present — commit may be in Raft pipeline
+)
+
+func (c *twoPhaseCommitter) checkPrimaryStatus(ctx context.Context) (primaryStatus, error) {
+	var status primaryStatus
 	err := c.client.sender.SendToRegion(ctx, c.primary, func(client tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
 		resp, err := client.KvCheckTxnStatus(ctx, &kvrpcpb.CheckTxnStatusRequest{
 			Context:    buildContext(info),
@@ -237,16 +259,19 @@ func (c *twoPhaseCommitter) isPrimaryCommitted(ctx context.Context) (bool, error
 		if resp.GetRegionError() != nil {
 			return resp.GetRegionError(), nil
 		}
-		// If CommitVersion is non-zero, the primary was committed.
 		if resp.GetCommitVersion() != 0 {
-			committed = true
+			status = primaryCommitted
+		} else if resp.GetLockTtl() > 0 {
+			status = primaryStillLocked
+		} else {
+			status = primaryNotCommitted
 		}
 		return nil, nil
 	})
 	if err != nil {
-		return false, err
+		return primaryNotCommitted, err
 	}
-	return committed, nil
+	return status, nil
 }
 
 // commitPrimary commits the primary key synchronously.
