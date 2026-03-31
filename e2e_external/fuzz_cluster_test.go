@@ -331,10 +331,21 @@ func (c *fuzzClient) doAudit() (int, error) {
 
 	_ = txn.Commit(ctx)
 
-	// Build map for per-key diagnostics
+	// Build map for per-key diagnostics; detect duplicate keys from Scan.
 	found := make(map[string]string, len(pairs))
+	var dupCount int
 	for _, p := range pairs {
-		found[string(p.Key)] = string(p.Value)
+		k := string(p.Key)
+		if _, exists := found[k]; exists {
+			dupCount++
+			if dupCount <= 5 {
+				c.fc.t.Logf("[audit-diag] duplicate key in Scan: %s old=%s new=%s", k, found[k], string(p.Value))
+			}
+		}
+		found[k] = string(p.Value)
+	}
+	if dupCount > 0 {
+		c.fc.t.Logf("[audit-diag] total duplicate keys: %d out of %d pairs", dupCount, len(pairs))
 	}
 
 	total := 0
@@ -355,7 +366,24 @@ func (c *fuzzClient) doAudit() (int, error) {
 	}
 
 	if total != fuzzExpectedTotal {
-		return total, fmt.Errorf("balance mismatch: got %d, want %d", total, fuzzExpectedTotal)
+		// Diagnostic: report accounts with abnormal balances.
+		var diag []string
+		for i := 0; i < fuzzNumAccounts; i++ {
+			key := string(accountKey(i))
+			b, _ := strconv.Atoi(found[key])
+			if b > 2*fuzzInitialBalance || b < 0 {
+				diag = append(diag, fmt.Sprintf("%s=%d", key, b))
+			}
+		}
+		extra := ""
+		if len(diag) > 0 {
+			if len(diag) > 20 {
+				diag = diag[:20]
+			}
+			extra = fmt.Sprintf(" abnormal(%d): %v", len(diag), diag)
+		}
+		extra += fmt.Sprintf(" scanPairs=%d", len(pairs))
+		return total, fmt.Errorf("balance mismatch: got %d, want %d diff=%+d%s", total, fuzzExpectedTotal, total-fuzzExpectedTotal, extra)
 	}
 
 	c.fc.stats.auditPasses.Add(1)

@@ -99,6 +99,17 @@ func (s *RegionRequestSender) SendToRegion(ctx context.Context, key []byte, rpcF
 		if !s.handleRegionError(ctx, info, regionErr) {
 			return fmt.Errorf("region error: %s", regionErr.GetMessage())
 		}
+		if nl := regionErr.GetNotLeader(); nl != nil {
+			if nl.GetLeader() != nil {
+				// Leader hint available — cache updated, minimal backoff.
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			// No leader hint — election may be in progress.
+			// Use a fixed delay to allow leader election + PD heartbeat.
+			time.Sleep(1 * time.Second)
+			continue
+		}
 		// Exponential backoff before retry to allow region state to stabilize
 		// (e.g., new region peers being created after a split, PD propagation).
 		time.Sleep(backoff)
