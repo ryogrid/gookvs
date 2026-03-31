@@ -1,9 +1,11 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -484,4 +486,204 @@ func (t *TxnHandle) pessimisticRollback(ctx context.Context, keys [][]byte) erro
 		}
 	}
 	return nil
+}
+
+// membufEntry represents a key from the local mutation buffer with its value
+// and whether it was deleted. Used during Scan membuf merge.
+type membufEntry struct {
+	key     string
+	value   []byte
+	deleted bool
+}
+
+// collectMembuf returns all membuf entries in [startKey, endKey), sorted by key.
+// Includes both puts and deletes (with deleted=true for Op_Del).
+func (t *TxnHandle) collectMembuf(startKey, endKey []byte) []membufEntry {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var entries []membufEntry
+	for k, entry := range t.membuf {
+		if k < string(startKey) {
+			continue
+		}
+		if len(endKey) > 0 && k >= string(endKey) {
+			continue
+		}
+		entries = append(entries, membufEntry{
+			key:     k,
+			value:   entry.value,
+			deleted: entry.op == kvrpcpb.Op_Del,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].key < entries[j].key })
+	return entries
+}
+
+// mergeResults performs a two-pointer merge of sorted RPC results and sorted
+// membuf entries. Membuf entries override RPC results for the same key.
+// Deleted keys (membuf entries with deleted=true) suppress RPC results.
+// The result is capped at limit.
+func mergeResults(rpcResults []KvPair, membuf []membufEntry, limit int) []KvPair {
+	var merged []KvPair
+	i, j := 0, 0
+	for len(merged) < limit && (i < len(rpcResults) || j < len(membuf)) {
+		if i >= len(rpcResults) {
+			if !membuf[j].deleted {
+				merged = append(merged, KvPair{Key: []byte(membuf[j].key), Value: membuf[j].value})
+			}
+			j++
+		} else if j >= len(membuf) {
+			merged = append(merged, rpcResults[i])
+			i++
+		} else {
+			rpcKey := string(rpcResults[i].Key)
+			bufKey := membuf[j].key
+			if rpcKey < bufKey {
+				merged = append(merged, rpcResults[i])
+				i++
+			} else if rpcKey > bufKey {
+				if !membuf[j].deleted {
+					merged = append(merged, KvPair{Key: []byte(bufKey), Value: membuf[j].value})
+				}
+				j++
+			} else {
+				if !membuf[j].deleted {
+					merged = append(merged, KvPair{Key: []byte(bufKey), Value: membuf[j].value})
+				}
+				i++
+				j++
+			}
+		}
+	}
+	return merged
+}
+
+// Scan retrieves key-value pairs in [startKey, endKey) at the transaction's
+// snapshot timestamp. It crosses region boundaries transparently, resolves
+// locks encountered during the scan, and merges results with the local
+// mutation buffer (uncommitted writes and deletes).
+func (t *TxnHandle) Scan(ctx context.Context, startKey, endKey []byte, limit int) ([]KvPair, error) {
+	t.mu.Lock()
+	if t.committed {
+		t.mu.Unlock()
+		return nil, ErrTxnCommitted
+	}
+	if t.rolledBack {
+		t.mu.Unlock()
+		return nil, ErrTxnRolledBack
+	}
+	t.mu.Unlock()
+
+	// If no client (membuf-only mode, e.g., in unit tests), return membuf results.
+	if t.client == nil {
+		bufEntries := t.collectMembuf(startKey, endKey)
+		var result []KvPair
+		for _, e := range bufEntries {
+			if !e.deleted {
+				result = append(result, KvPair{Key: []byte(e.key), Value: e.value})
+			}
+			if len(result) >= limit {
+				break
+			}
+		}
+		return result, nil
+	}
+
+	// Multi-region scan with per-region lock retry.
+	var rpcResults []KvPair
+	currentKey := startKey
+	const maxLockRetries = 20
+
+	for {
+		remaining := limit - len(rpcResults)
+		if remaining <= 0 {
+			break
+		}
+
+		var regionPairs []KvPair
+		var regionEnd []byte
+		var lastLockErr error
+
+		for retry := 0; retry <= maxLockRetries; retry++ {
+			var pairs []KvPair
+			var lockInfo *kvrpcpb.LockInfo
+			regionEnd = nil
+
+			err := t.client.sender.SendToRegion(ctx, currentKey,
+				func(cli tikvpb.TikvClient, info *RegionInfo) (*errorpb.Error, error) {
+					regionEnd = info.Region.GetEndKey()
+					scanEnd := endKey
+					if len(regionEnd) > 0 && (len(scanEnd) == 0 || bytes.Compare(regionEnd, scanEnd) < 0) {
+						scanEnd = regionEnd
+					}
+					resp, err := cli.KvScan(ctx, &kvrpcpb.ScanRequest{
+						Context:  buildContext(info),
+						StartKey: currentKey,
+						EndKey:   scanEnd,
+						Limit:    uint32(remaining),
+						Version:  uint64(t.startTS),
+					})
+					if err != nil {
+						return nil, err
+					}
+					if resp.GetRegionError() != nil {
+						return resp.GetRegionError(), nil
+					}
+					if resp.GetError() != nil {
+						if locked := resp.GetError().GetLocked(); locked != nil {
+							lockInfo = locked
+							return nil, nil
+						}
+					}
+					pairs = nil
+					for _, kv := range resp.GetPairs() {
+						pairs = append(pairs, KvPair{Key: kv.GetKey(), Value: kv.GetValue()})
+					}
+					return nil, nil
+				})
+			if err != nil {
+				return nil, err
+			}
+
+			if lockInfo == nil {
+				regionPairs = pairs
+				lastLockErr = nil
+				break
+			}
+
+			lastLockErr = fmt.Errorf("lock on key %x after %d retries", lockInfo.GetKey(), retry+1)
+			if err := t.client.resolver.ResolveLocks(ctx, []*kvrpcpb.LockInfo{lockInfo}); err != nil {
+				return nil, fmt.Errorf("resolve lock: %w", err)
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+
+		if lastLockErr != nil {
+			return nil, fmt.Errorf("scan: lock resolution retries exhausted: %w", lastLockErr)
+		}
+
+		rpcResults = append(rpcResults, regionPairs...)
+
+		if len(rpcResults) >= limit {
+			break
+		}
+		if len(regionEnd) == 0 {
+			break
+		}
+		if len(endKey) > 0 && bytes.Compare(regionEnd, endKey) >= 0 {
+			break
+		}
+		currentKey = regionEnd
+	}
+
+	if len(rpcResults) > limit {
+		rpcResults = rpcResults[:limit]
+	}
+
+	bufEntries := t.collectMembuf(startKey, endKey)
+	if len(bufEntries) == 0 {
+		return rpcResults, nil
+	}
+	return mergeResults(rpcResults, bufEntries, limit), nil
 }
