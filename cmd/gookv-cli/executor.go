@@ -49,6 +49,7 @@ type txnHandleAPI interface {
 	BatchGet(ctx context.Context, keys [][]byte) ([]client.KvPair, error)
 	Set(ctx context.Context, key, value []byte) error
 	Delete(ctx context.Context, key []byte) error
+	Scan(ctx context.Context, startKey, endKey []byte, limit int) ([]client.KvPair, error)
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
 	StartTS() interface{} // returns txntypes.TimeStamp (uint64)
@@ -172,6 +173,8 @@ func (e *Executor) Exec(ctx context.Context, cmd Command) (*Result, error) {
 		return e.execTxnSet(ctx, cmd)
 	case CmdTxnDelete:
 		return e.execTxnDelete(ctx, cmd)
+	case CmdTxnScan:
+		return e.execTxnScan(ctx, cmd)
 	case CmdCommit:
 		return e.execCommit(ctx, cmd)
 	case CmdRollback:
@@ -520,6 +523,26 @@ func (e *Executor) execTxnDelete(ctx context.Context, cmd Command) (*Result, err
 		return nil, err
 	}
 	return &Result{Type: ResultOK}, nil
+}
+
+func (e *Executor) execTxnScan(ctx context.Context, cmd Command) (*Result, error) {
+	if e.activeTxn == nil {
+		return nil, fmt.Errorf("no active transaction")
+	}
+	startKey, endKey := cmd.Args[0], cmd.Args[1]
+	limit := int(cmd.IntArg)
+	if limit <= 0 {
+		limit = e.defaultScanLimit
+	}
+	pairs, err := e.activeTxn.Scan(ctx, startKey, endKey, limit)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]KvPairResult, len(pairs))
+	for i, p := range pairs {
+		rows[i] = KvPairResult{Key: p.Key, Value: p.Value}
+	}
+	return &Result{Type: ResultRows, Rows: rows}, nil
 }
 
 func (e *Executor) execCommit(ctx context.Context, _ Command) (*Result, error) {

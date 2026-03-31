@@ -303,6 +303,7 @@ const (
 	CmdTxnBatchGet // BGET (inside txn)
 	CmdTxnSet      // SET key value (inside txn only)
 	CmdTxnDelete   // DELETE (inside txn)
+	CmdTxnScan     // SCAN (inside txn)
 	CmdBegin       // BEGIN [opts...]
 	CmdCommit      // COMMIT
 	CmdRollback    // ROLLBACK
@@ -383,7 +384,7 @@ func ParseCommand(tokens []Token, inTxn bool) (Command, error) {
 	case "TTL":
 		return parseTTL(args)
 	case "SCAN":
-		return parseScan(args)
+		return parseScan(args, inTxn)
 	case "BGET":
 		return parseBGet(args, inTxn)
 	case "BPUT":
@@ -564,19 +565,23 @@ func parseTTL(args []Token) (Command, error) {
 	return Command{Type: CmdTTL, Args: [][]byte{args[0].Value}}, nil
 }
 
-func parseScan(args []Token) (Command, error) {
+func parseScan(args []Token, inTxn bool) (Command, error) {
 	if len(args) < 2 {
 		return Command{}, fmt.Errorf("SCAN requires at least 2 arguments (start_key end_key), got %d", len(args))
 	}
+	cmd := CmdScan
+	if inTxn {
+		cmd = CmdTxnScan
+	}
 	if len(args) == 2 {
-		return Command{Type: CmdScan, Args: [][]byte{args[0].Value, args[1].Value}, IntArg: 0}, nil
+		return Command{Type: cmd, Args: [][]byte{args[0].Value, args[1].Value}, IntArg: 0}, nil
 	}
 	if len(args) == 4 && strings.ToUpper(string(args[2].Value)) == "LIMIT" {
 		limit, err := strconv.ParseInt(string(args[3].Value), 10, 64)
 		if err != nil {
 			return Command{}, fmt.Errorf("SCAN LIMIT: invalid number: %s", args[3].Raw)
 		}
-		return Command{Type: CmdScan, Args: [][]byte{args[0].Value, args[1].Value}, IntArg: limit}, nil
+		return Command{Type: cmd, Args: [][]byte{args[0].Value, args[1].Value}, IntArg: limit}, nil
 	}
 	return Command{}, fmt.Errorf("SCAN: unexpected arguments (expected: SCAN start end [LIMIT n])")
 }

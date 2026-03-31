@@ -322,32 +322,37 @@ func (c *fuzzClient) doAudit() (int, error) {
 		return 0, fmt.Errorf("begin: %w", err)
 	}
 
-	total := 0
-	for i := 0; i < fuzzNumAccounts; i++ {
-		val, err := txn.Get(ctx, accountKey(i))
-		if err != nil {
-			_ = txn.Rollback(ctx)
-			c.fc.stats.auditSkips.Add(1)
-			return 0, fmt.Errorf("get account-%d: %w", i, err)
-		}
-		if val == nil {
-			_ = txn.Rollback(ctx)
-			c.fc.stats.auditSkips.Add(1)
-			return 0, fmt.Errorf("account-%d not found", i)
-		}
-		b, err := strconv.Atoi(string(val))
-		if err != nil {
-			_ = txn.Rollback(ctx)
-			return 0, fmt.Errorf("parse account-%d balance %q: %w", i, val, err)
-		}
-		if b < 0 {
-			_ = txn.Rollback(ctx)
-			return total + b, fmt.Errorf("account-%d has negative balance: %d", i, b)
-		}
-		total += b
+	pairs, err := txn.Scan(ctx, []byte("account-"), []byte("account."), fuzzNumAccounts+1)
+	if err != nil {
+		_ = txn.Rollback(ctx)
+		c.fc.stats.auditSkips.Add(1)
+		return 0, fmt.Errorf("scan: %w", err)
 	}
 
 	_ = txn.Commit(ctx)
+
+	// Build map for per-key diagnostics
+	found := make(map[string]string, len(pairs))
+	for _, p := range pairs {
+		found[string(p.Key)] = string(p.Value)
+	}
+
+	total := 0
+	for i := 0; i < fuzzNumAccounts; i++ {
+		key := string(accountKey(i))
+		valStr, ok := found[key]
+		if !ok {
+			return 0, fmt.Errorf("%s not found", key)
+		}
+		b, err := strconv.Atoi(valStr)
+		if err != nil {
+			return 0, fmt.Errorf("parse %s balance %q: %w", key, valStr, err)
+		}
+		if b < 0 {
+			return total + b, fmt.Errorf("%s has negative balance: %d", key, b)
+		}
+		total += b
+	}
 
 	if total != fuzzExpectedTotal {
 		return total, fmt.Errorf("balance mismatch: got %d, want %d", total, fuzzExpectedTotal)

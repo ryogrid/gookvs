@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
@@ -438,4 +439,103 @@ func TestTxnHandle_StartTS(t *testing.T) {
 	var ts txntypes.TimeStamp = 12345
 	txn := newTestTxnHandle(ts)
 	assert.Equal(t, ts, txn.StartTS())
+}
+
+// ---------------------------------------------------------------------------
+// 5. Scan (membuf-only, nil client)
+// ---------------------------------------------------------------------------
+
+func TestScan_MembufOnly(t *testing.T) {
+	ctx := context.Background()
+	txn := newTestTxnHandle(100)
+
+	require.NoError(t, txn.Set(ctx, []byte("b"), []byte("v-b")))
+	require.NoError(t, txn.Set(ctx, []byte("a"), []byte("v-a")))
+	require.NoError(t, txn.Set(ctx, []byte("c"), []byte("v-c")))
+
+	pairs, err := txn.Scan(ctx, []byte("a"), []byte("d"), 10)
+	require.NoError(t, err)
+	require.Len(t, pairs, 3)
+	assert.Equal(t, "a", string(pairs[0].Key))
+	assert.Equal(t, "v-a", string(pairs[0].Value))
+	assert.Equal(t, "b", string(pairs[1].Key))
+	assert.Equal(t, "c", string(pairs[2].Key))
+}
+
+func TestScan_MembufDeleteExcluded(t *testing.T) {
+	ctx := context.Background()
+	txn := newTestTxnHandle(100)
+
+	require.NoError(t, txn.Set(ctx, []byte("a"), []byte("v-a")))
+	require.NoError(t, txn.Set(ctx, []byte("b"), []byte("v-b")))
+	require.NoError(t, txn.Delete(ctx, []byte("b")))
+
+	pairs, err := txn.Scan(ctx, []byte("a"), []byte("c"), 10)
+	require.NoError(t, err)
+	require.Len(t, pairs, 1)
+	assert.Equal(t, "a", string(pairs[0].Key))
+}
+
+func TestScan_MembufRangeFiltering(t *testing.T) {
+	ctx := context.Background()
+	txn := newTestTxnHandle(100)
+
+	require.NoError(t, txn.Set(ctx, []byte("a"), []byte("v-a")))
+	require.NoError(t, txn.Set(ctx, []byte("m"), []byte("v-m")))
+	require.NoError(t, txn.Set(ctx, []byte("z"), []byte("v-z")))
+
+	// Scan [b, y) — should only return "m"
+	pairs, err := txn.Scan(ctx, []byte("b"), []byte("y"), 10)
+	require.NoError(t, err)
+	require.Len(t, pairs, 1)
+	assert.Equal(t, "m", string(pairs[0].Key))
+}
+
+func TestScan_MembufLimit(t *testing.T) {
+	ctx := context.Background()
+	txn := newTestTxnHandle(100)
+
+	for i := 0; i < 10; i++ {
+		key := []byte(fmt.Sprintf("key%02d", i))
+		require.NoError(t, txn.Set(ctx, key, []byte("val")))
+	}
+
+	pairs, err := txn.Scan(ctx, []byte("key00"), []byte("key99"), 3)
+	require.NoError(t, err)
+	assert.Len(t, pairs, 3)
+}
+
+func TestScan_MembufEmptyRange(t *testing.T) {
+	ctx := context.Background()
+	txn := newTestTxnHandle(100)
+
+	require.NoError(t, txn.Set(ctx, []byte("a"), []byte("v")))
+
+	pairs, err := txn.Scan(ctx, []byte("m"), []byte("z"), 10)
+	require.NoError(t, err)
+	assert.Empty(t, pairs)
+}
+
+func TestScan_AfterCommit(t *testing.T) {
+	ctx := context.Background()
+	txn := newTestTxnHandle(100)
+
+	txn.mu.Lock()
+	txn.committed = true
+	txn.mu.Unlock()
+
+	_, err := txn.Scan(ctx, []byte("a"), []byte("z"), 10)
+	assert.ErrorIs(t, err, ErrTxnCommitted)
+}
+
+func TestScan_AfterRollback(t *testing.T) {
+	ctx := context.Background()
+	txn := newTestTxnHandle(100)
+
+	txn.mu.Lock()
+	txn.rolledBack = true
+	txn.mu.Unlock()
+
+	_, err := txn.Scan(ctx, []byte("a"), []byte("z"), 10)
+	assert.ErrorIs(t, err, ErrTxnRolledBack)
 }

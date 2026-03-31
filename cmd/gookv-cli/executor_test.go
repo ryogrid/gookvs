@@ -493,6 +493,18 @@ func TestTxnDeleteWithoutTxn(t *testing.T) {
 	assert.Contains(t, err.Error(), "no active transaction")
 }
 
+func TestTxnScanWithoutTxn(t *testing.T) {
+	ctx := context.Background()
+	exec := newTestExecutor(nil, nil, nil)
+
+	_, err := exec.Exec(ctx, Command{
+		Type: CmdTxnScan,
+		Args: [][]byte{[]byte("a"), []byte("z")},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no active transaction")
+}
+
 func TestTxnCommitWithoutTxn(t *testing.T) {
 	ctx := context.Background()
 	exec := newTestExecutor(nil, nil, nil)

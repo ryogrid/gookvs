@@ -265,3 +265,26 @@ func CLIParallel(t *testing.T, addrs []string, stmt string) map[string]string {
 	wg.Wait()
 	return results
 }
+
+// CLITxnScan performs a transactional SCAN via CLI.
+// Executes BEGIN; SCAN startKey endKey [LIMIT n]; ROLLBACK as a batch.
+func CLITxnScan(t *testing.T, pdAddr string, startKey, endKey string, limit int) string {
+	t.Helper()
+	limitClause := ""
+	if limit > 0 {
+		limitClause = fmt.Sprintf(" LIMIT %d", limit)
+	}
+	stmt := fmt.Sprintf("BEGIN; SCAN %s %s%s; ROLLBACK", startKey, endKey, limitClause)
+	return CLIExec(t, pdAddr, stmt)
+}
+
+// CLITxnScanRaw is the non-fatal variant that returns (stdout, stderr, error).
+func CLITxnScanRaw(t *testing.T, pdAddr string, startKey, endKey string, limit int) (string, string, error) {
+	t.Helper()
+	limitClause := ""
+	if limit > 0 {
+		limitClause = fmt.Sprintf(" LIMIT %d", limit)
+	}
+	stmt := fmt.Sprintf("BEGIN; SCAN %s %s%s; ROLLBACK", startKey, endKey, limitClause)
+	return CLIExecRaw(t, pdAddr, stmt)
+}

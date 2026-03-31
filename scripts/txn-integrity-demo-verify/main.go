@@ -736,19 +736,24 @@ func readAllBalances(ctx context.Context, txnClient *client.TxnKVClient) (int, [
 		return 0, nil, err
 	}
 
+	pairs, err := txn.Scan(ctx, []byte("acct:"), []byte("acct;"), numAccounts+1)
+	if err != nil {
+		_ = txn.Rollback(ctx)
+		return 0, nil, fmt.Errorf("scan: %w", err)
+	}
+	_ = txn.Rollback(ctx) // read-only, no commit needed
+
+	if len(pairs) != numAccounts {
+		return 0, nil, fmt.Errorf("expected %d accounts, got %d", numAccounts, len(pairs))
+	}
+
 	total := 0
 	balances := make([]int, 0, numAccounts)
-	for i := 0; i < numAccounts; i++ {
-		val, err := txn.Get(ctx, acctKey(i))
-		if err != nil {
-			_ = txn.Rollback(ctx)
-			return 0, nil, fmt.Errorf("get acct:%04d: %w", i, err)
-		}
-		bal := parseBalance(val)
+	for _, p := range pairs {
+		bal := parseBalance(p.Value)
 		balances = append(balances, bal)
 		total += bal
 	}
-	_ = txn.Rollback(ctx) // read-only, no commit needed
 	return total, balances, nil
 }
 

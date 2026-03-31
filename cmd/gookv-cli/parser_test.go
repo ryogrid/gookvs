@@ -365,6 +365,8 @@ func TestParseCommand(t *testing.T) {
 		// SCAN
 		{name: "SCAN default limit", input: "SCAN a z", wantType: CmdScan, wantArgs: bss("a", "z"), wantInt: 0},
 		{name: "SCAN with LIMIT", input: "SCAN a z LIMIT 50", wantType: CmdScan, wantArgs: bss("a", "z"), wantInt: 50},
+		{name: "txn SCAN", input: "SCAN a z", inTxn: true, wantType: CmdTxnScan, wantArgs: bss("a", "z"), wantInt: 0},
+		{name: "txn SCAN with LIMIT", input: "SCAN a z LIMIT 10", inTxn: true, wantType: CmdTxnScan, wantArgs: bss("a", "z"), wantInt: 10},
 		// BGET
 		{name: "BGET", input: "BGET k1 k2 k3", wantType: CmdBatchGet, wantArgs: bss("k1", "k2", "k3")},
 		{name: "txn BGET", input: "BGET k1 k2", inTxn: true, wantType: CmdTxnBatchGet, wantArgs: bss("k1", "k2")},
