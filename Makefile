@@ -74,34 +74,9 @@ pd-cluster-start: build
 
 pd-cluster-stop:
 	@echo "Stopping PD cluster..."
-	@for i in $$(seq 1 $(CLUSTER_NODES)); do \
-		PID_FILE=$(PD_CLUSTER_DIR)/node$$i.pid; \
-		if [ -f $$PID_FILE ]; then \
-			PID=$$(cat $$PID_FILE); \
-			if kill -0 $$PID 2>/dev/null; then \
-				kill $$PID 2>/dev/null; \
-				sleep 1; \
-				if kill -0 $$PID 2>/dev/null; then kill -9 $$PID 2>/dev/null; fi; \
-				echo "  Node $$i (pid $$PID): stopped"; \
-			else \
-				echo "  Node $$i (pid $$PID): already stopped"; \
-			fi; \
-			rm -f $$PID_FILE; \
-		fi; \
-	done
-	@PID_FILE=$(PD_CLUSTER_DIR)/pd.pid; \
-	if [ -f $$PID_FILE ]; then \
-		PID=$$(cat $$PID_FILE); \
-		if kill -0 $$PID 2>/dev/null; then \
-			kill $$PID 2>/dev/null; \
-			sleep 1; \
-			if kill -0 $$PID 2>/dev/null; then kill -9 $$PID 2>/dev/null; fi; \
-			echo "  PD (pid $$PID): stopped"; \
-		else \
-			echo "  PD (pid $$PID): already stopped"; \
-		fi; \
-		rm -f $$PID_FILE; \
-	fi
+	@-pkill -KILL -f gookv-server 2>/dev/null || true
+	@-pkill -KILL -f gookv-pd 2>/dev/null || true
+	@sleep 1
 	@rm -rf $(PD_CLUSTER_DIR)
 	@echo "PD cluster stopped and data cleaned up."
 
@@ -161,34 +136,9 @@ txn-demo-verify:
 
 txn-demo-stop:
 	@echo "Stopping txn demo cluster..."
-	@for i in $$(seq 1 $(TXN_DEMO_NODES)); do \
-		PID_FILE=$(TXN_DEMO_DIR)/node$$i.pid; \
-		if [ -f $$PID_FILE ]; then \
-			PID=$$(cat $$PID_FILE); \
-			if kill -0 $$PID 2>/dev/null; then \
-				kill $$PID 2>/dev/null; \
-				sleep 1; \
-				if kill -0 $$PID 2>/dev/null; then kill -9 $$PID 2>/dev/null; fi; \
-				echo "  Node $$i (pid $$PID): stopped"; \
-			else \
-				echo "  Node $$i (pid $$PID): already stopped"; \
-			fi; \
-			rm -f $$PID_FILE; \
-		fi; \
-	done
-	@PID_FILE=$(TXN_DEMO_DIR)/pd.pid; \
-	if [ -f $$PID_FILE ]; then \
-		PID=$$(cat $$PID_FILE); \
-		if kill -0 $$PID 2>/dev/null; then \
-			kill $$PID 2>/dev/null; \
-			sleep 1; \
-			if kill -0 $$PID 2>/dev/null; then kill -9 $$PID 2>/dev/null; fi; \
-			echo "  PD (pid $$PID): stopped"; \
-		else \
-			echo "  PD (pid $$PID): already stopped"; \
-		fi; \
-		rm -f $$PID_FILE; \
-	fi
+	@-pkill -KILL -f gookv-server 2>/dev/null || true
+	@-pkill -KILL -f gookv-pd 2>/dev/null || true
+	@sleep 1
 	@rm -rf $(TXN_DEMO_DIR)
 	@echo "Txn demo cluster stopped and data cleaned up."
 
@@ -246,34 +196,9 @@ scale-demo-verify:
 
 scale-demo-stop:
 	@echo "Stopping scale demo cluster..."
-	@for i in $$(seq 1 $(SCALE_DEMO_MAX_NODES)); do \
-		PID_FILE=$(SCALE_DEMO_DIR)/node$$i.pid; \
-		if [ -f $$PID_FILE ]; then \
-			PID=$$(cat $$PID_FILE); \
-			if kill -0 $$PID 2>/dev/null; then \
-				kill $$PID 2>/dev/null; \
-				sleep 1; \
-				if kill -0 $$PID 2>/dev/null; then kill -9 $$PID 2>/dev/null; fi; \
-				echo "  Node $$i (pid $$PID): stopped"; \
-			else \
-				echo "  Node $$i (pid $$PID): already stopped"; \
-			fi; \
-			rm -f $$PID_FILE; \
-		fi; \
-	done
-	@PID_FILE=$(SCALE_DEMO_DIR)/pd.pid; \
-	if [ -f $$PID_FILE ]; then \
-		PID=$$(cat $$PID_FILE); \
-		if kill -0 $$PID 2>/dev/null; then \
-			kill $$PID 2>/dev/null; \
-			sleep 1; \
-			if kill -0 $$PID 2>/dev/null; then kill -9 $$PID 2>/dev/null; fi; \
-			echo "  PD (pid $$PID): stopped"; \
-		else \
-			echo "  PD (pid $$PID): already stopped"; \
-		fi; \
-		rm -f $$PID_FILE; \
-	fi
+	@-pkill -KILL -f gookv-server 2>/dev/null || true
+	@-pkill -KILL -f gookv-pd 2>/dev/null || true
+	@sleep 1
 	@rm -rf $(SCALE_DEMO_DIR)
 	@echo "Scale demo cluster stopped and data cleaned up."
 
@@ -344,36 +269,9 @@ pd-failover-demo-verify:
 
 pd-failover-demo-stop:
 	@echo "Stopping PD failover demo cluster..."
-	@for i in $$(seq 1 $(PD_FAILOVER_KVS_NODES)); do \
-		PID_FILE=$(PD_FAILOVER_DIR)/node$$i.pid; \
-		if [ -f $$PID_FILE ]; then \
-			PID=$$(cat $$PID_FILE); \
-			if kill -0 $$PID 2>/dev/null; then \
-				kill $$PID 2>/dev/null; \
-				sleep 1; \
-				if kill -0 $$PID 2>/dev/null; then kill -9 $$PID 2>/dev/null; fi; \
-				echo "  Node $$i (pid $$PID): stopped"; \
-			else \
-				echo "  Node $$i (pid $$PID): already stopped"; \
-			fi; \
-			rm -f $$PID_FILE; \
-		fi; \
-	done
-	@for i in 1 2 3; do \
-		PID_FILE=$(PD_FAILOVER_DIR)/pd$$i.pid; \
-		if [ -f $$PID_FILE ]; then \
-			PID=$$(cat $$PID_FILE); \
-			if kill -0 $$PID 2>/dev/null; then \
-				kill $$PID 2>/dev/null; \
-				sleep 1; \
-				if kill -0 $$PID 2>/dev/null; then kill -9 $$PID 2>/dev/null; fi; \
-				echo "  PD $$i (pid $$PID): stopped"; \
-			else \
-				echo "  PD $$i (pid $$PID): already stopped"; \
-			fi; \
-			rm -f $$PID_FILE; \
-		fi; \
-	done
+	@-pkill -KILL -f gookv-server 2>/dev/null || true
+	@-pkill -KILL -f gookv-pd 2>/dev/null || true
+	@sleep 1
 	@rm -rf $(PD_FAILOVER_DIR)
 	@echo "PD failover demo cluster stopped and data cleaned up."
 
@@ -430,33 +328,8 @@ txn-integrity-demo-verify:
 
 txn-integrity-demo-stop:
 	@echo "Stopping txn integrity demo cluster..."
-	@for i in $$(seq 1 $(TXN_INTEGRITY_NODES)); do \
-		PID_FILE=$(TXN_INTEGRITY_DIR)/node$$i.pid; \
-		if [ -f $$PID_FILE ]; then \
-			PID=$$(cat $$PID_FILE); \
-			if kill -0 $$PID 2>/dev/null; then \
-				kill $$PID 2>/dev/null; \
-				sleep 1; \
-				if kill -0 $$PID 2>/dev/null; then kill -9 $$PID 2>/dev/null; fi; \
-				echo "  Node $$i (pid $$PID): stopped"; \
-			else \
-				echo "  Node $$i (pid $$PID): already stopped"; \
-			fi; \
-			rm -f $$PID_FILE; \
-		fi; \
-	done
-	@PID_FILE=$(TXN_INTEGRITY_DIR)/pd.pid; \
-	if [ -f $$PID_FILE ]; then \
-		PID=$$(cat $$PID_FILE); \
-		if kill -0 $$PID 2>/dev/null; then \
-			kill $$PID 2>/dev/null; \
-			sleep 1; \
-			if kill -0 $$PID 2>/dev/null; then kill -9 $$PID 2>/dev/null; fi; \
-			echo "  PD (pid $$PID): stopped"; \
-		else \
-			echo "  PD (pid $$PID): already stopped"; \
-		fi; \
-		rm -f $$PID_FILE; \
-	fi
+	@-pkill -KILL -f gookv-server 2>/dev/null || true
+	@-pkill -KILL -f gookv-pd 2>/dev/null || true
+	@sleep 1
 	@rm -rf $(TXN_INTEGRITY_DIR)
 	@echo "Txn integrity demo cluster stopped and data cleaned up."

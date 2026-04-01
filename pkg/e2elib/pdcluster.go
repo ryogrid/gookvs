@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -141,6 +142,7 @@ func (c *PDCluster) Start() error {
 		}
 
 		node.cmd = exec.Command(binary, args...)
+		node.cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 
 		lf, err := os.Create(logPath)
 		if err != nil {
@@ -318,6 +320,7 @@ func (n *PDClusterNode) Restart() error {
 	binary := n.cmd.Path
 
 	n.cmd = exec.Command(binary, oldArgs...)
+	n.cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 
 	lf, err := os.OpenFile(n.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {

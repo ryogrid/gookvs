@@ -43,29 +43,5 @@
     ]
   },
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/ryo/work/gookv/.claude/skills/continuous-learning-v2/hooks/observe.sh pre",
-            "timeout": 10
-          }
-        ]
-      }      
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/ryo/work/gookv/.claude/skills/continuous-learning-v2/hooks/observe.sh post",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
   }
 }

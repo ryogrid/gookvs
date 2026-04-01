@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
@@ -108,6 +109,7 @@ func (n *PDNode) Start() error {
 	}
 
 	n.cmd = exec.Command(binary, args...)
+	n.cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 
 	logFile, err := os.Create(n.logPath)
 	if err != nil {

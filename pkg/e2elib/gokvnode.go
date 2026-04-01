@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -126,6 +127,7 @@ func (n *GokvNode) Start() error {
 	args = append(args, n.cfg.ExtraFlags...)
 
 	n.cmd = exec.Command(binary, args...)
+	n.cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 
 	lf, err := os.OpenFile(n.logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 	if err != nil {
