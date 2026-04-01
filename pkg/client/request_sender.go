@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/pingcap/kvproto/pkg/errorpb"
@@ -20,27 +19,44 @@ type RegionRequestSender struct {
 	cache      *RegionCache
 	resolver   *PDStoreResolver
 	maxRetries int
-	dialTimeout time.Duration
-
-	mu    sync.RWMutex
-	conns map[string]*grpc.ClientConn
+	pool       *ConnPool
 }
 
-// NewRegionRequestSender creates a new sender.
+// NewRegionRequestSender creates a new sender with a connection pool.
 func NewRegionRequestSender(cache *RegionCache, resolver *PDStoreResolver, maxRetries int, dialTimeout time.Duration) *RegionRequestSender {
 	if maxRetries <= 0 {
 		maxRetries = 10
 	}
-	if dialTimeout <= 0 {
-		dialTimeout = 5 * time.Second
+	return NewRegionRequestSenderWithPool(cache, resolver, maxRetries, NewConnPool(ConnPoolConfig{
+		PoolSize: 2,
+		DialFunc: defaultClientDial,
+	}))
+}
+
+// NewRegionRequestSenderWithPool creates a sender with a custom ConnPool.
+func NewRegionRequestSenderWithPool(cache *RegionCache, resolver *PDStoreResolver, maxRetries int, pool *ConnPool) *RegionRequestSender {
+	if maxRetries <= 0 {
+		maxRetries = 10
 	}
 	return &RegionRequestSender{
-		cache:       cache,
-		resolver:    resolver,
-		maxRetries:  maxRetries,
-		dialTimeout: dialTimeout,
-		conns:       make(map[string]*grpc.ClientConn),
+		cache:      cache,
+		resolver:   resolver,
+		maxRetries: maxRetries,
+		pool:       pool,
 	}
+}
+
+// defaultClientDial creates a gRPC connection with the standard client options.
+func defaultClientDial(addr string) (*grpc.ClientConn, error) {
+	return grpc.NewClient(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64<<20)),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                60 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: false,
+		}),
+	)
 }
 
 // RPCFunc is the callback for making a gRPC call.
@@ -68,7 +84,7 @@ func (s *RegionRequestSender) SendToRegion(ctx context.Context, key []byte, rpcF
 			return fmt.Errorf("locate key: %w", err)
 		}
 
-		conn, err := s.getOrDial(info.StoreAddr)
+		conn, err := s.pool.Get(info.StoreAddr)
 		if err != nil {
 			s.cache.InvalidateRegion(info.Region.GetId())
 			continue
@@ -162,57 +178,7 @@ func (s *RegionRequestSender) handleRegionError(ctx context.Context, info *Regio
 	return false
 }
 
-// getOrDial returns a cached connection or dials a new one.
-func (s *RegionRequestSender) getOrDial(addr string) (*grpc.ClientConn, error) {
-	s.mu.RLock()
-	if conn, ok := s.conns[addr]; ok {
-		s.mu.RUnlock()
-		return conn, nil
-	}
-	s.mu.RUnlock()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Double-check after acquiring write lock.
-	if conn, ok := s.conns[addr]; ok {
-		return conn, nil
-	}
-
-	slog.Debug("tikv.dial", "addr", addr)
-	conn, err := grpc.NewClient(addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64<<20)),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                60 * time.Second,
-			Timeout:             10 * time.Second,
-			PermitWithoutStream: false,
-		}),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", addr, err)
-	}
-
-	s.conns[addr] = conn
-	return conn, nil
-}
-
-// closeConn closes and removes a cached connection.
-func (s *RegionRequestSender) closeConn(addr string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if conn, ok := s.conns[addr]; ok {
-		conn.Close()
-		delete(s.conns, addr)
-	}
-}
-
 // Close closes all cached connections.
 func (s *RegionRequestSender) Close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for addr, conn := range s.conns {
-		conn.Close()
-		delete(s.conns, addr)
-	}
+	s.pool.Close()
 }

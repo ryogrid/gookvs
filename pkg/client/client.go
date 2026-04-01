@@ -15,6 +15,7 @@ type Config struct {
 	DialTimeout   time.Duration // default: 5s
 	MaxRetries    int           // default: 3
 	StoreCacheTTL time.Duration // default: 30s
+	ConnPoolSize  int           // gRPC connections per store (default: 2)
 }
 
 // Client provides access to gookv sub-clients (RawKV, etc.).
@@ -47,9 +48,17 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("create PD client: %w", err)
 	}
 
+	if cfg.ConnPoolSize <= 0 {
+		cfg.ConnPoolSize = 2
+	}
+
 	resolver := NewPDStoreResolver(pdClient, cfg.StoreCacheTTL)
 	cache := NewRegionCache(pdClient, resolver)
-	sender := NewRegionRequestSender(cache, resolver, cfg.MaxRetries, cfg.DialTimeout)
+	pool := NewConnPool(ConnPoolConfig{
+		PoolSize: cfg.ConnPoolSize,
+		DialFunc: defaultClientDial,
+	})
+	sender := NewRegionRequestSenderWithPool(cache, resolver, cfg.MaxRetries, pool)
 
 	return &Client{
 		pdClient: pdClient,

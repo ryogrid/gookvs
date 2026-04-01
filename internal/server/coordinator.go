@@ -61,6 +61,9 @@ type StoreCoordinator struct {
 	// Performance optimization components (nil when disabled).
 	raftLogWriter   *raftstore.RaftLogWriter
 	applyWorkerPool *raftstore.ApplyWorkerPool
+
+	// ReadIndex batching: per-region batchers for coalescing concurrent reads.
+	batchers map[uint64]*ReadIndexBatcher
 }
 
 // StoreCoordinatorConfig holds the configuration for creating a StoreCoordinator.
@@ -103,6 +106,7 @@ func NewStoreCoordinator(cfg StoreCoordinatorConfig) *StoreCoordinator {
 		cancels:       make(map[uint64]context.CancelFunc),
 		dones:         make(map[uint64]chan struct{}),
 		splitResultCh: make(chan *raftstore.SplitRegionResult, 16),
+		batchers:      make(map[uint64]*ReadIndexBatcher),
 	}
 
 	// Create Raft log batch writer if enabled.
@@ -383,10 +387,42 @@ func (sc *StoreCoordinator) ReadIndex(regionID uint64, timeout time.Duration) er
 	// but does not guarantee that all committed Raft entries have been applied
 	// to the engine. ReadIndex (ReadOnlySafe) guarantees both leadership AND
 	// that appliedIndex >= readIndex, preventing stale reads.
-	// TODO: re-enable after adding appliedIndex >= commitIndex check to lease path.
 
-	// Generate unique request context.
-	id := peer.NextReadID()
+	// Use batching to coalesce concurrent ReadIndex requests for the same region.
+	batcher := sc.getOrCreateBatcher(regionID, peer)
+	return batcher.Wait(timeout)
+}
+
+// getOrCreateBatcher returns the batcher for a region, creating one if needed.
+func (sc *StoreCoordinator) getOrCreateBatcher(regionID uint64, peer *raftstore.Peer) *ReadIndexBatcher {
+	// Fast path: read lock.
+	sc.mu.RLock()
+	b, ok := sc.batchers[regionID]
+	sc.mu.RUnlock()
+	if ok {
+		return b
+	}
+
+	// Slow path: write lock with double-check.
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if b, ok = sc.batchers[regionID]; ok {
+		return b
+	}
+	b = NewReadIndexBatcher(regionID, &coordinatorDispatcher{sc: sc, peer: peer})
+	sc.batchers[regionID] = b
+	return b
+}
+
+// coordinatorDispatcher implements ReadIndexDispatcher using the coordinator's
+// existing ReadIndex protocol (peer + router).
+type coordinatorDispatcher struct {
+	sc   *StoreCoordinator
+	peer *raftstore.Peer
+}
+
+func (d *coordinatorDispatcher) Dispatch(regionID uint64) error {
+	id := d.peer.NextReadID()
 	requestCtx := make([]byte, 8)
 	binary.BigEndian.PutUint64(requestCtx, id)
 
@@ -401,16 +437,15 @@ func (sc *StoreCoordinator) ReadIndex(regionID uint64, timeout time.Duration) er
 		Data: req,
 	}
 
-	if err := sc.router.Send(regionID, msg); err != nil {
+	if err := d.sc.router.Send(regionID, msg); err != nil {
 		return fmt.Errorf("raftstore: send read index: %w", err)
 	}
 
 	select {
 	case err := <-doneCh:
 		return err
-	case <-time.After(timeout):
-		// Clean up the stale pending read so it doesn't accumulate.
-		peer.CancelPendingRead(requestCtx)
+	case <-time.After(30 * time.Second):
+		d.peer.CancelPendingRead(requestCtx)
 		return fmt.Errorf("raftstore: read index timeout for region %d", regionID)
 	}
 }
@@ -567,6 +602,12 @@ func (sc *StoreCoordinator) Stop() {
 	sc.cancels = make(map[uint64]context.CancelFunc)
 	sc.dones = make(map[uint64]chan struct{})
 
+	// Stop all ReadIndex batchers.
+	for id, b := range sc.batchers {
+		b.Stop()
+		delete(sc.batchers, id)
+	}
+
 	// Stop Raft log writer AFTER all peers have exited (they may still submit tasks).
 	if sc.raftLogWriter != nil {
 		sc.raftLogWriter.Stop()
@@ -599,12 +640,29 @@ func (sc *StoreCoordinator) IsBusy() bool {
 // RunStoreWorker processes store-level messages from the Router.
 // Should be started as a goroutine.
 func (sc *StoreCoordinator) RunStoreWorker(ctx context.Context) {
+	batcherEvictTicker := time.NewTicker(batcherIdleTimeout)
+	defer batcherEvictTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case msg := <-sc.router.StoreCh():
 			sc.handleStoreMsg(msg)
+		case <-batcherEvictTicker.C:
+			sc.evictIdleBatchers()
+		}
+	}
+}
+
+// evictIdleBatchers removes batchers that have had no activity for the idle timeout.
+func (sc *StoreCoordinator) evictIdleBatchers() {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	for id, b := range sc.batchers {
+		if b.IsIdle() {
+			b.Stop()
+			delete(sc.batchers, id)
 		}
 	}
 }

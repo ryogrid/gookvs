@@ -24,14 +24,15 @@ type PDNodeConfig struct {
 
 // PDNode represents a running PD process managed for testing.
 type PDNode struct {
-	t       *testing.T
-	cfg     PDNodeConfig
-	port    int
-	dataDir string
-	logPath string
-	cmd     *exec.Cmd
-	alloc   *PortAllocator
-	running bool
+	t          *testing.T
+	cfg        PDNodeConfig
+	port       int
+	statusPort int
+	dataDir    string
+	logPath    string
+	cmd        *exec.Cmd
+	alloc      *PortAllocator
+	running    bool
 }
 
 // NewPDNode creates a new PDNode. It allocates a port and creates a temp directory for data.
@@ -43,22 +44,29 @@ func NewPDNode(t *testing.T, alloc *PortAllocator, cfg PDNodeConfig) *PDNode {
 	if err != nil {
 		t.Fatalf("e2elib: alloc port for PD: %v", err)
 	}
+	statusPort, err := alloc.AllocPort()
+	if err != nil {
+		alloc.Release(port)
+		t.Fatalf("e2elib: alloc status port for PD: %v", err)
+	}
 
 	dataDir := t.TempDir()
 	logPath := filepath.Join(dataDir, "pd.log")
 
 	n := &PDNode{
-		t:       t,
-		cfg:     cfg,
-		port:    port,
-		dataDir: dataDir,
-		logPath: logPath,
-		alloc:   alloc,
+		t:          t,
+		cfg:        cfg,
+		port:       port,
+		statusPort: statusPort,
+		dataDir:    dataDir,
+		logPath:    logPath,
+		alloc:      alloc,
 	}
 
 	t.Cleanup(func() {
 		_ = n.Stop()
 		alloc.Release(port)
+		alloc.Release(statusPort)
 	})
 
 	return n
@@ -90,6 +98,7 @@ func (n *PDNode) Start() error {
 
 	args := []string{
 		"--addr", n.Addr(),
+		"--status-addr", n.StatusAddr(),
 		"--cluster-id", strconv.FormatUint(clusterID, 10),
 		"--data-dir", n.dataDir,
 		"--log-level", logLevel,
@@ -148,6 +157,11 @@ func (n *PDNode) Stop() error {
 // Addr returns the PD address in "127.0.0.1:port" format.
 func (n *PDNode) Addr() string {
 	return fmt.Sprintf("127.0.0.1:%d", n.port)
+}
+
+// StatusAddr returns the HTTP status/pprof address.
+func (n *PDNode) StatusAddr() string {
+	return fmt.Sprintf("127.0.0.1:%d", n.statusPort)
 }
 
 // Client creates a pdclient.Client connected to this PD node.

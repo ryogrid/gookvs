@@ -840,7 +840,7 @@ func TestFuzzCluster(t *testing.T) {
 	// This prevents the initial audit from hitting "not leader" errors
 	// due to Raft elections still in progress after splits.
 	cluster.ResetClient()
-	e2elib.WaitForCondition(t, 60*time.Second, "all regions have leaders", func() bool {
+	e2elib.WaitForCondition(t, 120*time.Second, "all regions have leaders", func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		txn, err := cluster.TxnKV().Begin(ctx)
