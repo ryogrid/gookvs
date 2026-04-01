@@ -57,7 +57,7 @@ type PeerConfig struct {
 // DefaultPeerConfig returns a PeerConfig with sensible defaults.
 func DefaultPeerConfig() PeerConfig {
 	return PeerConfig{
-		RaftBaseTickInterval:     100 * time.Millisecond,
+		RaftBaseTickInterval:     10 * time.Millisecond,
 		RaftElectionTimeoutTicks: 10,
 		RaftHeartbeatTicks:       2,
 		MaxInflightMsgs:          256,

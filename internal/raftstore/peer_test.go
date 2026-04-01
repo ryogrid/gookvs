@@ -227,7 +227,7 @@ func TestPeerMessageHandling(t *testing.T) {
 
 func TestDefaultPeerConfig(t *testing.T) {
 	cfg := DefaultPeerConfig()
-	assert.Equal(t, 100*time.Millisecond, cfg.RaftBaseTickInterval)
+	assert.Equal(t, 10*time.Millisecond, cfg.RaftBaseTickInterval)
 	assert.Equal(t, 10, cfg.RaftElectionTimeoutTicks)
 	assert.Equal(t, 2, cfg.RaftHeartbeatTicks)
 	assert.Equal(t, 256, cfg.MaxInflightMsgs)
