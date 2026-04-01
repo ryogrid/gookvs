@@ -57,6 +57,11 @@ type SnapshotData struct {
 	RegionID uint64
 	Version  uint64
 	CFFiles  []SnapshotCFFile
+	// StartKey and EndKey record the region boundaries at generation time.
+	// ApplySnapshotData uses these for DeleteRange to avoid clearing data
+	// belonging to sibling regions when the receiver has stale metadata.
+	StartKey []byte
+	EndKey   []byte
 }
 
 // SnapshotCFFile represents one column family's data in the snapshot.
@@ -86,7 +91,15 @@ func MarshalSnapshotData(sd *SnapshotData) ([]byte, error) {
 	binary.BigEndian.PutUint64(b8, sd.Version)
 	buf = append(buf, b8...)
 
+	// Serialize region boundaries (added in Version 1 for safe DeleteRange).
 	b4 := make([]byte, 4)
+	binary.BigEndian.PutUint32(b4, uint32(len(sd.StartKey)))
+	buf = append(buf, b4...)
+	buf = append(buf, sd.StartKey...)
+	binary.BigEndian.PutUint32(b4, uint32(len(sd.EndKey)))
+	buf = append(buf, b4...)
+	buf = append(buf, sd.EndKey...)
+
 	binary.BigEndian.PutUint32(b4, uint32(len(sd.CFFiles)))
 	buf = append(buf, b4...)
 
@@ -132,6 +145,35 @@ func UnmarshalSnapshotData(data []byte) (*SnapshotData, error) {
 	pos += 8
 	sd.Version = binary.BigEndian.Uint64(data[pos : pos+8])
 	pos += 8
+
+	// Deserialize region boundaries.
+	if pos+4 > len(data) {
+		return nil, fmt.Errorf("raftstore: truncated startKey length")
+	}
+	startKeyLen := int(binary.BigEndian.Uint32(data[pos : pos+4]))
+	pos += 4
+	if pos+startKeyLen > len(data) {
+		return nil, fmt.Errorf("raftstore: truncated startKey")
+	}
+	if startKeyLen > 0 {
+		sd.StartKey = make([]byte, startKeyLen)
+		copy(sd.StartKey, data[pos:pos+startKeyLen])
+	}
+	pos += startKeyLen
+
+	if pos+4 > len(data) {
+		return nil, fmt.Errorf("raftstore: truncated endKey length")
+	}
+	endKeyLen := int(binary.BigEndian.Uint32(data[pos : pos+4]))
+	pos += 4
+	if pos+endKeyLen > len(data) {
+		return nil, fmt.Errorf("raftstore: truncated endKey")
+	}
+	if endKeyLen > 0 {
+		sd.EndKey = make([]byte, endKeyLen)
+		copy(sd.EndKey, data[pos:pos+endKeyLen])
+	}
+	pos += endKeyLen
 
 	cfCount := int(binary.BigEndian.Uint32(data[pos : pos+4]))
 	pos += 4
@@ -215,6 +257,8 @@ func GenerateSnapshotData(engine traits.KvEngine, regionID uint64, startKey, end
 	sd := &SnapshotData{
 		RegionID: regionID,
 		Version:  SnapshotVersion,
+		StartKey: startKey,
+		EndKey:   endKey,
 	}
 
 	dataCFs := []string{cfnames.CFDefault, cfnames.CFLock, cfnames.CFWrite}
@@ -263,11 +307,20 @@ func scanCFForSnapshot(snap traits.Snapshot, cf string, startKey, endKey []byte)
 func ApplySnapshotData(engine traits.KvEngine, sd *SnapshotData, startKey, endKey []byte) error {
 	wb := engine.NewWriteBatch()
 
+	// Use boundaries from the snapshot data (recorded at generation time) to
+	// avoid clearing sibling regions' data when the receiver has stale metadata.
+	delStart := startKey
+	delEnd := endKey
+	if len(sd.StartKey) > 0 || len(sd.EndKey) > 0 {
+		delStart = sd.StartKey
+		delEnd = sd.EndKey
+	}
+
 	// Clear existing data for the region key range in data CFs.
 	dataCFs := []string{cfnames.CFDefault, cfnames.CFLock, cfnames.CFWrite}
 	for _, cf := range dataCFs {
-		if len(startKey) > 0 || len(endKey) > 0 {
-			if err := wb.DeleteRange(cf, startKey, endKey); err != nil {
+		if len(delStart) > 0 || len(delEnd) > 0 {
+			if err := wb.DeleteRange(cf, delStart, delEnd); err != nil {
 				return fmt.Errorf("raftstore: clear CF %s: %w", cf, err)
 			}
 		}

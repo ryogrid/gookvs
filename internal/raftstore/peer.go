@@ -235,6 +235,18 @@ func NewPeer(
 		if err := rawNode.Bootstrap(peers); err != nil {
 			return nil, fmt.Errorf("raftstore: bootstrap: %w", err)
 		}
+		// For split-created regions (non-empty StartKey), advance TruncatedIndex
+		// past the bootstrap ConfChange at index 1. This ensures that when PD
+		// adds a new replica on a different node, the leader cannot send log
+		// entries (which don't contain pre-split data inherited from the parent
+		// region's engine) and must send a full snapshot instead.
+		if len(region.GetStartKey()) > 0 {
+			storage.SetApplyState(ApplyState{
+				AppliedIndex:   0,
+				TruncatedIndex: 1,
+				TruncatedTerm:  1,
+			})
+		}
 	}
 
 	p := &Peer{
