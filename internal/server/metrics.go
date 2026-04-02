@@ -98,6 +98,14 @@ var storageApplyBatchSize = prometheus.NewHistogram(
 	},
 )
 
+var leaseReadTotal = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Namespace: "gookv",
+		Name:      "lease_read_total",
+		Help:      "Total reads served via leader lease (bypassing ReadIndex).",
+	},
+)
+
 func init() {
 	prometheus.MustRegister(grpcMsgDuration)
 	prometheus.MustRegister(grpcMsgTotal)
@@ -107,4 +115,5 @@ func init() {
 	prometheus.MustRegister(proposeDuration)
 	prometheus.MustRegister(storageCommandDuration)
 	prometheus.MustRegister(storageApplyBatchSize)
+	prometheus.MustRegister(leaseReadTotal)
 }

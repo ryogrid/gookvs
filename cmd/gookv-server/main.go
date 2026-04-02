@@ -253,6 +253,7 @@ func main() {
 			},
 			EnableBatchRaftWrite: cfg.RaftStore.EnableBatchRaftWrite,
 			EnableApplyPipeline:  cfg.RaftStore.EnableApplyPipeline,
+			EnableLeaseRead:      true,
 		})
 		srv.SetCoordinator(coord)
 
@@ -408,6 +409,7 @@ func main() {
 			},
 			EnableBatchRaftWrite: cfg.RaftStore.EnableBatchRaftWrite,
 			EnableApplyPipeline:  cfg.RaftStore.EnableApplyPipeline,
+			EnableLeaseRead:      true,
 		})
 		srv.SetCoordinator(coord)
 

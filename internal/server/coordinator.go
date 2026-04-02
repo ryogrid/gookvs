@@ -64,6 +64,9 @@ type StoreCoordinator struct {
 
 	// ReadIndex batching: per-region batchers for coalescing concurrent reads.
 	batchers map[uint64]*ReadIndexBatcher
+
+	// Leader lease reads: when enabled, bypass ReadIndex if lease is valid.
+	enableLeaseRead bool
 }
 
 // StoreCoordinatorConfig holds the configuration for creating a StoreCoordinator.
@@ -79,6 +82,7 @@ type StoreCoordinatorConfig struct {
 	SplitCheckCfg        split.SplitCheckWorkerConfig // Split check worker configuration
 	EnableBatchRaftWrite bool                         // Enable Raft log batch writer
 	EnableApplyPipeline  bool                         // Enable async apply worker pool
+	EnableLeaseRead      bool                         // Enable leader lease reads (bypass ReadIndex)
 }
 
 // NewStoreCoordinator creates a new StoreCoordinator.
@@ -106,7 +110,8 @@ func NewStoreCoordinator(cfg StoreCoordinatorConfig) *StoreCoordinator {
 		cancels:       make(map[uint64]context.CancelFunc),
 		dones:         make(map[uint64]chan struct{}),
 		splitResultCh: make(chan *raftstore.SplitRegionResult, 16),
-		batchers:      make(map[uint64]*ReadIndexBatcher),
+		batchers:        make(map[uint64]*ReadIndexBatcher),
+		enableLeaseRead: cfg.EnableLeaseRead,
 	}
 
 	// Create Raft log batch writer if enabled.
@@ -372,9 +377,6 @@ func (sc *StoreCoordinator) applyEntriesForPeer(peer *raftstore.Peer, entries []
 // then waits for the applied index to reach the committed index.
 // Returns nil when it is safe to read from the local engine.
 func (sc *StoreCoordinator) ReadIndex(regionID uint64, timeout time.Duration) error {
-	start := time.Now()
-	defer func() { readindexDuration.Observe(time.Since(start).Seconds()) }()
-
 	sc.mu.RLock()
 	peer, ok := sc.peers[regionID]
 	sc.mu.RUnlock()
@@ -387,12 +389,16 @@ func (sc *StoreCoordinator) ReadIndex(regionID uint64, timeout time.Duration) er
 		return fmt.Errorf("raftstore: not leader for region %d", regionID)
 	}
 
-	// Leader lease is implemented but disabled: the lease confirms leadership
-	// but does not guarantee that all committed Raft entries have been applied
-	// to the engine. ReadIndex (ReadOnlySafe) guarantees both leadership AND
-	// that appliedIndex >= readIndex, preventing stale reads.
+	// Lease read: bypass ReadIndex entirely if the leader lease is valid
+	// and all committed entries have been applied to the engine.
+	if sc.enableLeaseRead && peer.IsLeaseValid() && peer.IsAppliedCurrent() {
+		leaseReadTotal.Inc()
+		return nil
+	}
 
-	// Use batching to coalesce concurrent ReadIndex requests for the same region.
+	// Fall through to ReadIndex via batcher.
+	start := time.Now()
+	defer func() { readindexDuration.Observe(time.Since(start).Seconds()) }()
 	batcher := sc.getOrCreateBatcher(regionID, peer)
 	return batcher.Wait(timeout)
 }

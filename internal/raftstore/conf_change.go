@@ -39,6 +39,7 @@ func (p *Peer) applyConfChangeEntry(e raftpb.Entry) *ChangePeerResult {
 			return nil
 		}
 		p.rawNode.ApplyConfChange(cc)
+		p.leaseValid.Store(false) // Invalidate lease on ConfChange
 		result := p.processConfChange(cc.Type, cc.NodeID, e.Index, cc.Context)
 		if p.regionID == 1 {
 			slog.Info("region 1 ConfChange applied",
@@ -54,6 +55,7 @@ func (p *Peer) applyConfChangeEntry(e raftpb.Entry) *ChangePeerResult {
 			return nil
 		}
 		p.rawNode.ApplyConfChange(cc)
+		p.leaseValid.Store(false) // Invalidate lease on ConfChangeV2
 		// Process the first single change (V2 with single transition).
 		if len(cc.Changes) > 0 {
 			change := cc.Changes[0]

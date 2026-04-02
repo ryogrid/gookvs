@@ -58,7 +58,7 @@ type PeerConfig struct {
 func DefaultPeerConfig() PeerConfig {
 	return PeerConfig{
 		RaftBaseTickInterval:     1 * time.Millisecond,
-		RaftElectionTimeoutTicks: 10,
+		RaftElectionTimeoutTicks: 50,
 		RaftHeartbeatTicks:       2,
 		MaxInflightMsgs:          256,
 		MaxSizePerMsg:            1 << 20, // 1 MiB
@@ -145,8 +145,9 @@ type Peer struct {
 	// Leader lease: allows serving reads without ReadIndex round-trip
 	// when the leader has recently confirmed its leadership via heartbeats.
 	// Lease duration is 80% of election timeout (conservative).
-	leaseExpiryNanos atomic.Int64 // Unix nanoseconds; accessed from multiple goroutines
+	leaseExpiryNanos atomic.Int64  // Unix nanoseconds; accessed from multiple goroutines
 	leaseValid       atomic.Bool
+	committedIndex   atomic.Uint64 // updated from peer goroutine only in handleReady()
 
 	// splitResultCh sends split results to the coordinator for child
 	// region bootstrapping. Only used by the leader.
@@ -385,6 +386,12 @@ func (p *Peer) IsLeaseValid() bool {
 		return false
 	}
 	return true
+}
+
+// IsAppliedCurrent returns true if all committed entries have been applied.
+// Safe to call from any goroutine (both fields are atomic/mutex-protected).
+func (p *Peer) IsAppliedCurrent() bool {
+	return p.storage.AppliedIndex() >= p.committedIndex.Load()
 }
 
 // CancelPendingRead removes a timed-out pending read from the map.
@@ -682,9 +689,10 @@ func (p *Peer) handleReady() {
 		}
 	}
 
-	// Cache current term for use in propose() without calling Status().
+	// Cache current term and committed index for cross-goroutine access.
 	if !raft.IsEmptyHardState(rd.HardState) {
 		p.currentTerm = rd.HardState.Term
+		p.committedIndex.Store(rd.HardState.Commit)
 	}
 
 	// Persist entries and hard state.

@@ -170,6 +170,7 @@ func (p *Peer) ProposeSplit(req SplitAdminRequest) error {
 
 // applySplitAdminEntry processes a committed split admin entry.
 func (p *Peer) applySplitAdminEntry(e *raftpb.Entry) {
+	p.leaseValid.Store(false) // Invalidate lease on split
 	data := e.Data
 	if !IsSplitAdmin(data) {
 		return
